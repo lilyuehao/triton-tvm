@@ -1,0 +1,355 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""M2.5 performance baseline and regression guard for Triton TVM pointwise kernels.
+
+This file is intentionally opt-in.  The numbers are hardware- and driver-sensitive, so
+the default pytest run skips it.  Use it to establish a same-machine baseline and to
+guard later translator/contract changes against large regressions.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import statistics
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+
+import tvm
+import tvm.testing
+from tvm.contrib.triton_tvm import build_triton_tvm, lower_to_ttir, translate_ttir
+
+try:
+    import torch
+    import triton
+    import triton.language as tl
+except ImportError:
+    pytestmark = pytest.skip("Triton or PyTorch is not available", allow_module_level=True)
+
+
+_RUN_PERF = os.environ.get("TRITON_TVM_RUN_PERF_BASELINE") == "1"
+_DEFAULT_N = int(os.environ.get("TRITON_TVM_PERF_N", str(2**22)))
+_DEFAULT_BLOCK = int(os.environ.get("TRITON_TVM_PERF_BLOCK", "256"))
+_TVM_NUMBER = int(os.environ.get("TRITON_TVM_PERF_TVM_NUMBER", "20"))
+_TVM_REPEAT = int(os.environ.get("TRITON_TVM_PERF_TVM_REPEAT", "7"))
+_TVM_MIN_REPEAT_MS = int(os.environ.get("TRITON_TVM_PERF_TVM_MIN_REPEAT_MS", "100"))
+_TRITON_WARMUP = int(os.environ.get("TRITON_TVM_PERF_TRITON_WARMUP", "25"))
+_TRITON_REP = int(os.environ.get("TRITON_TVM_PERF_TRITON_REP", "100"))
+_REGRESSION_TOLERANCE = float(os.environ.get("TRITON_TVM_PERF_TOLERANCE", "0.35"))
+
+
+@triton.jit
+def _perf_vector_add_kernel(x, y, out, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    vx = tl.load(x + offsets, mask=mask, other=0.0)
+    vy = tl.load(y + offsets, mask=mask, other=0.0)
+    tl.store(out + offsets, vx + vy, mask=mask)
+
+
+@triton.jit
+def _perf_pointwise_chain_kernel(x, y, z, out, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    vx = tl.load(x + offsets, mask=mask, other=0.0)
+    vy = tl.load(y + offsets, mask=mask, other=0.0)
+    vz = tl.load(z + offsets, mask=mask, other=0.0)
+    value = vx * 2.0 + vy - vz
+    tl.store(out + offsets, value, mask=mask)
+
+
+@triton.jit
+def _perf_dual_store_kernel(x, y, out0, out1, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    vx = tl.load(x + offsets, mask=mask, other=0.0)
+    vy = tl.load(y + offsets, mask=mask, other=0.0)
+    tl.store(out0 + offsets, vx + vy, mask=mask)
+    tl.store(out1 + offsets, vx - vy, mask=mask)
+
+
+@triton.jit
+def _perf_scalar_broadcast_kernel(x, out0, out1, n, alpha, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    vx = tl.load(x + offsets, mask=mask, other=0.0)
+    shifted = alpha + 1.0
+    tl.store(out0 + offsets, vx + shifted, mask=mask)
+    tl.store(out1 + offsets, vx * alpha, mask=mask)
+
+
+@dataclass(frozen=True)
+class _PerfCase:
+    name: str
+    jit_fn: Any
+    signature: dict[str, str]
+    contract: str
+    inputs: tuple[str, ...]
+    outputs: tuple[str, ...]
+    bytes_per_element: int
+    scalars: dict[str, Any]
+
+
+_PERF_CASES = (
+    _PerfCase(
+        name="vector_add",
+        jit_fn=_perf_vector_add_kernel,
+        signature={
+            "x": "*fp32",
+            "y": "*fp32",
+            "out": "*fp32",
+            "n": "i64",
+            "BLOCK": "constexpr",
+        },
+        contract="cuda_minimal",
+        inputs=("x", "y"),
+        outputs=("out",),
+        bytes_per_element=12,
+        scalars={},
+    ),
+    _PerfCase(
+        name="pointwise_chain",
+        jit_fn=_perf_pointwise_chain_kernel,
+        signature={
+            "x": "*fp32",
+            "y": "*fp32",
+            "z": "*fp32",
+            "out": "*fp32",
+            "n": "i64",
+            "BLOCK": "constexpr",
+        },
+        contract="cuda_minimal",
+        inputs=("x", "y", "z"),
+        outputs=("out",),
+        bytes_per_element=16,
+        scalars={},
+    ),
+    _PerfCase(
+        name="dual_store",
+        jit_fn=_perf_dual_store_kernel,
+        signature={
+            "x": "*fp32",
+            "y": "*fp32",
+            "out0": "*fp32",
+            "out1": "*fp32",
+            "n": "i64",
+            "BLOCK": "constexpr",
+        },
+        contract="cuda_pointwise_flat",
+        inputs=("x", "y"),
+        outputs=("out0", "out1"),
+        bytes_per_element=16,
+        scalars={},
+    ),
+    _PerfCase(
+        name="scalar_broadcast",
+        jit_fn=_perf_scalar_broadcast_kernel,
+        signature={
+            "x": "*fp32",
+            "out0": "*fp32",
+            "out1": "*fp32",
+            "n": "i64",
+            "alpha": "fp32",
+            "BLOCK": "constexpr",
+        },
+        contract="cuda_pointwise_flat",
+        inputs=("x",),
+        outputs=("out0", "out1"),
+        bytes_per_element=12,
+        scalars={"alpha": 2.5},
+    ),
+)
+
+
+@pytest.mark.skipif(
+    not _RUN_PERF,
+    reason="Set TRITON_TVM_RUN_PERF_BASELINE=1 to run Triton TVM perf baseline",
+)
+@tvm.testing.requires_cuda
+def test_m25_perf_baseline_regression_guard():
+    results = _run_perf_baseline()
+    print("TRITON_TVM_PERF_RESULT " + json.dumps(results, indent=2, sort_keys=True))
+
+    write_path = os.environ.get("TRITON_TVM_PERF_WRITE_JSON")
+    if write_path:
+        Path(write_path).write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
+
+    baseline_path = os.environ.get("TRITON_TVM_PERF_BASELINE_JSON")
+    if baseline_path:
+        _assert_no_perf_regression(results, Path(baseline_path))
+
+
+def _run_perf_baseline() -> dict[str, Any]:
+    dev = tvm.cuda(0)
+    rng = np.random.default_rng(0)
+
+    payload = {
+        "schema_version": 1,
+        "purpose": "m2.5 standalone pointwise performance baseline/regression guard",
+        "n": _DEFAULT_N,
+        "block": _DEFAULT_BLOCK,
+        "tvm_number": _TVM_NUMBER,
+        "tvm_repeat": _TVM_REPEAT,
+        "tvm_min_repeat_ms": _TVM_MIN_REPEAT_MS,
+        "triton_warmup": _TRITON_WARMUP,
+        "triton_rep": _TRITON_REP,
+        "device": torch.cuda.get_device_name(0),
+        "tvm_version": tvm.__version__,
+        "triton_version": triton.__version__,
+        "cases": [],
+    }
+
+    for case in _PERF_CASES:
+        payload["cases"].append(_benchmark_case(case, dev, rng))
+
+    return payload
+
+
+def _benchmark_case(case: _PerfCase, dev, rng: np.random.Generator) -> dict[str, Any]:
+    n = _DEFAULT_N
+    block = _DEFAULT_BLOCK
+    grid = (triton.cdiv(n, block),)
+    arrays = _make_arrays(case, n, rng)
+    scalar_values = {"n": n, **case.scalars}
+
+    artifact = lower_to_ttir(case.jit_fn, case.signature, {"BLOCK": block})
+    irmod, meta = translate_ttir(
+        artifact,
+        grid=grid,
+        target="cuda",
+        contract=case.contract,
+    )
+    built = build_triton_tvm(irmod, meta)
+
+    tvm_args = _make_tvm_args(case, arrays, scalar_values, dev)
+    built.run(tvm_args)
+    timer = built.executable.mod.time_evaluator(
+        meta.kernel_name,
+        dev,
+        number=_TVM_NUMBER,
+        repeat=_TVM_REPEAT,
+        min_repeat_ms=_TVM_MIN_REPEAT_MS,
+    )
+    tvm_result = timer(*tvm_args)
+    tvm_seconds = statistics.median(tvm_result.results)
+
+    torch_args = _make_torch_args(case, arrays, scalar_values)
+    triton_ms = triton.testing.do_bench(
+        lambda: case.jit_fn[grid](*torch_args, BLOCK=block),
+        warmup=_TRITON_WARMUP,
+        rep=_TRITON_REP,
+    )
+    triton_seconds = float(triton_ms) / 1e3
+
+    traffic_bytes = n * case.bytes_per_element
+    tvm_gbps = _gbps(traffic_bytes, tvm_seconds)
+    triton_gbps = _gbps(traffic_bytes, triton_seconds)
+    return {
+        "case": case.name,
+        "contract": case.contract,
+        "traffic_bytes": traffic_bytes,
+        "tvm_us": tvm_seconds * 1e6,
+        "tvm_gbps": tvm_gbps,
+        "triton_us": triton_seconds * 1e6,
+        "triton_gbps": triton_gbps,
+        "tvm_to_triton_gbps": tvm_gbps / triton_gbps if triton_gbps else None,
+    }
+
+
+def _make_arrays(case: _PerfCase, n: int, rng: np.random.Generator) -> dict[str, np.ndarray]:
+    arrays: dict[str, np.ndarray] = {}
+    for name in case.inputs:
+        arrays[name] = rng.random(n, dtype=np.float32)
+    for name in case.outputs:
+        arrays[name] = np.empty(n, dtype=np.float32)
+    return arrays
+
+
+def _make_tvm_args(case: _PerfCase, arrays, scalars, dev) -> list[Any]:
+    args = []
+    for name, ty in case.signature.items():
+        if ty == "constexpr":
+            continue
+        if name in arrays:
+            if name in case.inputs:
+                args.append(tvm.runtime.tensor(arrays[name], dev))
+            else:
+                args.append(tvm.runtime.empty(arrays[name].shape, "float32", dev))
+        else:
+            args.append(scalars[name])
+    return args
+
+
+def _make_torch_args(case: _PerfCase, arrays, scalars) -> list[Any]:
+    args = []
+    for name, ty in case.signature.items():
+        if ty == "constexpr":
+            continue
+        if name in arrays:
+            if name in case.inputs:
+                args.append(torch.tensor(arrays[name], device="cuda"))
+            else:
+                args.append(torch.empty(arrays[name].shape, dtype=torch.float32, device="cuda"))
+        else:
+            args.append(scalars[name])
+    return args
+
+
+def _gbps(num_bytes: int, seconds: float) -> float:
+    return num_bytes / seconds / 1e9
+
+
+def _assert_no_perf_regression(current: dict[str, Any], baseline_path: Path) -> None:
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    baseline_cases = {case["case"]: case for case in baseline["cases"]}
+    regressions = []
+
+    for key in ("device", "n", "block"):
+        if baseline.get(key) != current.get(key):
+            regressions.append(
+                f"{key}: current {current.get(key)!r} does not match "
+                f"baseline {baseline.get(key)!r}"
+            )
+
+    for current_case in current["cases"]:
+        name = current_case["case"]
+        if name not in baseline_cases:
+            regressions.append(f"{name}: missing from baseline {baseline_path}")
+            continue
+
+        baseline_gbps = float(baseline_cases[name]["tvm_gbps"])
+        current_gbps = float(current_case["tvm_gbps"])
+        floor_gbps = baseline_gbps * (1.0 - _REGRESSION_TOLERANCE)
+        if current_gbps < floor_gbps:
+            regressions.append(
+                f"{name}: {current_gbps:.2f} GB/s below floor {floor_gbps:.2f} GB/s "
+                f"(baseline {baseline_gbps:.2f} GB/s, tolerance {_REGRESSION_TOLERANCE:.0%})"
+            )
+
+    assert not regressions, "Triton TVM perf regression detected:\n" + "\n".join(regressions)
+
+
+if __name__ == "__main__":
+    tvm.testing.main()
