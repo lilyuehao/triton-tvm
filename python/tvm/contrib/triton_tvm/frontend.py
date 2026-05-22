@@ -42,6 +42,7 @@ def lower_to_ttir(
     constexprs: dict[str, Any] | None = None,
     *,
     dump_path: str | Path | None = None,
+    attrs: Any | None = None,
 ) -> TTIRArtifact:
     """Lower a Triton JIT function to optimized TTIR.
 
@@ -58,6 +59,11 @@ def lower_to_ttir(
 
     dump_path:
         Optional path where the textual TTIR should be written.
+
+    attrs:
+        Optional Triton argument attributes.  Standalone kernels usually do not
+        need this, but TorchInductor kernels carry alignment/divisibility attrs
+        through their generated autotuner metadata.
     """
     import triton  # pylint: disable=import-outside-toplevel
 
@@ -72,6 +78,7 @@ def lower_to_ttir(
         fn=jit_fn,
         signature=dict(signature),
         constexprs=constexprs,
+        attrs=attrs,
     )
     compiled = triton.compiler.compile(source, options={"constexprs": constexprs})
     ttir = compiled.asm["ttir"]

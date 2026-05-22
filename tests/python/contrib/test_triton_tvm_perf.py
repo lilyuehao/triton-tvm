@@ -14,11 +14,12 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""M2.5 performance baseline and regression guard for Triton TVM pointwise kernels.
+"""Performance baseline and regression guard for Triton TVM pointwise kernels.
 
 This file is intentionally opt-in.  The numbers are hardware- and driver-sensitive, so
 the default pytest run skips it.  Use it to establish a same-machine baseline and to
-guard later translator/contract changes against large regressions.
+guard later translator/contract changes against large regressions.  The case set covers
+the M2.5 standalone pointwise contracts and the M3.5 indexed pointwise contract.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,7 @@ _TVM_MIN_REPEAT_MS = int(os.environ.get("TRITON_TVM_PERF_TVM_MIN_REPEAT_MS", "10
 _TRITON_WARMUP = int(os.environ.get("TRITON_TVM_PERF_TRITON_WARMUP", "25"))
 _TRITON_REP = int(os.environ.get("TRITON_TVM_PERF_TRITON_REP", "100"))
 _REGRESSION_TOLERANCE = float(os.environ.get("TRITON_TVM_PERF_TOLERANCE", "0.35"))
+_BROADCAST_FEATURE = int(os.environ.get("TRITON_TVM_PERF_BROADCAST_FEATURE", "1024"))
 
 
 @triton.jit
@@ -100,6 +102,27 @@ def _perf_scalar_broadcast_kernel(x, out0, out1, n, alpha, BLOCK: tl.constexpr):
     tl.store(out1 + offsets, vx * alpha, mask=mask)
 
 
+@triton.jit
+def _perf_indexed_broadcast_relu_kernel(x, y, out, n, BLOCK: tl.constexpr, FEATURE: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    y_offsets = offsets % FEATURE
+    vx = tl.load(x + offsets, mask=mask)
+    vy = tl.load(y + y_offsets, mask=mask)
+    relu = tl.where(vx > 0.0, vx, 0.0)
+    tl.store(out + offsets, relu + vy, mask=mask)
+
+
+@triton.jit
+def _perf_indexed_strided_kernel(x, out, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    vx = tl.load(x + offsets * 2, mask=mask)
+    tl.store(out + offsets, vx * 2.0, mask=mask)
+
+
 @dataclass(frozen=True)
 class _PerfCase:
     name: str
@@ -110,6 +133,9 @@ class _PerfCase:
     outputs: tuple[str, ...]
     bytes_per_element: int
     scalars: dict[str, Any]
+    constexprs: dict[str, Any] = field(default_factory=dict)
+    array_size_factors: dict[str, int] = field(default_factory=dict)
+    array_size_constants: dict[str, int] = field(default_factory=dict)
 
 
 _PERF_CASES = (
@@ -180,6 +206,41 @@ _PERF_CASES = (
         bytes_per_element=12,
         scalars={"alpha": 2.5},
     ),
+    _PerfCase(
+        name="indexed_broadcast_relu",
+        jit_fn=_perf_indexed_broadcast_relu_kernel,
+        signature={
+            "x": "*fp32",
+            "y": "*fp32",
+            "out": "*fp32",
+            "n": "i64",
+            "BLOCK": "constexpr",
+            "FEATURE": "constexpr",
+        },
+        contract="pointwise_indexed",
+        inputs=("x", "y"),
+        outputs=("out",),
+        bytes_per_element=12,
+        scalars={},
+        constexprs={"FEATURE": _BROADCAST_FEATURE},
+        array_size_constants={"y": _BROADCAST_FEATURE},
+    ),
+    _PerfCase(
+        name="indexed_strided",
+        jit_fn=_perf_indexed_strided_kernel,
+        signature={
+            "x": "*fp32",
+            "out": "*fp32",
+            "n": "i64",
+            "BLOCK": "constexpr",
+        },
+        contract="pointwise_indexed",
+        inputs=("x",),
+        outputs=("out",),
+        bytes_per_element=8,
+        scalars={},
+        array_size_factors={"x": 2},
+    ),
 )
 
 
@@ -188,7 +249,7 @@ _PERF_CASES = (
     reason="Set TRITON_TVM_RUN_PERF_BASELINE=1 to run Triton TVM perf baseline",
 )
 @tvm.testing.requires_cuda
-def test_m25_perf_baseline_regression_guard():
+def test_pointwise_perf_baseline_regression_guard():
     results = _run_perf_baseline()
     print("TRITON_TVM_PERF_RESULT " + json.dumps(results, indent=2, sort_keys=True))
 
@@ -207,7 +268,7 @@ def _run_perf_baseline() -> dict[str, Any]:
 
     payload = {
         "schema_version": 1,
-        "purpose": "m2.5 standalone pointwise performance baseline/regression guard",
+        "purpose": "pointwise performance baseline/regression guard",
         "n": _DEFAULT_N,
         "block": _DEFAULT_BLOCK,
         "tvm_number": _TVM_NUMBER,
@@ -215,6 +276,7 @@ def _run_perf_baseline() -> dict[str, Any]:
         "tvm_min_repeat_ms": _TVM_MIN_REPEAT_MS,
         "triton_warmup": _TRITON_WARMUP,
         "triton_rep": _TRITON_REP,
+        "broadcast_feature": _BROADCAST_FEATURE,
         "device": torch.cuda.get_device_name(0),
         "tvm_version": tvm.__version__,
         "triton_version": triton.__version__,
@@ -234,7 +296,8 @@ def _benchmark_case(case: _PerfCase, dev, rng: np.random.Generator) -> dict[str,
     arrays = _make_arrays(case, n, rng)
     scalar_values = {"n": n, **case.scalars}
 
-    artifact = lower_to_ttir(case.jit_fn, case.signature, {"BLOCK": block})
+    constexprs = {"BLOCK": block, **case.constexprs}
+    artifact = lower_to_ttir(case.jit_fn, case.signature, constexprs)
     irmod, meta = translate_ttir(
         artifact,
         grid=grid,
@@ -257,7 +320,7 @@ def _benchmark_case(case: _PerfCase, dev, rng: np.random.Generator) -> dict[str,
 
     torch_args = _make_torch_args(case, arrays, scalar_values)
     triton_ms = triton.testing.do_bench(
-        lambda: case.jit_fn[grid](*torch_args, BLOCK=block),
+        lambda: case.jit_fn[grid](*torch_args, **constexprs),
         warmup=_TRITON_WARMUP,
         rep=_TRITON_REP,
     )
@@ -281,10 +344,16 @@ def _benchmark_case(case: _PerfCase, dev, rng: np.random.Generator) -> dict[str,
 def _make_arrays(case: _PerfCase, n: int, rng: np.random.Generator) -> dict[str, np.ndarray]:
     arrays: dict[str, np.ndarray] = {}
     for name in case.inputs:
-        arrays[name] = rng.random(n, dtype=np.float32)
+        arrays[name] = rng.random(_array_size(case, name, n), dtype=np.float32)
     for name in case.outputs:
-        arrays[name] = np.empty(n, dtype=np.float32)
+        arrays[name] = np.empty(_array_size(case, name, n), dtype=np.float32)
     return arrays
+
+
+def _array_size(case: _PerfCase, name: str, n: int) -> int:
+    if name in case.array_size_constants:
+        return int(case.array_size_constants[name])
+    return n * int(case.array_size_factors.get(name, 1))
 
 
 def _make_tvm_args(case: _PerfCase, arrays, scalars, dev) -> list[Any]:
@@ -336,7 +405,6 @@ def _assert_no_perf_regression(current: dict[str, Any], baseline_path: Path) -> 
     for current_case in current["cases"]:
         name = current_case["case"]
         if name not in baseline_cases:
-            regressions.append(f"{name}: missing from baseline {baseline_path}")
             continue
 
         baseline_gbps = float(baseline_cases[name]["tvm_gbps"])

@@ -855,18 +855,58 @@ UnsupportedTTIROpError: tt.dot is not supported yet
 - offline Inductor kernel regression test
 - capability matrix update
 
+### M3.5 Hardening: M4 Entry Gate
+
+目标：
+
+- 在开启 M4 reduction 前收紧 M3.5 aggressive pointwise 覆盖的语义边界。
+- 不新增 Inductor pointwise 覆盖，不实现 reduction lowering，不接 Inductor runtime。
+- 将 pointwise op capability 从全局 allowlist 改成 per-contract allowlist。
+- 将 `pointwise_indexed` 的 no-`other` masked load、indexed pointer 和 bool bitcast-store
+  语义固化到 contract validator 和 negative tests。
+- 保持 `NormalizeTritonKernelTIR` validation-only，作为 M4 前的显式选择；如果 M4 暴露
+  mask/index/legalize 复用压力，再规划 rewrite pass。
+- 让 `reduction_minimal` 保持 clean placeholder，明确报 not implemented，不进入 pointwise
+  translator。
+
+完成标准：
+
+- `pointwise_minimal` / `pointwise_flat` 只接受 M2.5 flat pointwise op surface。
+- `pointwise_indexed` 独占 M3.5 indexed/math/no-`other` 扩展。
+- 手写 shape-only TIR 不能绕过 `pointwise_indexed` 的 load/guard/index 约束。
+- 三组回归通过：static、standalone pointwise、Inductor promoted subset。
+
 ### M4: Reduction Subset
 
 目标：
 
-- 支持简单 block reduction。
-- 跑通 layernorm/rmsnorm-like kernel 的核心片段。
-- 明确 reduction axis、init 和 mask semantics。
+- 支持 `reduction_minimal` correctness-first row-wise reduction。
+- 支持 Triton 3.7 textual `"tt.reduce"` region parsing，combiner 限定为
+  `arith.addf` / `arith.addi` + `tt.reduce.return`。
+- 支持 `tl.sum(axis=0)`、row sum、RMSNorm core、RMSNorm with weight，以及单行
+  LayerNorm gamma/beta 形态。
+- 单行完整 LN/RMS 已收口：runtime `n`、runtime/constexpr `eps`、mask、RMS
+  weight、LayerNorm gamma/beta、LayerNorm 双 reduction 均有 CUDA correctness
+  覆盖。
+- 明确 M4 v0 不追求性能：每个 row 由 `threadIdx.x == 0` 串行完成 reduction 和
+  epilogue，避免 shared/local accumulator race；shared/allreduce 或标准 TIR
+  reduction block 留给后续优化。
+- 明确 mask semantics：masked load 必须带 explicit zero `other`；安全的
+  unmasked load 可用于 `n == BLOCK` 的 weight/gamma/beta 等参数；masked-out
+  lanes 只有在 kernel 显式 `tl.where` 或 mask 后才不会参与后续 reduction。
+- `grid` 必须是 static 1D row count；不支持 callable/multidim grid、persistent
+  kernel、cross-block reduction、Welford、`tl.max`、atomic 或 Inductor runtime hook。
 
 产物：
 
 - reduction correctness tests
-- one model-derived kernel case
+- row sum / RMS / RMSNorm / LayerNorm CUDA correctness cases
+- `validate_reduction_minimal_contract`
+
+M5 前保持：
+
+- 单行完整 LN/RMS 作为 M5 前置能力维护，不再作为未完成项。
+- 性能路径另起 hardening/optimization，不作为 M4 pass/fail criterion。
 
 ### M5: Inductor Integration Prototype
 

@@ -547,3 +547,458 @@ Opt-in regression guard against the generated baseline:
 ```text
 1 passed
 ```
+
+## 2026-05-22: M3 Inductor Pointwise Audit
+
+### Implemented Scope
+
+- Added `python/tvm/contrib/triton_tvm/inductor.py` as the M3 offline audit tool.
+- The tool extracts `async_compile.triton(...)` source blocks from TorchInductor wrapper code
+  using Python AST parsing.
+- The tool loads extracted kernels through PyTorch `PyCodeCache`, force-reloading source blocks
+  so the generated `CachingAutotuner` still has its Triton configs.
+- The tool lowers loaded Inductor kernels to optimized TTIR with the existing Triton frontend path,
+  preserving Inductor argument attrs from the autotuner metadata.
+- The tool audits TTIR op/type/attr/indexing/mask coverage and then tries the existing
+  `translate_ttir(..., contract="pointwise_flat")` path only to classify current gaps.
+- No TVM build/run path, Inductor runtime hook, or translator semantic expansion was added.
+
+### CLI Added
+
+```bash
+python -m tvm.contrib.triton_tvm.inductor \
+  --builtin-corpus \
+  --out-dir /tmp/triton_tvm_m3 \
+  --min-kernels 20
+```
+
+Outputs:
+
+- `kernels/*.py`
+- `ttir/*.ttir`
+- `report.json`
+- `report.md`
+
+`--input-dir PATH` can also scan existing Inductor wrapper/cache `.py` files.
+
+### Builtin Corpus
+
+The builtin corpus currently contains 24 pointwise cases:
+
+- `add`
+- `add_mul`
+- `three_input_chain`
+- `scalar_alpha`
+- `two_scalars`
+- `relu_add`
+- `sigmoid_mul`
+- `tanh_shift`
+- `exp_log_abs`
+- `sin_cos`
+- `where_cmp`
+- `clamp_add`
+- `reciprocal_abs`
+- `sqrt_rsqrt`
+- `pow2_add`
+- `fp16_add`
+- `bf16_add`
+- `int32_add`
+- `bool_mask`
+- `broadcast_row`
+- `broadcast_col`
+- `tuple_two_outputs`
+- `strided_input`
+- `slice_even`
+
+### Local Audit Result
+
+Command:
+
+```bash
+conda run -n tvm-0.24.0 \
+  python -m tvm.contrib.triton_tvm.inductor \
+  --builtin-corpus \
+  --out-dir /tmp/triton_tvm_m3 \
+  --min-kernels 20
+```
+
+Result:
+
+```text
+Wrote M3 Inductor audit with 24 kernels to /tmp/triton_tvm_m3
+```
+
+Summary:
+
+- 24 pointwise kernels collected.
+- 24 TTIR dumps generated.
+- 0 kernels translated by the current M2.5 translator.
+- Unsupported buckets: `unsupported_ttir_op=24`.
+- Dominant blocker: Inductor emits masked `tt.load` without explicit `other`.
+- Broadcast cases additionally exposed `arith.remsi` and `arith.divsi` indexing patterns.
+
+Full compressed report:
+
+- `docs/arch/triton_tvm_m3_inductor_audit.md`
+
+### Tests Added
+
+- Added `tests/python/contrib/test_triton_tvm_inductor_subset.py`.
+- Static coverage:
+  - AST extraction from hard-coded Inductor wrapper source.
+  - Coverage/report generation from hand-written TTIR.
+  - Unsupported bucket and Markdown/JSON report checks.
+- CUDA coverage:
+  - Compiles a small `torch.compile(..., backend="inductor")` pointwise case.
+  - Captures Inductor wrapper source through `GraphLowering.save_output_code`.
+  - Extracts, loads, lowers to TTIR, reads with `TTIRReader`, and runs audit classification.
+
+### Remaining Bounds
+
+- M3 intentionally does not implement unsafe masked-load semantics.
+- M3 does not build/run translated TVM modules.
+- M3 does not add an Inductor runtime or `torch.compile` hook.
+- M3.5 should start with masked load semantics and high-frequency Inductor pointwise ops from the
+  M3 coverage report.
+
+## 2026-05-22: M3.5 Inductor Pointwise Coverage
+
+### Implemented Scope
+
+- Added the canonical `pointwise_indexed` contract and `cuda_pointwise_indexed` alias.
+- Extended `TritonTVMMeta` with:
+  - `extent_kind`;
+  - `extent_value`;
+  - `buffer_extents`.
+- Hardened `TTIRReader` for real TorchInductor TTIR:
+  - strips parameter attrs from types;
+  - parses `arith.cmpf`, `arith.select`, `arith.extf`, `arith.truncf`;
+  - parses `tt.bitcast`, `tt.extern_elementwise`, and bare load/store attrs such as
+    `evictionPolicy = evict_last`.
+- Implemented safe masked `tt.load` without `other` for `pointwise_indexed`:
+  - load/store masks must share the same memory predicate;
+  - no-`other` load values must flow only into store values guarded by that predicate;
+  - pointer, load, return, unguarded-store, and unsupported uses are rejected explicitly.
+- Added lowering for the M3 Inductor pointwise op surface:
+  - `arith.select`, observed `arith.cmpf` predicates, `arith.divf`;
+  - `arith.divsi`, `arith.remsi`, bool `arith.andi` / `arith.ori`;
+  - `arith.extf`, `arith.truncf`;
+  - `math.absf`, `math.sin`, `math.cos`, `math.exp`, `math.log`, `tt.precise_sqrt`;
+  - `tt.extern_elementwise` symbols `__nv_expf`, `__nv_tanhf`, and `__nv_rsqrtf`.
+- Added indexed pointer support for:
+  - flat `idx`;
+  - broadcast `idx % C` and `idx // C`;
+  - strided `idx * C`.
+- Added the observed bool output pattern:
+  - `ptr<i1> -> ptr<i8>` plus `extui bool -> i8` stores are collapsed to bool buffer stores.
+- Kept `NormalizeTritonKernelTIR` validation-only and did not add an Inductor runtime hook.
+
+### Audit Result
+
+Command:
+
+```bash
+conda run -n tvm-0.24.0 \
+  python -m tvm.contrib.triton_tvm.inductor \
+  --builtin-corpus \
+  --out-dir /tmp/triton_tvm_m35 \
+  --min-kernels 20 \
+  --contract pointwise_indexed
+```
+
+Result:
+
+```text
+Wrote M3 Inductor audit with 24 kernels to /tmp/triton_tvm_m35
+```
+
+Summary:
+
+- 24 pointwise kernels collected.
+- 24 kernels translated with `contract="pointwise_indexed"`.
+- Unsupported buckets: `translated=24`.
+
+### Tests Added
+
+- Static `pointwise_indexed` coverage for:
+  - real Inductor parameter attrs and bare load attrs;
+  - constant extent masks;
+  - safe and unsafe masked loads without `other`;
+  - indexed broadcast pointers;
+  - bool bitcast-store collapse.
+- M3.5 audit coverage proving the previous masked-load blocker translates under
+  `pointwise_indexed`.
+- CUDA build/run coverage for promoted Inductor pointwise cases:
+  - `add`, `tuple_two_outputs`, `relu_add`, `where_cmp`, `sigmoid_mul`, `sin_cos`;
+  - `broadcast_row`, `broadcast_col`, `strided_input`, `slice_even`;
+  - `fp16_add`, `int32_add`, `bool_mask`.
+
+### Validation
+
+Commands:
+
+```bash
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_static.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_inductor_subset.py
+```
+
+Results:
+
+```text
+12 passed
+17 passed
+16 passed
+```
+
+## 2026-05-22: M3.5 Hardening / M4 Entry Gate
+
+### Positioning
+
+This checkpoint hardens the aggressive M3.5 Inductor pointwise coverage before
+opening M4 reductions.  It does not add reduction lowering, does not expand the
+Inductor pointwise corpus, and does not add an Inductor runtime hook.
+
+### Implementation Changes
+
+- Replaced the global translator op allowlist with per-contract TTIR capability
+  tables:
+  - `pointwise_minimal` and `pointwise_flat` keep the M2.5 flat pointwise op set.
+  - `pointwise_indexed` exclusively enables M3.5 no-`other` masked loads,
+    indexed pointer ops, math/extern ops, and the observed bool bitcast-store
+    pattern.
+- Made `reduction_minimal` fail before target-policy or pointwise-builder
+  dispatch with an explicit not-implemented error for M4.
+- Bumped metadata versions:
+  - translator: `triton_tvm_python_m35_hardened_v1`;
+  - `pointwise_indexed`: `pointwise_indexed_v2`.
+- Strengthened `validate_pointwise_indexed_contract`:
+  - every store must be guarded;
+  - all stores must use the same guard;
+  - direct `BufferLoad` nodes must appear only inside guarded store values;
+  - store/load buffer indices are limited to `i`, `i % C`, `i // C`, and `i * C`.
+- Kept `NormalizeTritonKernelTIR` validation-only as an explicit pre-M4 choice.
+  M4 can continue the direct-to-contract prototype; shared lane/mask/index
+  rewrites should move into this pass only once reduction lowering creates
+  concrete reuse pressure.
+
+### Tests Added
+
+- Static hardening coverage that `pointwise_flat` rejects M3.5-only indexed ops
+  and bool bitcast-store patterns.
+- Static validator coverage that shape-only `pointwise_indexed` TIR is rejected
+  when direct loads escape guarded store values, indexes leave the supported set,
+  or stores use different guards.
+- Static coverage that `reduction_minimal` reports `not implemented yet` instead
+  of falling into pointwise-specific errors.
+
+### M4 Entry Criteria
+
+- `pointwise_indexed` safe no-`other` masked load semantics are locked by
+  translator proof, contract validation, and negative tests.
+- Pointwise contract op surfaces are contract-specific and no longer expand via
+  a single global allowlist.
+- M3.5 remains documented as offline pointwise E2E only.
+- `reduction_minimal` remains a clean placeholder.
+
+### Validation
+
+Commands:
+
+```bash
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_static.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_inductor_subset.py
+```
+
+Results:
+
+```text
+14 passed
+17 passed
+16 passed
+```
+
+Audit recheck:
+
+```bash
+conda run -n tvm-0.24.0 \
+  python -m tvm.contrib.triton_tvm.inductor \
+  --builtin-corpus \
+  --out-dir /tmp/triton_tvm_m35_hardening_m3 \
+  --min-kernels 20
+
+conda run -n tvm-0.24.0 \
+  python -m tvm.contrib.triton_tvm.inductor \
+  --builtin-corpus \
+  --out-dir /tmp/triton_tvm_m35_hardening_m35 \
+  --min-kernels 20 \
+  --contract pointwise_indexed
+```
+
+Audit results:
+
+```text
+pointwise_flat: total=24, translated=0, unsupported_ttir_op=24
+pointwise_indexed: total=24, translated=24, bucket translated=24
+```
+
+## 2026-05-22: M3.5 Pointwise Performance Baseline
+
+### Positioning
+
+This checkpoint extends the opt-in performance guard from the M2.5 standalone
+pointwise corpus to the M3.5 `pointwise_indexed` contract.  It remains a
+same-machine regression guard, not a portable performance claim.
+
+### Test Changes
+
+- `tests/python/contrib/test_triton_tvm_perf.py` now covers:
+  - the existing M2.5 `cuda_minimal` / `cuda_pointwise_flat` standalone cases;
+  - `indexed_broadcast_relu`, covering no-`other` masked loads, `%` indexing,
+    compare/select, and `pointwise_indexed`;
+  - `indexed_strided`, covering no-`other` masked loads and `idx * 2`
+    `pointwise_indexed` pointer indexing.
+- Older JSON baselines may omit newer cases; regression comparison now checks
+  overlapping cases so the M2.5 baseline remains usable.
+- Added local RTX 6000D sample baseline:
+  `docs/arch/triton_tvm_m35_perf_baseline_rtx6000d.baseline`.
+
+### Commands
+
+Default test path, expected to skip:
+
+```bash
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_perf.py
+```
+
+Collect the M3.5 baseline:
+
+```bash
+TRITON_TVM_RUN_PERF_BASELINE=1 \
+TRITON_TVM_PERF_WRITE_JSON=/tmp/triton_tvm_m35_perf_baseline.json \
+conda run -n tvm-0.24.0 python -m pytest -q -s tests/python/contrib/test_triton_tvm_perf.py
+```
+
+### Local Baseline
+
+Environment:
+
+- GPU: NVIDIA RTX 6000D
+- TVM version: `0.24.0`
+- Triton version: `3.7.0`
+- `n = 4194304`
+- `BLOCK = 256`
+- broadcast feature size: `1024`
+
+| Case | Contract | TVM us | TVM GB/s | Triton us | Triton GB/s | TVM/Triton GB/s |
+|---|---|---:|---:|---:|---:|---:|
+| vector_add | cuda_minimal | 10.01 | 5029.32 | 49.32 | 1020.41 | 4.93x |
+| pointwise_chain | cuda_minimal | 10.10 | 6644.53 | 66.12 | 1014.89 | 6.55x |
+| dual_store | cuda_pointwise_flat | 12.47 | 5379.86 | 58.40 | 1149.09 | 4.68x |
+| scalar_broadcast | cuda_pointwise_flat | 11.65 | 4318.75 | 42.30 | 1189.89 | 3.63x |
+| indexed_broadcast_relu | pointwise_indexed | 9.99 | 5037.21 | 30.27 | 1662.65 | 3.03x |
+| indexed_strided | pointwise_indexed | 9.98 | 3362.37 | 46.57 | 720.46 | 4.67x |
+
+### Validation
+
+Results:
+
+```text
+default perf test: 1 skipped
+opt-in baseline collection: 1 passed
+opt-in regression guard against M3.5 baseline: 1 passed
+opt-in regression guard against old M2.5 baseline: 1 passed
+```
+
+## 2026-05-22: M4 Reduction Subset
+
+### Positioning
+
+M4 opens `reduction_minimal` as a correctness-first reduction contract.  It is
+not a performance milestone and does not add an Inductor runtime hook.  The v0
+lowering intentionally uses one lane per row (`threadIdx.x == 0`) to compute the
+row reduction and epilogue serially, avoiding accumulator races until a later
+shared/allreduce or TIR reduction-block path is designed.
+
+### Implementation Changes
+
+- Extended `TTIRReader` to parse quoted region ops such as `"tt.reduce"`:
+  - the reduce op remains a top-level `TTIROp`;
+  - combiner ops are stored in `TTIROp.regions`;
+  - region-local `arith.addf` / `tt.reduce.return` no longer leak into the
+    top-level op stream;
+  - ops after the reduce region, including `tt.store`, continue to parse.
+- Implemented the dedicated `reduction_minimal` translator path:
+  - `tl.sum(axis=0)` with single-input sum combiner;
+  - row-major pointers `x + row * n + offsets`, vector epilogues
+    `out + row * n + offsets`, scalar row outputs `out + row`, and
+    per-row weight/gamma/beta vectors;
+  - explicit-zero masked loads only;
+  - fp32 row sum, RMS core, RMSNorm weight, and LayerNorm gamma/beta formulas.
+- Promoted `reduction_minimal` from placeholder to contract version
+  `reduction_minimal_v1` and added `validate_reduction_minimal_contract`.
+- Kept M4 grid support narrow: static 1D row count only.  Callable and multidim
+  grids are rejected.
+
+### Tests Added
+
+- Static reader coverage for real Triton 3.7 `"tt.reduce"` region shape.
+- Static reduction contract and negative coverage for unsupported axis,
+  non-sum combiner, masked load without explicit zero `other`, non-row-major
+  pointer patterns, callable grid, and multidim grid.
+- CUDA correctness coverage for row sum, RMS core, RMSNorm with weight, and
+  LayerNorm with gamma/beta and two reductions.
+
+### Validation
+
+Commands:
+
+```bash
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_static.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_inductor_subset.py
+```
+
+Results:
+
+```text
+16 passed
+21 passed
+16 passed
+```
+
+## 2026-05-22: M4 Full LN/RMS Closure
+
+### Positioning
+
+This closes the single-row full LN/RMS surface that was reserved as a pre-M5
+capability.  It keeps the same correctness-first `reduction_minimal` lowering
+and does not introduce a performance-oriented shared/allreduce path.
+
+### Implementation Changes
+
+- Kept masked loads strict: `tt.load(ptr, mask)` without `other` is still
+  rejected for reductions.
+- Added safe unmasked `tt.load(ptr)` support for reduction epilogues and
+  parameter vectors, covering `n == BLOCK` gamma/beta/weight access patterns.
+- Confirmed runtime `eps` flows through the scalar ABI for RMSNorm and
+  LayerNorm, in addition to the earlier constexpr-eps cases.
+
+### Tests Added
+
+- CUDA RMSNorm with runtime `eps`, runtime `n`, mask, and weight vector.
+- CUDA LayerNorm with runtime `eps`, runtime `n`, mask, gamma/beta vectors, and
+  two reductions.
+- CUDA LayerNorm with runtime `eps` and unmasked gamma/beta loads in the
+  `n == BLOCK` case.
+
+### Validation
+
+Results after closure:
+
+```text
+test_triton_tvm_static.py: 16 passed
+test_triton_tvm.py: 24 passed
+test_triton_tvm_inductor_subset.py: 16 passed
+```

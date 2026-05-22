@@ -32,6 +32,7 @@ from tvm.contrib.triton_tvm import (
     validate_cuda_pointwise_flat_contract,
     validate_pointwise_flat_contract,
     validate_pointwise_minimal_contract,
+    validate_reduction_minimal_contract,
 )
 
 try:
@@ -96,6 +97,98 @@ def _strided_pointer_kernel(x, out, n, BLOCK: tl.constexpr):
     tl.store(out + offsets, vx, mask=mask)
 
 
+@triton.jit
+def _row_sum_kernel(x, out, n, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < n
+    values = tl.load(x + row * n + offsets, mask=mask, other=0.0)
+    acc = tl.sum(values, axis=0)
+    tl.store(out + row, acc)
+
+
+@triton.jit
+def _rms_core_kernel(x, out, n, eps: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < n
+    values = tl.load(x + row * n + offsets, mask=mask, other=0.0)
+    ss = tl.sum(values * values, axis=0)
+    scale = tl.rsqrt(ss / n + eps)
+    tl.store(out + row * n + offsets, values * scale, mask=mask)
+
+
+@triton.jit
+def _rmsnorm_kernel(x, weight, out, n, eps: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < n
+    values = tl.load(x + row * n + offsets, mask=mask, other=0.0)
+    weight_values = tl.load(weight + offsets, mask=mask, other=0.0)
+    ss = tl.sum(values * values, axis=0)
+    scale = tl.rsqrt(ss / n + eps)
+    tl.store(out + row * n + offsets, values * scale * weight_values, mask=mask)
+
+
+@triton.jit
+def _rmsnorm_runtime_eps_kernel(x, weight, out, n, eps, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < n
+    values = tl.load(x + row * n + offsets, mask=mask, other=0.0)
+    weight_values = tl.load(weight + offsets, mask=mask, other=0.0)
+    ss = tl.sum(values * values, axis=0)
+    scale = tl.rsqrt(ss / n + eps)
+    tl.store(out + row * n + offsets, values * scale * weight_values, mask=mask)
+
+
+@triton.jit
+def _layernorm_kernel(x, gamma, beta, out, n, eps: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < n
+    values = tl.load(x + row * n + offsets, mask=mask, other=0.0)
+    gamma_values = tl.load(gamma + offsets, mask=mask, other=0.0)
+    beta_values = tl.load(beta + offsets, mask=mask, other=0.0)
+    mean = tl.sum(values, axis=0) / n
+    centered = tl.where(mask, values - mean, 0.0)
+    var = tl.sum(centered * centered, axis=0) / n
+    normed = centered * tl.rsqrt(var + eps)
+    tl.store(out + row * n + offsets, normed * gamma_values + beta_values, mask=mask)
+
+
+@triton.jit
+def _layernorm_runtime_eps_kernel(x, gamma, beta, out, n, eps, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < n
+    values = tl.load(x + row * n + offsets, mask=mask, other=0.0)
+    gamma_values = tl.load(gamma + offsets, mask=mask, other=0.0)
+    beta_values = tl.load(beta + offsets, mask=mask, other=0.0)
+    mean = tl.sum(values, axis=0) / n
+    centered = tl.where(mask, values - mean, 0.0)
+    var = tl.sum(centered * centered, axis=0) / n
+    normed = centered * tl.rsqrt(var + eps)
+    tl.store(out + row * n + offsets, normed * gamma_values + beta_values, mask=mask)
+
+
+@triton.jit
+def _layernorm_runtime_eps_unmasked_params_kernel(
+    x, gamma, beta, out, n, eps, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < n
+    values = tl.load(x + row * n + offsets, mask=mask, other=0.0)
+    gamma_values = tl.load(gamma + offsets)
+    beta_values = tl.load(beta + offsets)
+    mean = tl.sum(values, axis=0) / n
+    centered = tl.where(mask, values - mean, 0.0)
+    var = tl.sum(centered * centered, axis=0) / n
+    normed = centered * tl.rsqrt(var + eps)
+    tl.store(out + row * n + offsets, normed * gamma_values + beta_values, mask=mask)
+
+
 def _signature():
     return {
         "x": "*fp32",
@@ -148,6 +241,71 @@ def _strided_pointer_signature():
     }
 
 
+def _row_sum_signature():
+    return {
+        "x": "*fp32",
+        "out": "*fp32",
+        "n": "i64",
+        "BLOCK": "constexpr",
+    }
+
+
+def _rms_core_signature():
+    return {
+        "x": "*fp32",
+        "out": "*fp32",
+        "n": "i64",
+        "eps": "constexpr",
+        "BLOCK": "constexpr",
+    }
+
+
+def _rmsnorm_signature():
+    return {
+        "x": "*fp32",
+        "weight": "*fp32",
+        "out": "*fp32",
+        "n": "i64",
+        "eps": "constexpr",
+        "BLOCK": "constexpr",
+    }
+
+
+def _layernorm_signature():
+    return {
+        "x": "*fp32",
+        "gamma": "*fp32",
+        "beta": "*fp32",
+        "out": "*fp32",
+        "n": "i64",
+        "eps": "constexpr",
+        "BLOCK": "constexpr",
+    }
+
+
+def _rmsnorm_runtime_eps_signature():
+    return {
+        "x": "*fp32",
+        "weight": "*fp32",
+        "out": "*fp32",
+        "n": "i64",
+        "eps": "fp32",
+        "BLOCK": "constexpr",
+    }
+
+
+def _layernorm_runtime_eps_signature():
+    return {
+        "x": "*fp32",
+        "gamma": "*fp32",
+        "beta": "*fp32",
+        "out": "*fp32",
+        "n": "i64",
+        "eps": "fp32",
+        "BLOCK": "constexpr",
+    }
+
+
 def _lower(block=128):
     return lower_to_ttir(_vector_add_kernel, _signature(), {"BLOCK": block})
 
@@ -163,6 +321,58 @@ def _lower_dual_store(block=64):
 def _lower_scalar_broadcast(block=64):
     return lower_to_ttir(
         _scalar_broadcast_kernel, _scalar_broadcast_signature(), {"BLOCK": block}
+    )
+
+
+def _lower_row_sum(block=64):
+    return lower_to_ttir(_row_sum_kernel, _row_sum_signature(), {"BLOCK": block})
+
+
+def _lower_rms_core(block=64, eps=1e-5):
+    return lower_to_ttir(
+        _rms_core_kernel,
+        _rms_core_signature(),
+        {"BLOCK": block, "eps": eps},
+    )
+
+
+def _lower_rmsnorm(block=64, eps=1e-5):
+    return lower_to_ttir(
+        _rmsnorm_kernel,
+        _rmsnorm_signature(),
+        {"BLOCK": block, "eps": eps},
+    )
+
+
+def _lower_layernorm(block=64, eps=1e-5):
+    return lower_to_ttir(
+        _layernorm_kernel,
+        _layernorm_signature(),
+        {"BLOCK": block, "eps": eps},
+    )
+
+
+def _lower_rmsnorm_runtime_eps(block=64):
+    return lower_to_ttir(
+        _rmsnorm_runtime_eps_kernel,
+        _rmsnorm_runtime_eps_signature(),
+        {"BLOCK": block},
+    )
+
+
+def _lower_layernorm_runtime_eps(block=64):
+    return lower_to_ttir(
+        _layernorm_runtime_eps_kernel,
+        _layernorm_runtime_eps_signature(),
+        {"BLOCK": block},
+    )
+
+
+def _lower_layernorm_runtime_eps_unmasked_params(block=64):
+    return lower_to_ttir(
+        _layernorm_runtime_eps_unmasked_params_kernel,
+        _layernorm_runtime_eps_signature(),
+        {"BLOCK": block},
     )
 
 
@@ -376,6 +586,220 @@ def test_m25_scalar_broadcast_pointwise_flat_build_run():
 
     tvm.testing.assert_allclose(out0_tvm.numpy(), x_np + alpha + 1.0, rtol=1e-5, atol=1e-5)
     tvm.testing.assert_allclose(out1_tvm.numpy(), x_np * alpha, rtol=1e-5, atol=1e-5)
+
+
+@tvm.testing.requires_cuda
+def test_m4_row_sum_reduction_minimal_build_run():
+    rows = 4
+    n = 37
+    block = 64
+    rng = np.random.default_rng(3)
+    x_np = rng.random((rows, n), dtype=np.float32)
+    expected_np = x_np.sum(axis=1)
+
+    artifact = _lower_row_sum(block=block)
+    graph = TTIRReader().read(artifact.ttir)
+    assert "tt.reduce" in {op.name for op in graph.ops}
+    irmod, meta = translate_ttir(
+        artifact,
+        grid=(rows,),
+        target="cuda",
+        contract="reduction_minimal",
+    )
+    validate_reduction_minimal_contract(irmod)
+    assert meta.contract == "reduction_minimal"
+    assert meta.contract_version == "reduction_minimal_v1"
+    built = build_triton_tvm(irmod, meta)
+
+    dev = tvm.cuda(0)
+    x_tvm = tvm.runtime.tensor(x_np.reshape(-1), dev)
+    out_tvm = tvm.runtime.empty((rows,), "float32", dev)
+    built.run([x_tvm, out_tvm, n])
+
+    tvm.testing.assert_allclose(out_tvm.numpy(), expected_np, rtol=1e-5, atol=1e-5)
+
+
+@tvm.testing.requires_cuda
+def test_m4_rms_core_reduction_minimal_build_run():
+    rows = 3
+    n = 41
+    block = 64
+    eps = 1e-5
+    rng = np.random.default_rng(4)
+    x_np = rng.random((rows, n), dtype=np.float32)
+    scale = 1.0 / np.sqrt(np.sum(x_np * x_np, axis=1, keepdims=True) / n + eps)
+    expected_np = x_np * scale.astype("float32")
+
+    artifact = _lower_rms_core(block=block, eps=eps)
+    irmod, meta = translate_ttir(
+        artifact,
+        grid=(rows,),
+        target="cuda",
+        contract="reduction_minimal",
+    )
+    validate_reduction_minimal_contract(irmod)
+    built = build_triton_tvm(irmod, meta)
+
+    dev = tvm.cuda(0)
+    x_tvm = tvm.runtime.tensor(x_np.reshape(-1), dev)
+    out_tvm = tvm.runtime.empty((rows * n,), "float32", dev)
+    built.run([x_tvm, out_tvm, n])
+
+    tvm.testing.assert_allclose(
+        out_tvm.numpy().reshape(rows, n), expected_np, rtol=1e-4, atol=1e-5
+    )
+
+
+@tvm.testing.requires_cuda
+def test_m4_rmsnorm_reduction_minimal_build_run():
+    rows = 3
+    n = 41
+    block = 64
+    eps = 1e-5
+    rng = np.random.default_rng(5)
+    x_np = rng.random((rows, n), dtype=np.float32)
+    weight_np = rng.random(n, dtype=np.float32)
+    scale = 1.0 / np.sqrt(np.sum(x_np * x_np, axis=1, keepdims=True) / n + eps)
+    expected_np = x_np * scale.astype("float32") * weight_np
+
+    artifact = _lower_rmsnorm(block=block, eps=eps)
+    irmod, meta = translate_ttir(
+        artifact,
+        grid=(rows,),
+        target="cuda",
+        contract="reduction_minimal",
+    )
+    validate_reduction_minimal_contract(irmod)
+    built = build_triton_tvm(irmod, meta)
+
+    dev = tvm.cuda(0)
+    x_tvm = tvm.runtime.tensor(x_np.reshape(-1), dev)
+    weight_tvm = tvm.runtime.tensor(weight_np, dev)
+    out_tvm = tvm.runtime.empty((rows * n,), "float32", dev)
+    built.run([x_tvm, weight_tvm, out_tvm, n])
+
+    tvm.testing.assert_allclose(
+        out_tvm.numpy().reshape(rows, n), expected_np, rtol=1e-4, atol=1e-5
+    )
+
+
+@tvm.testing.requires_cuda
+def test_m4_rmsnorm_runtime_eps_reduction_minimal_build_run():
+    rows = 3
+    n = 41
+    block = 64
+    eps = np.float32(1e-5)
+    rng = np.random.default_rng(7)
+    x_np = rng.random((rows, n), dtype=np.float32)
+    weight_np = rng.random(n, dtype=np.float32)
+    scale = 1.0 / np.sqrt(np.sum(x_np * x_np, axis=1, keepdims=True) / n + eps)
+    expected_np = x_np * scale.astype("float32") * weight_np
+
+    artifact = _lower_rmsnorm_runtime_eps(block=block)
+    irmod, meta = translate_ttir(
+        artifact,
+        grid=(rows,),
+        target="cuda",
+        contract="reduction_minimal",
+    )
+    validate_reduction_minimal_contract(irmod)
+    assert meta.abi[-1] == {"name": "eps", "kind": "scalar", "dtype": "float32"}
+    built = build_triton_tvm(irmod, meta)
+
+    dev = tvm.cuda(0)
+    x_tvm = tvm.runtime.tensor(x_np.reshape(-1), dev)
+    weight_tvm = tvm.runtime.tensor(weight_np, dev)
+    out_tvm = tvm.runtime.empty((rows * n,), "float32", dev)
+    built.run([x_tvm, weight_tvm, out_tvm, n, float(eps)])
+
+    tvm.testing.assert_allclose(
+        out_tvm.numpy().reshape(rows, n), expected_np, rtol=1e-4, atol=1e-5
+    )
+
+
+@tvm.testing.requires_cuda
+def test_m4_layernorm_reduction_minimal_build_run():
+    rows = 3
+    n = 41
+    block = 64
+    eps = 1e-5
+    rng = np.random.default_rng(6)
+    x_np = rng.random((rows, n), dtype=np.float32)
+    gamma_np = rng.random(n, dtype=np.float32)
+    beta_np = rng.random(n, dtype=np.float32)
+    mean = np.sum(x_np, axis=1, keepdims=True) / n
+    centered = x_np - mean.astype("float32")
+    var = np.sum(centered * centered, axis=1, keepdims=True) / n
+    expected_np = centered * (1.0 / np.sqrt(var + eps)).astype("float32")
+    expected_np = expected_np * gamma_np + beta_np
+
+    artifact = _lower_layernorm(block=block, eps=eps)
+    irmod, meta = translate_ttir(
+        artifact,
+        grid=(rows,),
+        target="cuda",
+        contract="reduction_minimal",
+    )
+    validate_reduction_minimal_contract(irmod)
+    assert len([op for op in TTIRReader().read(artifact.ttir).ops if op.name == "tt.reduce"]) == 2
+    built = build_triton_tvm(irmod, meta)
+
+    dev = tvm.cuda(0)
+    x_tvm = tvm.runtime.tensor(x_np.reshape(-1), dev)
+    gamma_tvm = tvm.runtime.tensor(gamma_np, dev)
+    beta_tvm = tvm.runtime.tensor(beta_np, dev)
+    out_tvm = tvm.runtime.empty((rows * n,), "float32", dev)
+    built.run([x_tvm, gamma_tvm, beta_tvm, out_tvm, n])
+
+    tvm.testing.assert_allclose(
+        out_tvm.numpy().reshape(rows, n), expected_np, rtol=1e-4, atol=1e-5
+    )
+
+
+@tvm.testing.requires_cuda
+@pytest.mark.parametrize(
+    ("lower_fn", "n", "seed"),
+    [
+        (_lower_layernorm_runtime_eps, 41, 8),
+        (_lower_layernorm_runtime_eps_unmasked_params, 64, 9),
+    ],
+)
+def test_m4_layernorm_runtime_eps_reduction_minimal_build_run(lower_fn, n, seed):
+    rows = 3
+    block = 64
+    eps = np.float32(1e-5)
+    rng = np.random.default_rng(seed)
+    x_np = rng.random((rows, n), dtype=np.float32)
+    gamma_np = rng.random(n, dtype=np.float32)
+    beta_np = rng.random(n, dtype=np.float32)
+    mean = np.sum(x_np, axis=1, keepdims=True) / n
+    centered = x_np - mean.astype("float32")
+    var = np.sum(centered * centered, axis=1, keepdims=True) / n
+    expected_np = centered * (1.0 / np.sqrt(var + eps)).astype("float32")
+    expected_np = expected_np * gamma_np + beta_np
+
+    artifact = lower_fn(block=block)
+    irmod, meta = translate_ttir(
+        artifact,
+        grid=(rows,),
+        target="cuda",
+        contract="reduction_minimal",
+    )
+    validate_reduction_minimal_contract(irmod)
+    assert meta.abi[-1] == {"name": "eps", "kind": "scalar", "dtype": "float32"}
+    assert len([op for op in TTIRReader().read(artifact.ttir).ops if op.name == "tt.reduce"]) == 2
+    built = build_triton_tvm(irmod, meta)
+
+    dev = tvm.cuda(0)
+    x_tvm = tvm.runtime.tensor(x_np.reshape(-1), dev)
+    gamma_tvm = tvm.runtime.tensor(gamma_np, dev)
+    beta_tvm = tvm.runtime.tensor(beta_np, dev)
+    out_tvm = tvm.runtime.empty((rows * n,), "float32", dev)
+    built.run([x_tvm, gamma_tvm, beta_tvm, out_tvm, n, float(eps)])
+
+    tvm.testing.assert_allclose(
+        out_tvm.numpy().reshape(rows, n), expected_np, rtol=1e-4, atol=1e-5
+    )
 
 
 @tvm.testing.requires_cuda

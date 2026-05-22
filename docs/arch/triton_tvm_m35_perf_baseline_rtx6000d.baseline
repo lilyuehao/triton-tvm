@@ -1,0 +1,77 @@
+{
+  "block": 256,
+  "broadcast_feature": 1024,
+  "cases": [
+    {
+      "case": "vector_add",
+      "contract": "cuda_minimal",
+      "traffic_bytes": 50331648,
+      "triton_gbps": 1020.4145626801372,
+      "triton_us": 49.324705703731844,
+      "tvm_gbps": 5029.321690624329,
+      "tvm_to_triton_gbps": 4.928704346804621,
+      "tvm_us": 10.007641406957196
+    },
+    {
+      "case": "pointwise_chain",
+      "contract": "cuda_minimal",
+      "traffic_bytes": 67108864,
+      "triton_gbps": 1014.8892567270336,
+      "triton_us": 66.12432199393132,
+      "tvm_gbps": 6644.525395429679,
+      "tvm_to_triton_gbps": 6.547044765118448,
+      "tvm_us": 10.099873204813044
+    },
+    {
+      "case": "dual_store",
+      "contract": "cuda_pointwise_flat",
+      "traffic_bytes": 67108864,
+      "triton_gbps": 1149.0884894894439,
+      "triton_us": 58.40182424054862,
+      "tvm_gbps": 5379.863023326654,
+      "tvm_to_triton_gbps": 4.681852679350223,
+      "tvm_us": 12.47408413727661
+    },
+    {
+      "case": "scalar_broadcast",
+      "contract": "cuda_pointwise_flat",
+      "traffic_bytes": 50331648,
+      "triton_gbps": 1189.8863731354184,
+      "triton_us": 42.29954148258143,
+      "tvm_gbps": 4318.754307103883,
+      "tvm_to_triton_gbps": 3.6295518669767763,
+      "tvm_us": 11.654204990825688
+    },
+    {
+      "case": "indexed_broadcast_relu",
+      "contract": "pointwise_indexed",
+      "traffic_bytes": 50331648,
+      "triton_gbps": 1662.6510321821831,
+      "triton_us": 30.27192539251073,
+      "tvm_gbps": 5037.207160348549,
+      "tvm_to_triton_gbps": 3.02962381332501,
+      "tvm_us": 9.991974996818934
+    },
+    {
+      "case": "indexed_strided",
+      "contract": "pointwise_indexed",
+      "traffic_bytes": 33554432,
+      "triton_gbps": 720.4649652406177,
+      "triton_us": 46.573301435682765,
+      "tvm_gbps": 3362.373812879348,
+      "tvm_to_triton_gbps": 4.6669497825704775,
+      "tvm_us": 9.979387738350802
+    }
+  ],
+  "device": "NVIDIA RTX 6000D",
+  "n": 4194304,
+  "purpose": "pointwise performance baseline/regression guard",
+  "schema_version": 1,
+  "triton_rep": 100,
+  "triton_version": "3.7.0",
+  "triton_warmup": 25,
+  "tvm_min_repeat_ms": 100,
+  "tvm_number": 20,
+  "tvm_repeat": 7,
+  "tvm_version": "0.24.0"
+}

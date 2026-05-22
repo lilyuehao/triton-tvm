@@ -26,9 +26,10 @@ from .contracts import validate_triton_tvm_contract
 def NormalizeTritonKernelTIR(contract: str = "pointwise_minimal"):
     """Return the normalization pass for a Triton TVM contract.
 
-    M2.5 emits the selected pointwise contract directly.  This pass currently
-    performs contract dispatch and validation only; it is intentionally a no-op
-    rewrite pass until lane-axis, launch-axis, and mask legalizations move here.
+    M4 still emits the selected pointwise or reduction contract directly.  This
+    pass currently performs contract dispatch and validation only; shared
+    lane/mask/index rewrites should move here only once reduction lowering
+    creates concrete reuse pressure.
     """
 
     @tvm.ir.transform.module_pass(opt_level=0, name="triton_tvm.NormalizeTritonKernelTIR")

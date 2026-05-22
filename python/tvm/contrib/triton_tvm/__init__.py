@@ -21,9 +21,12 @@ from .contracts import (
     get_triton_tvm_contract,
     normalize_triton_tvm_contract,
     validate_cuda_minimal_contract,
+    validate_cuda_pointwise_indexed_contract,
     validate_cuda_pointwise_flat_contract,
+    validate_pointwise_indexed_contract,
     validate_pointwise_flat_contract,
     validate_pointwise_minimal_contract,
+    validate_reduction_minimal_contract,
     validate_triton_tvm_contract,
 )
 from .errors import (
@@ -62,8 +65,11 @@ __all__ = [
     "normalize_triton_tvm_contract",
     "translate_ttir",
     "validate_cuda_minimal_contract",
+    "validate_cuda_pointwise_indexed_contract",
     "validate_cuda_pointwise_flat_contract",
+    "validate_pointwise_indexed_contract",
     "validate_pointwise_flat_contract",
     "validate_pointwise_minimal_contract",
+    "validate_reduction_minimal_contract",
     "validate_triton_tvm_contract",
 ]

@@ -53,6 +53,7 @@ class TTIROp:
     operands: list[str]
     result_types: list[TTIRType]
     attrs: dict[str, Any] = field(default_factory=dict)
+    regions: list[list["TTIROp"]] = field(default_factory=list)
     raw: str = ""
 
 

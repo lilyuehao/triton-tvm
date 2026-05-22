@@ -29,7 +29,7 @@ _FUNC_RE = re.compile(
     r"\((?P<params>.*)\)\s*(?:attributes\s+(?P<attrs>\{.*\}))?\s*\{"
 )
 _ASSIGN_RE = re.compile(r"(?P<results>(?:%[\w$.]+)(?:\s*,\s*%[\w$.]+)*)\s*=\s*(?P<body>.*)")
-_OP_RE = re.compile(r"(?P<name>[A-Za-z_][\w.]+)(?P<rest>.*)")
+_OP_RE = re.compile(r'(?P<name>"?[A-Za-z_][\w.]+"?)(?P<rest>.*)')
 
 
 class TTIRReader:
@@ -49,7 +49,10 @@ class TTIRReader:
         ops: list[TTIROp] = []
         in_func = False
 
-        for line in lines:
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            i += 1
             if line in ("module {", "{", "}"):
                 continue
             if not in_func:
@@ -68,7 +71,10 @@ class TTIRReader:
                 in_func = False
                 continue
 
-            op = self._parse_op(line)
+            if '"tt.reduce"' in line:
+                op, i = self._parse_region_op(line, lines, i)
+            else:
+                op = self._parse_op(line)
             if op is not None:
                 ops.append(op)
 
@@ -121,7 +127,7 @@ class TTIRReader:
         if not match:
             return None
 
-        name = match.group("name")
+        name = match.group("name").strip('"')
         rest = match.group("rest").strip()
         attrs = self._parse_op_attrs(name, rest)
         operands = [_clean_value_name(x) for x in re.findall(r"%[\w$.]+", rest)]
@@ -134,6 +140,37 @@ class TTIRReader:
             attrs=attrs,
             raw=line,
         )
+
+    def _parse_region_op(
+        self, line: str, lines: list[str], index: int
+    ) -> tuple[TTIROp | None, int]:
+        """Parse a single-region op such as Triton's textual ``"tt.reduce"``."""
+        op = self._parse_op(line)
+        if op is None:
+            return None, index
+
+        region_ops: list[TTIROp] = []
+        close_line = ""
+        while index < len(lines):
+            body_line = lines[index]
+            index += 1
+            if body_line.startswith("})"):
+                close_line = body_line
+                break
+            if body_line.startswith("^"):
+                continue
+            region_op = self._parse_op(body_line)
+            if region_op is not None:
+                region_ops.append(region_op)
+
+        if not close_line:
+            raise ValueError(f"Unclosed TTIR region op: {line}")
+        op.regions.append(region_ops)
+        result_type = _parse_region_result_type(close_line)
+        if result_type is not None:
+            op.result_types = [result_type]
+        op.raw = line + "\n" + "\n".join(child.raw for child in region_ops) + "\n" + close_line
+        return op, index
 
     def _parse_op_attrs(self, name: str, rest: str) -> dict[str, Any]:
         attrs: dict[str, Any] = {}
@@ -154,8 +191,22 @@ class TTIRReader:
         elif name == "arith.cmpi":
             predicate = rest.split(",", 1)[0].strip()
             attrs["predicate"] = predicate
+        elif name == "arith.cmpf":
+            predicate = rest.split(",", 1)[0].strip()
+            attrs["predicate"] = predicate
+        elif name == "tt.extern_elementwise":
+            raw_attrs = _extract_first_attr_dict(rest)
+            if raw_attrs:
+                attrs["raw_attrs"] = raw_attrs
+                attrs.update(self._parse_attr_dict(raw_attrs))
+        elif name == "tt.reduce":
+            match = re.search(r"axis\s*=\s*(-?\d+)\s*:\s*i\d+", rest)
+            if match:
+                attrs["axis"] = int(match.group(1))
         if name in ("tt.load", "tt.store"):
             raw_attrs = _extract_first_attr_dict(rest)
+            if not raw_attrs:
+                raw_attrs = _extract_bare_load_store_attrs(rest)
             if raw_attrs:
                 attrs["raw_attrs"] = raw_attrs
                 attrs["unknown_attrs"] = self._parse_attr_dict(raw_attrs)
@@ -166,17 +217,25 @@ class TTIRReader:
             return []
         if name == "tt.splat" and "->" in rest:
             return [parse_ttir_type(rest.rsplit("->", 1)[1].strip())]
-        if name in ("arith.extsi", "arith.extui") and " to " in rest:
+        if (
+            name
+            in ("arith.extf", "arith.extsi", "arith.extui", "arith.sitofp", "arith.truncf")
+            and " to " in rest
+        ):
             return [parse_ttir_type(rest.rsplit(" to ", 1)[1].strip())]
+        if name in ("tt.bitcast", "tt.extern_elementwise") and "->" in rest:
+            return [parse_ttir_type(rest.rsplit("->", 1)[1].strip())]
         if ":" not in rest:
             return []
         type_text = rest.rsplit(":", 1)[1].strip()
         if not type_text:
             return []
         types = [parse_ttir_type(item.strip()) for item in _split_top_level(type_text, ",")]
-        if name == "arith.cmpi" and types:
+        if name in ("arith.cmpf", "arith.cmpi") and types:
             ty = types[0]
             return [TTIRType(raw=_format_ttir_type("bool", ty.shape), dtype="bool", shape=ty.shape)]
+        if name == "arith.select" and types:
+            return [types[-1]]
         if name == "tt.load" and types:
             ty = types[0]
             if ty.is_pointer:
@@ -199,7 +258,7 @@ class TTIRReader:
 
 def parse_ttir_type(type_text: str) -> TTIRType:
     """Parse the subset of TTIR type strings needed by the prototype."""
-    type_text = type_text.strip()
+    type_text = _strip_type_attrs(type_text.strip())
     tensor_match = re.fullmatch(r"tensor<(?P<shape>\d+(?:x\d+)*)x(?P<elem>.+)>", type_text)
     if tensor_match:
         shape = tuple(int(x) for x in tensor_match.group("shape").split("x"))
@@ -267,6 +326,14 @@ def _denormalize_dtype(dtype: str) -> str:
     return dtype
 
 
+def _parse_region_result_type(close_line: str) -> TTIRType | None:
+    match = re.search(r"->\s*(?P<type>.+)$", close_line)
+    if not match:
+        return None
+    type_text = match.group("type").strip()
+    return parse_ttir_type(type_text)
+
+
 def _clean_value_name(name: str) -> str:
     name = name.strip()
     if name.startswith("%"):
@@ -323,6 +390,18 @@ def _extract_first_attr_dict(text: str) -> str:
     return ""
 
 
+def _extract_bare_load_store_attrs(text: str) -> str:
+    """Extract unbraced load/store attrs such as ``evictionPolicy = evict_last``."""
+    prefix = text.rsplit(":", 1)[0].strip() if ":" in text else text.strip()
+    operand_matches = list(re.finditer(r"%[\w$.]+", prefix))
+    if not operand_matches:
+        return ""
+    tail = prefix[operand_matches[-1].end() :].strip(" ,")
+    if "=" not in tail:
+        return ""
+    return tail
+
+
 def _split_top_level(text: str, delimiter: str) -> list[str]:
     items: list[str] = []
     start = 0
@@ -339,3 +418,29 @@ def _split_top_level(text: str, delimiter: str) -> list[str]:
             start = i + 1
     items.append(text[start:])
     return items
+
+
+def _strip_type_attrs(type_text: str) -> str:
+    """Remove MLIR attrs appended to a type without disturbing nested type syntax."""
+    text = type_text.strip()
+    result: list[str] = []
+    angle_depth = 0
+    paren_depth = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "<":
+            angle_depth += 1
+        elif ch == ">":
+            angle_depth -= 1
+        elif ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth -= 1
+        elif ch == "{" and angle_depth == 0 and paren_depth == 0:
+            break
+        elif text.startswith(" loc(", i) and angle_depth == 0 and paren_depth == 0:
+            break
+        result.append(ch)
+        i += 1
+    return "".join(result).strip()
