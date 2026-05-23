@@ -23,6 +23,7 @@ import json
 import keyword
 import re
 from dataclasses import dataclass
+from numbers import Integral, Real
 from typing import Any
 
 import tvm
@@ -33,9 +34,8 @@ from .contracts import (
     validate_triton_tvm_contract,
 )
 from .errors import UnsupportedContractError, UnsupportedTargetPolicyError, UnsupportedTTIROpError
-from .frontend import TTIRArtifact
 from .op_graph import NormalizedTTIROpGraph, TTIROp, TTIRType
-from .ttir import TTIRReader
+from .ttir import TTIRInput, normalize_ttir_input
 
 
 _M25_POINTWISE_OPS = frozenset(
@@ -84,8 +84,7 @@ _M35_INDEXED_EXTRA_OPS = frozenset(
 
 _SUPPORTED_OPS_BY_CONTRACT = {
     "pointwise_minimal": _M25_POINTWISE_OPS,
-    "pointwise_flat": _M25_POINTWISE_OPS,
-    "pointwise_indexed": _M25_POINTWISE_OPS | _M35_INDEXED_EXTRA_OPS,
+    "pointwise_flat": _M25_POINTWISE_OPS | _M35_INDEXED_EXTRA_OPS,
     "reduction_minimal": frozenset(
         {
             "arith.addf",
@@ -115,6 +114,9 @@ _SUPPORTED_OPS_BY_CONTRACT = {
         }
     ),
 }
+_SUPPORTED_OPS_BY_CONTRACT["norm_single_row"] = _SUPPORTED_OPS_BY_CONTRACT[
+    "reduction_minimal"
+]
 
 _BINARY_OP_SYMBOLS = {
     "arith.addf": "+",
@@ -130,8 +132,9 @@ _BINARY_OP_SYMBOLS = {
     "arith.subi": "-",
 }
 
-_TRANSLATOR_VERSION = "triton_tvm_python_m35_hardened_v1"
+_TRANSLATOR_VERSION = "triton_tvm_python_pre_m5_contracts_v1"
 _CUDA_TARGET_POLICY_VERSION = "cuda_thread_binding_v1"
+_CACHE_POLICY = "disabled"
 
 
 @dataclass(frozen=True)
@@ -208,30 +211,38 @@ class TritonTVMMeta:
     indexing_kind: str
     launch_policy_id: str
     abi: list[dict[str, str]]
+    cache_policy: str
+    disk_cache_enabled: bool
+    fallback_reason: str
     cache_key: str
 
 
 def translate_ttir(
-    ttir_or_graph: str | TTIRArtifact | NormalizedTTIROpGraph,
+    ttir_or_graph: TTIRInput,
     *,
     grid,
     target: str = "cuda",
     emit: str = "tirx",
     contract: str = "pointwise_minimal",
 ) -> tuple[tvm.IRModule, TritonTVMMeta]:
-    """Translate TTIR into a contract-driven TIRX IRModule."""
+    """Translate normalized TTIR into a contract-driven TIRX IRModule.
+
+    ``str`` and ``TTIRArtifact`` inputs are accepted for the public convenience
+    API, but textual parsing is delegated to ``ttir.normalize_ttir_input``.
+    Unsupported TTIR, target policies, contracts, and stream/cache semantics are
+    reported explicitly; this path never silently falls back to native Triton.
+    """
     if emit != "tirx":
         raise ValueError(f"Only emit='tirx' is supported by this prototype, got {emit!r}")
-    requested_contract = contract
     canonical_contract = normalize_triton_tvm_contract(contract)
     contract_spec = get_triton_tvm_contract(canonical_contract)
     target_policy = _pointwise_target_policy(target)
     _validate_policy_contract_support(target_policy, canonical_contract)
 
-    graph, artifact = _as_graph(ttir_or_graph)
+    graph, artifact = normalize_ttir_input(ttir_or_graph)
     _validate_supported_subset(graph, canonical_contract)
 
-    if canonical_contract == "reduction_minimal":
+    if canonical_contract in ("reduction_minimal", "norm_single_row"):
         builder = _TIRXReductionBuilder(graph, target_policy, grid)
     else:
         builder = _TIRXTemplateBuilder(graph, target_policy, canonical_contract)
@@ -253,17 +264,19 @@ def translate_ttir(
         kernel_name=graph.function_name,
         signature=signature,
         constexprs=constexprs,
-        grid=grid,
         target=target_policy.target,
         target_kind=target_policy.target_kind,
+        target_policy=target_policy.launch_policy_id,
         canonical_contract=canonical_contract,
         emit=emit,
         translator_version=_TRANSLATOR_VERSION,
         contract_version=contract_spec.version,
         target_policy_version=target_policy.version,
+        tvm_version=tvm.__version__,
         triton_version=triton_version,
         ttir_hash=ttir_hash,
         source_hash=source_hash,
+        abi=abi,
         extent_param=builder.extent_info.param_name,
         extent_kind=builder.extent_info.kind,
         extent_value=builder.extent_info.value,
@@ -272,6 +285,7 @@ def translate_ttir(
         indexing_kind=contract_spec.indexing_kind,
         launch_policy_id=target_policy.launch_policy_id,
         target_attrs=target_policy.target_attrs,
+        cache_policy=_CACHE_POLICY,
     )
     meta = TritonTVMMeta(
         kernel_name=graph.function_name,
@@ -282,7 +296,7 @@ def translate_ttir(
         target_kind=target_policy.target_kind,
         contract=canonical_contract,
         canonical_contract=canonical_contract,
-        requested_contract=requested_contract,
+        requested_contract=canonical_contract,
         emit=emit,
         translator_version=_TRANSLATOR_VERSION,
         contract_version=contract_spec.version,
@@ -300,6 +314,9 @@ def translate_ttir(
         indexing_kind=contract_spec.indexing_kind,
         launch_policy_id=target_policy.launch_policy_id,
         abi=abi,
+        cache_policy=_CACHE_POLICY,
+        disk_cache_enabled=False,
+        fallback_reason="",
         cache_key=cache_key,
     )
     return irmod, meta
@@ -522,7 +539,7 @@ class _TIRXTemplateBuilder:
                 raise UnsupportedTTIROpError(
                     "non-contiguous pointer pattern is not supported yet"
                 )
-            if self.contract == "pointwise_indexed":
+            if self._allows_indexed_pointwise_capability():
                 offset = self._index_info(op.operands[1]).expr
             else:
                 if op.operands[1] != self.lane_index_ssa:
@@ -649,11 +666,11 @@ class _TIRXTemplateBuilder:
         op = self.defs.get(value)
         if op is not None and op.name in ("arith.extsi", "arith.extui") and len(op.operands) == 1:
             return self._index_info(op.operands[0])
-        if self.contract != "pointwise_indexed":
+        if not self._allows_indexed_pointwise_capability():
             raise UnsupportedTTIROpError("non-contiguous pointer pattern is not supported yet")
         if op is None or len(op.operands) != 2:
             raise UnsupportedTTIROpError(
-                "unsupported composed indexing pattern for pointwise_indexed"
+                "unsupported composed indexing pattern for pointwise_flat"
             )
 
         lhs, rhs = op.operands
@@ -680,7 +697,7 @@ class _TIRXTemplateBuilder:
                     extent_expr=f"T.int64({constant})",
                     factor=constant,
                 )
-        raise UnsupportedTTIROpError("unsupported composed indexing pattern for pointwise_indexed")
+        raise UnsupportedTTIROpError("unsupported composed indexing pattern for pointwise_flat")
 
     def _scaled_index_info(self, factor: int) -> _IndexInfo:
         return _IndexInfo(
@@ -698,7 +715,7 @@ class _TIRXTemplateBuilder:
         ]
         if not loads:
             return set()
-        if self.contract != "pointwise_indexed":
+        if not self._allows_indexed_pointwise_capability():
             return set()
 
         masks = self._collect_mask_values()
@@ -748,7 +765,7 @@ class _TIRXTemplateBuilder:
                             "masked tt.load without other cannot escape through tt.return"
                         )
                     if (
-                        use_op.name not in _SUPPORTED_OPS_BY_CONTRACT["pointwise_indexed"]
+                        use_op.name not in _SUPPORTED_OPS_BY_CONTRACT["pointwise_flat"]
                         or not use_op.results
                     ):
                         raise UnsupportedTTIROpError(
@@ -778,6 +795,9 @@ class _TIRXTemplateBuilder:
             ):
                 return op.results[0]
         return None
+
+    def _allows_indexed_pointwise_capability(self) -> bool:
+        return self.contract == "pointwise_flat"
 
     def _is_make_range(self, value: str) -> bool:
         op = self.defs.get(value)
@@ -1416,32 +1436,21 @@ class _TIRXReductionBuilder:
         raise UnsupportedTTIROpError(f"Cannot infer dtype for %{value}")
 
 
-def _as_graph(
-    ttir_or_graph: str | TTIRArtifact | NormalizedTTIROpGraph,
-) -> tuple[NormalizedTTIROpGraph, TTIRArtifact | None]:
-    if isinstance(ttir_or_graph, NormalizedTTIROpGraph):
-        return ttir_or_graph, None
-    if isinstance(ttir_or_graph, TTIRArtifact):
-        return TTIRReader().read(ttir_or_graph.ttir), ttir_or_graph
-    if isinstance(ttir_or_graph, str):
-        return TTIRReader().read(ttir_or_graph), None
-    raise TypeError(f"Unsupported TTIR input type: {type(ttir_or_graph)!r}")
-
-
 def _validate_supported_subset(graph: NormalizedTTIROpGraph, contract: str) -> None:
     supported_ops = _SUPPORTED_OPS_BY_CONTRACT.get(contract)
     if supported_ops is None:
         raise UnsupportedContractError(
             f"Contract {contract!r} is not implemented yet; "
-            "only pointwise and reduction_minimal contracts are supported by this translator."
+            "only pointwise, reduction_minimal, and norm_single_row contracts are "
+            "supported by this translator."
         )
     for op in _iter_ops_with_regions(graph.ops):
         if op.name not in supported_ops:
             raise UnsupportedTTIROpError(f"{op.name} is not supported by contract {contract!r}")
         if op.name == "tt.load" and len(op.operands) < 3:
-            if contract == "reduction_minimal" and len(op.operands) == 1:
+            if contract in ("reduction_minimal", "norm_single_row") and len(op.operands) == 1:
                 continue
-            if contract != "pointwise_indexed":
+            if contract != "pointwise_flat":
                 raise UnsupportedTTIROpError(
                     f"masked tt.load without other is not supported by contract {contract!r}"
                 )
@@ -1493,8 +1502,22 @@ def _abi_from_graph(graph: NormalizedTTIROpGraph) -> list[dict[str, str]]:
 
 
 def _cache_key(**kwargs) -> str:
-    payload = json.dumps(kwargs, sort_keys=True, default=repr)
+    payload = json.dumps(_stable_jsonable(kwargs), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _stable_jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, Real) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): _stable_jsonable(value[key]) for key in sorted(value, key=str)}
+    if isinstance(value, (list, tuple)):
+        return [_stable_jsonable(item) for item in value]
+    raise TypeError(f"Unstable value in Triton TVM cache key payload: {type(value)!r}")
 
 
 def _current_triton_version() -> str:
@@ -1536,8 +1559,8 @@ def _pointwise_target_policy(target) -> _PointwiseTargetPolicy:
                 {
                     "pointwise_minimal",
                     "pointwise_flat",
-                    "pointwise_indexed",
                     "reduction_minimal",
+                    "norm_single_row",
                 }
             ),
             block_var="bx",

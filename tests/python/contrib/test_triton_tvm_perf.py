@@ -19,7 +19,7 @@
 This file is intentionally opt-in.  The numbers are hardware- and driver-sensitive, so
 the default pytest run skips it.  Use it to establish a same-machine baseline and to
 guard later translator/contract changes against large regressions.  The case set covers
-the M2.5 standalone pointwise contracts and the M3.5 indexed pointwise contract.
+the pre-M5 canonical pointwise contracts and pointwise_flat capability variants.
 """
 
 from __future__ import annotations
@@ -149,7 +149,7 @@ _PERF_CASES = (
             "n": "i64",
             "BLOCK": "constexpr",
         },
-        contract="cuda_minimal",
+        contract="pointwise_minimal",
         inputs=("x", "y"),
         outputs=("out",),
         bytes_per_element=12,
@@ -166,7 +166,7 @@ _PERF_CASES = (
             "n": "i64",
             "BLOCK": "constexpr",
         },
-        contract="cuda_minimal",
+        contract="pointwise_minimal",
         inputs=("x", "y", "z"),
         outputs=("out",),
         bytes_per_element=16,
@@ -183,7 +183,7 @@ _PERF_CASES = (
             "n": "i64",
             "BLOCK": "constexpr",
         },
-        contract="cuda_pointwise_flat",
+        contract="pointwise_flat",
         inputs=("x", "y"),
         outputs=("out0", "out1"),
         bytes_per_element=16,
@@ -200,7 +200,7 @@ _PERF_CASES = (
             "alpha": "fp32",
             "BLOCK": "constexpr",
         },
-        contract="cuda_pointwise_flat",
+        contract="pointwise_flat",
         inputs=("x",),
         outputs=("out0", "out1"),
         bytes_per_element=12,
@@ -217,7 +217,7 @@ _PERF_CASES = (
             "BLOCK": "constexpr",
             "FEATURE": "constexpr",
         },
-        contract="pointwise_indexed",
+        contract="pointwise_flat",
         inputs=("x", "y"),
         outputs=("out",),
         bytes_per_element=12,
@@ -234,7 +234,7 @@ _PERF_CASES = (
             "n": "i64",
             "BLOCK": "constexpr",
         },
-        contract="pointwise_indexed",
+        contract="pointwise_flat",
         inputs=("x",),
         outputs=("out",),
         bytes_per_element=8,

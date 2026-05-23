@@ -1002,3 +1002,273 @@ test_triton_tvm_static.py: 16 passed
 test_triton_tvm.py: 24 passed
 test_triton_tvm_inductor_subset.py: 16 passed
 ```
+
+## 2026-05-22: Pre-M5 Debt Sprint Workflows 1-4
+
+### Scope
+
+This sprint prepares the prototype for M5 Inductor integration without adding
+new Triton semantics, op coverage, reduction capability, or Inductor hooks.
+
+### Workflow 1: Pass Surface Cleanup
+
+- Renamed the validation-only public pass from `NormalizeTritonKernelTIR` to
+  `ValidateTritonKernelTIR`.
+- Removed `NormalizeTritonKernelTIR` from the public `tvm.contrib.triton_tvm`
+  API.  A pass with that name should return only when it performs real IR
+  rewrites.
+- No `Legalize*`, `Lower*`, or `Normalize*` public pass remains as a no-op.
+
+### Workflow 2: Legacy Contract Alias Cleanup
+
+- Canonical contracts are now `pointwise_minimal`, `pointwise_flat`,
+  `reduction_minimal`, and `norm_single_row`.
+- `cuda_minimal` and `cuda_pointwise_flat` remain only as compatibility aliases
+  and emit `FutureWarning`.
+- Metadata and cache keys use canonical contract names even when a legacy alias
+  is requested in compatibility tests.
+- Removed the public `pointwise_indexed` / `cuda_pointwise_indexed` contract
+  surface.  The M3.5 indexed/no-`other` pointwise behavior is now a
+  `pointwise_flat` capability, not a separate contract.
+
+### Workflow 3: Contract Matrix
+
+- Added `docs/arch/triton_tvm_contracts.md` as the Pre-M5 capability matrix.
+- Added `norm_single_row` as the canonical name for the single-row LN/RMS M4
+  surface.  It reuses the existing correctness-first reduction lowering and
+  does not add new reduction semantics.
+- Strengthened `pointwise_flat` validator coverage so the old indexed
+  shape-only rejection remains attached to the canonical pointwise contract.
+
+### Workflow 4: Runtime, Cache, Stream Boundary
+
+- Cache key payload now includes TTIR/source hash, canonical contract, target
+  policy, target attrs, constexprs, ABI signature, TVM/Triton versions, and
+  translator capability version.
+- Cache key payload rejects unstable object reprs and no longer includes legacy
+  aliases or non-canonical target spelling.
+- Pre-M5 disk cache is explicit disabled metadata: `cache_policy="disabled"`
+  and `disk_cache_enabled=False`.
+- `artifact.run(..., stream=None)` is documented as TVM current/default stream.
+  Non-`None` streams raise `UnsupportedStreamError` with `unsupported_stream`.
+- Inductor audit status records now carry `fallback_reason` so M5 fallback
+  routing has a stable report bucket field.
+
+### Validation
+
+Commands:
+
+```bash
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_static.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_inductor_subset.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_perf.py
+```
+
+Results:
+
+```text
+test_triton_tvm_static.py: 19 passed
+test_triton_tvm_inductor_subset.py: 16 passed
+test_triton_tvm.py: 24 passed
+test_triton_tvm_perf.py: 1 skipped
+```
+
+## 2026-05-22: Pre-M5 Debt Sprint Workflows 5-8
+
+### Workflow 5: TTIRReader and Builder Debt
+
+- Moved TTIR input normalization to `ttir.normalize_ttir_input`.
+- Removed direct `TTIRReader` use from `translator.py`; translator code now
+  consumes `NormalizedTTIROpGraph` after the controlled reader boundary.
+- Added a static guard that `translator.py` does not instantiate `TTIRReader`.
+- Kept existing `NormalizedTTIROpGraph` reader snapshots for pointwise and
+  reduction TTIR.  New TTIR op support must update these snapshots first.
+- Registered builder debt in `docs/arch/triton_tvm_capability_matrix.md`:
+  current builder is TVMScript source plus `tvm.script.from_source`; M5 may keep
+  it with golden coverage, while M6 must evaluate direct node construction or
+  document why the source builder remains appropriate.
+
+### Workflow 6: Unified Reporting
+
+- Added `python/tvm/contrib/triton_tvm/reporting.py`.
+- Added `tests/python/contrib/test_triton_tvm_reporting.py` snapshot coverage
+  for a unified pointwise/reduction/norm report schema.
+- Updated Inductor audit report construction to use the shared capability
+  report schema while preserving `report.json` / `report.md` output paths.
+- Stable buckets now include `translated`, `unsupported_ttir_op`,
+  `contract_error`, `target_policy_error`, `unsupported_stream`, `input_error`,
+  `triton_tvm_error`, and `internal_error`.
+- Added `docs/arch/triton_tvm_capability_matrix.md`.
+
+### Workflow 7: Test Structure
+
+- Kept correctness tests default-runnable.
+- CUDA correctness tests retain `tvm.testing.requires_cuda` gating.
+- Perf regression guard remains opt-in and skipped by default.
+- Added public API and parser-boundary static tests so milestone demo paths do
+  not silently define the M5 surface.
+- Existing negative tests cover public unsupported paths: unsupported TTIR ops,
+  contract errors, target policy errors, runtime ABI/grid errors, and stream
+  errors.
+
+### Workflow 8: Public API Freeze
+
+- Trimmed `tvm.contrib.triton_tvm.__all__` to stable M5-entry APIs.
+- Kept legacy `validate_cuda_*` wrappers importable for compatibility warnings,
+  but removed them from `__all__`.
+- Removed `TTIRReader` and normalized graph structures from the top-level
+  public export surface; they remain accessible from their implementation
+  modules for tests and internal tooling.
+- Public docstrings now state unsupported behavior explicitly; no path silently
+  falls back to native Triton.
+
+### Validation
+
+Commands:
+
+```bash
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_reporting.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_static.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_inductor_subset.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_perf.py
+```
+
+Results:
+
+```text
+test_triton_tvm_reporting.py: 3 passed
+test_triton_tvm_static.py: 21 passed
+test_triton_tvm_inductor_subset.py: 16 passed
+test_triton_tvm.py: 24 passed
+test_triton_tvm_perf.py: 1 skipped
+```
+
+## 2026-05-23: M5 Inductor Integration Prototype
+
+### Scope
+
+This checkpoint adds the first live TorchInductor hook.  It does not expand
+Triton semantic coverage: M5 routes only already-supported `pointwise_flat`
+Inductor kernels through TVM, and records explicit native fallback for
+unsupported or failed kernels.
+
+### Implementation Changes
+
+- Added experimental APIs under `tvm.contrib.triton_tvm.inductor`:
+  `TritonTVMInductorConfig`, `TritonTVMInductorSession`, and
+  `make_triton_tvm_inductor_backend`.
+- The backend wraps TorchInductor by temporarily patching
+  `torch._inductor.async_compile.AsyncCompile.triton` during a single
+  `torch.compile` call.
+- Supported `Grid1D` non-atomic pointwise kernels lower to TTIR, translate with
+  `contract="pointwise_flat"`, build through TVM, and run with a TVM artifact.
+- Unsupported kernels use native Triton fallback with a stable report bucket and
+  non-empty `fallback_reason`.
+- Added a process-local artifact cache keyed by `TritonTVMMeta.cache_key`.
+  Disk cache remains disabled.
+- Added a PyTorch launcher path that wraps CUDA tensors through DLPack and hands
+  Inductor's raw CUDA stream to TVM with `tvm.cuda(device).set_raw_stream(...)`.
+  Outputs remain owned by the Inductor wrapper.
+
+### Tests Added
+
+- Added `tests/python/contrib/test_triton_tvm_inductor_hook.py`.
+- Static coverage checks that M5 hook APIs are experimental module APIs, not
+  top-level `__all__` exports.
+- Unit fallback coverage verifies unsupported source records stable report
+  buckets and writes the shared report schema.
+- CUDA E2E coverage verifies:
+  - `torch.compile(..., backend=make_triton_tvm_inductor_backend(...))` runs a
+    pointwise add/mul kernel through TVM;
+  - repeated compilation in the same session hits the process-local cache;
+  - an unsupported Inductor reduction keeps correctness through native fallback.
+
+### Validation
+
+Commands:
+
+```bash
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_reporting.py tests/python/contrib/test_triton_tvm_static.py tests/python/contrib/test_triton_tvm_inductor_subset.py tests/python/contrib/test_triton_tvm_inductor_hook.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_perf.py
+```
+
+Results:
+
+```text
+reporting/static/inductor_subset/inductor_hook: 44 passed
+test_triton_tvm.py: 24 passed
+test_triton_tvm_perf.py: 1 skipped
+```
+
+## 2026-05-23: M5.5 Inductor Hook Hardening Gate
+
+### Scope
+
+M5.5 is the mandatory gate before M6.  It does not add TTIR op semantics or
+model coverage.  The checkpoint hardens the live Inductor hook lifecycle,
+graph-level reporting, process-memory cache accounting, raw stream handoff,
+fallback boundaries, and compile/runtime exception handling.
+
+### Implementation Changes
+
+- Added graph-level session records to `TritonTVMInductorSession`.  Reports now
+  include `graph_summary` and `graphs` alongside kernel records.
+- Each graph records `graph_id`, compile region, observed kernel order,
+  TVM/native fallback counts, cache hits/misses, run count, fallback reason
+  histogram, and compile failure status when applicable.
+- Kernel records produced by the live hook now carry `graph_id` and
+  `graph_kernel_index`, so one `torch.compile` graph can explain which kernels
+  were replaced by TVM and which kernels used native Triton fallback.
+- Added a process-local hook lifecycle guard around
+  `AsyncCompile.triton`.  The patch is active only during the wrapped Inductor
+  compile call, rejects nested active hooks, serializes hook installation, and
+  restores the original method on success or exception.
+- TVM launcher run accounting now updates both kernel-level `run_count` and the
+  owning graph's `run_count`.
+- Runtime errors still raise to the caller; they are recorded with stable
+  status payloads and do not silently fall back to native Triton.
+
+### Tests Added
+
+- Added unit coverage for graph-level fallback records and process-local cache
+  lifecycle reporting.
+- Added hook reentrancy and restore tests, including a forced compile failure
+  path that verifies `AsyncCompile.triton` is restored.
+- Added raw stream handoff regression coverage that verifies the launcher sets
+  Inductor's raw stream and restores TVM's stream to `0`.
+- Added CUDA E2E coverage for a mixed graph: one supported pointwise Inductor
+  Triton kernel runs through TVM while an unsupported reduction kernel in the
+  same graph uses native Triton fallback.
+
+### Documentation
+
+- Promoted M5.5 to a mandatory M6 entry gate in the backend plan.
+- Documented graph-level report fields, hook lifecycle rules, launcher stream
+  behavior, and artifact cache lifecycle in the capability matrix.
+- Cache remains process-local, session-local, in-memory only, and discarded
+  with `TritonTVMInductorSession`; disk cache remains disabled.
+
+### Validation
+
+Commands:
+
+```bash
+conda run -n tvm-0.24.0 python -m py_compile python/tvm/contrib/triton_tvm/inductor.py tests/python/contrib/test_triton_tvm_inductor_hook.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_inductor_hook.py -k 'torch_compile'
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_reporting.py tests/python/contrib/test_triton_tvm_static.py tests/python/contrib/test_triton_tvm_inductor_subset.py tests/python/contrib/test_triton_tvm_inductor_hook.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_perf.py
+```
+
+Results:
+
+```text
+py_compile: passed
+inductor_hook torch_compile subset: 3 passed
+reporting/static/inductor_subset/inductor_hook: 49 passed
+test_triton_tvm.py: 24 passed
+test_triton_tvm_perf.py: 1 skipped
+```

@@ -122,7 +122,7 @@ def test_m3_extracts_triton_source_from_inductor_wrapper():
     assert "@triton.jit" in sources[0].source
 
 
-def test_m3_static_audit_report_for_unsupported_masked_load(tmp_path):
+def test_m3_static_audit_report_for_pointwise_flat_masked_load(tmp_path):
     record = audit_inductor_ttir(
         _UNSUPPORTED_MASKED_LOAD_TTIR,
         case_name="static_masked_load",
@@ -147,29 +147,23 @@ def test_m3_static_audit_report_for_unsupported_masked_load(tmp_path):
     ]
     assert record["load_count"] == 2
     assert record["store_count"] == 1
-    assert record["translate_status"]["bucket"] == "unsupported_ttir_op"
-    assert "masked tt.load without other" in record["translate_status"]["message"]
-
-    translated = audit_inductor_ttir(
-        _UNSUPPORTED_MASKED_LOAD_TTIR,
-        case_name="static_masked_load",
-        kernel_name="_inductor_like",
-        signature={"x": "*fp32", "y": "*fp32", "out": "*fp32", "n": "i32"},
-        constexprs={"XBLOCK": 64},
-        contract="pointwise_indexed",
-    )
-    assert translated["translate_status"] == {"ok": True, "bucket": "translated"}
+    assert record["translate_status"] == {
+        "ok": True,
+        "bucket": "translated",
+        "fallback_reason": "",
+    }
 
     report = build_audit_report([record])
     assert report["total_kernels"] == 1
-    assert report["unsupported_buckets"] == {"unsupported_ttir_op": 1}
+    assert report["unsupported_buckets"] == {"translated": 1}
     markdown = render_audit_markdown(report)
     assert "M3 Inductor Pointwise TTIR Audit" in markdown
-    assert "M3.5 Priority Gaps" in markdown
+    assert "Pre-M5 Boundary" in markdown
 
     write_audit_report(report, tmp_path)
     written = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
     assert written["schema_version"] == 1
+    assert "cuda_" not in json.dumps(written)
     assert (tmp_path / "report.md").read_text(encoding="utf-8").startswith("# M3")
 
 
@@ -259,9 +253,9 @@ def test_m35_cuda_builds_and_runs_promoted_inductor_pointwise(case_name):
         artifact,
         grid=(1,),
         target="cuda",
-        contract="pointwise_indexed",
+        contract="pointwise_flat",
     )
-    assert meta.contract == "pointwise_indexed"
+    assert meta.contract == "pointwise_flat"
 
     built = build_triton_tvm(irmod, meta)
     tvm_args, outputs = _make_tvm_runtime_args(meta, torch_args, expected)

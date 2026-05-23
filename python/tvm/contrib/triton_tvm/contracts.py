@@ -19,21 +19,22 @@
 Contract boundary:
 
 - ``pointwise_minimal`` is the canonical single-store pointwise contract.
-- ``pointwise_flat`` is the canonical M2.5 flat-contiguous pointwise contract.  It
-  allows multiple masked stores and multiple outputs.
-- ``pointwise_indexed`` is the M3.5 indexed pointwise contract.  It keeps the
-  same launch and guarded-store shape as ``pointwise_flat``, but permits a small
-  set of affine/broadcast pointer indices from Inductor pointwise kernels.
+- ``pointwise_flat`` is the canonical pointwise contract.  It allows multiple
+  masked stores and multiple outputs, with M3.5 indexed forms tracked as
+  capability metadata instead of a separate contract name.
 - ``reduction_minimal`` is the M4 row-wise reduction contract.  It keeps the
   CUDA block/thread launch shell, but uses a single-lane local accumulator for a
   correctness-first reduction subset.
-- ``cuda_minimal``, ``cuda_pointwise_flat``, and ``cuda_pointwise_indexed`` are
-  compatibility aliases kept while the implementation grows target policies
-  beyond CUDA.
+- ``norm_single_row`` is the M4 single-row LN/RMS contract over the same
+  correctness-first reduction lowering.
+- ``cuda_minimal`` and ``cuda_pointwise_flat`` are deprecated compatibility
+  aliases.  They are accepted only at the public boundary and immediately
+  canonicalized.
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 
 import tvm
@@ -44,11 +45,15 @@ from .errors import TritonTVMContractError, UnsupportedContractError
 _CONTRACT_ALIASES = {
     "pointwise_minimal": "pointwise_minimal",
     "pointwise_flat": "pointwise_flat",
-    "pointwise_indexed": "pointwise_indexed",
     "reduction_minimal": "reduction_minimal",
+    "norm_single_row": "norm_single_row",
     "cuda_minimal": "pointwise_minimal",
     "cuda_pointwise_flat": "pointwise_flat",
-    "cuda_pointwise_indexed": "pointwise_indexed",
+}
+
+_LEGACY_CONTRACT_ALIASES = {
+    "cuda_minimal": "pointwise_minimal",
+    "cuda_pointwise_flat": "pointwise_flat",
 }
 
 
@@ -75,19 +80,11 @@ _CONTRACTS = {
     ),
     "pointwise_flat": TritonTVMContract(
         name="pointwise_flat",
-        indexing_kind="flat_contiguous",
+        indexing_kind="pointwise",
         memory_model="flat_buffer",
         requires_extent_param=True,
         supports_multiple_outputs=True,
-        version="pointwise_v1",
-    ),
-    "pointwise_indexed": TritonTVMContract(
-        name="pointwise_indexed",
-        indexing_kind="indexed_pointwise",
-        memory_model="flat_buffer",
-        requires_extent_param=True,
-        supports_multiple_outputs=True,
-        version="pointwise_indexed_v2",
+        version="pointwise_pre_m5_v1",
     ),
     "reduction_minimal": TritonTVMContract(
         name="reduction_minimal",
@@ -97,17 +94,33 @@ _CONTRACTS = {
         supports_multiple_outputs=False,
         version="reduction_minimal_v1",
     ),
+    "norm_single_row": TritonTVMContract(
+        name="norm_single_row",
+        indexing_kind="single_row_norm",
+        memory_model="flat_buffer",
+        requires_extent_param=True,
+        supports_multiple_outputs=False,
+        version="norm_single_row_v1",
+    ),
 }
 
 
 def normalize_triton_tvm_contract(contract: str) -> str:
     """Return the canonical contract name for a public contract or alias."""
     try:
-        return _CONTRACT_ALIASES[contract]
+        canonical = _CONTRACT_ALIASES[contract]
     except KeyError as err:
         raise UnsupportedContractError(
             f"Unsupported Triton TVM contract: {contract}"
         ) from err
+    if contract in _LEGACY_CONTRACT_ALIASES:
+        warnings.warn(
+            f"Triton TVM contract {contract!r} is deprecated; use "
+            f"{canonical!r} instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+    return canonical
 
 
 def get_triton_tvm_contract(contract: str) -> TritonTVMContract:
@@ -124,17 +137,11 @@ def validate_pointwise_minimal_contract(irmod: tvm.IRModule) -> None:
 
 
 def validate_pointwise_flat_contract(irmod: tvm.IRModule) -> None:
-    """Validate the flat-contiguous multi-store pointwise contract."""
+    """Validate the multi-store pointwise contract and its capability variants."""
     _validate_pointwise_common(irmod, "pointwise_flat")
     for gvar, func in irmod.functions.items():
         _validate_pointwise_flat_body(gvar.name_hint, func)
-
-
-def validate_pointwise_indexed_contract(irmod: tvm.IRModule) -> None:
-    """Validate the indexed pointwise contract."""
-    _validate_pointwise_common(irmod, "pointwise_indexed")
-    for gvar, func in irmod.functions.items():
-        _validate_pointwise_indexed_body(gvar.name_hint, func)
+        _validate_pointwise_capability_body(gvar.name_hint, func)
 
 
 def validate_reduction_minimal_contract(irmod: tvm.IRModule) -> None:
@@ -144,19 +151,23 @@ def validate_reduction_minimal_contract(irmod: tvm.IRModule) -> None:
         _validate_reduction_minimal_body(gvar.name_hint, func)
 
 
+def validate_norm_single_row_contract(irmod: tvm.IRModule) -> None:
+    """Validate the M4 single-row LN/RMS contract."""
+    _validate_pointwise_common(irmod, "norm_single_row")
+    for gvar, func in irmod.functions.items():
+        _validate_reduction_minimal_body(gvar.name_hint, func)
+
+
 def validate_cuda_minimal_contract(irmod: tvm.IRModule) -> None:
     """Validate the legacy CUDA single-store alias."""
+    _warn_legacy_contract("cuda_minimal", "pointwise_minimal")
     validate_pointwise_minimal_contract(irmod)
 
 
 def validate_cuda_pointwise_flat_contract(irmod: tvm.IRModule) -> None:
     """Validate the legacy CUDA flat-contiguous alias."""
+    _warn_legacy_contract("cuda_pointwise_flat", "pointwise_flat")
     validate_pointwise_flat_contract(irmod)
-
-
-def validate_cuda_pointwise_indexed_contract(irmod: tvm.IRModule) -> None:
-    """Validate the legacy CUDA indexed pointwise alias."""
-    validate_pointwise_indexed_contract(irmod)
 
 
 def validate_triton_tvm_contract(irmod: tvm.IRModule, contract: str) -> None:
@@ -166,14 +177,22 @@ def validate_triton_tvm_contract(irmod: tvm.IRModule, contract: str) -> None:
         validate_pointwise_minimal_contract(irmod)
     elif contract == "pointwise_flat":
         validate_pointwise_flat_contract(irmod)
-    elif contract == "pointwise_indexed":
-        validate_pointwise_indexed_contract(irmod)
     elif contract == "reduction_minimal":
         validate_reduction_minimal_contract(irmod)
+    elif contract == "norm_single_row":
+        validate_norm_single_row_contract(irmod)
     else:
         raise UnsupportedContractError(
             f"Contract {contract!r} does not have a validator in this prototype"
         )
+
+
+def _warn_legacy_contract(alias: str, canonical: str) -> None:
+    warnings.warn(
+        f"Triton TVM contract {alias!r} is deprecated; use {canonical!r} instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
 
 
 def _validate_pointwise_common(irmod: tvm.IRModule, contract: str) -> None:
@@ -248,13 +267,13 @@ def _validate_pointwise_flat_body(name: str, func: tvm.tirx.PrimFunc) -> None:
         )
 
 
-def _validate_pointwise_indexed_body(name: str, func: tvm.tirx.PrimFunc) -> None:
+def _validate_pointwise_capability_body(name: str, func: tvm.tirx.PrimFunc) -> None:
     from tvm import tirx  # pylint: disable=import-outside-toplevel
 
     guarded_stores = _store_guard_records(func.body)
     if not guarded_stores:
         raise TritonTVMContractError(
-            f"{name} pointwise_indexed contract requires at least one BufferStore"
+            f"{name} pointwise_flat contract requires at least one BufferStore"
         )
 
     unguarded = sum(1 for _, guard in guarded_stores if guard is None)
@@ -268,7 +287,7 @@ def _validate_pointwise_indexed_body(name: str, func: tvm.tirx.PrimFunc) -> None
     first_guard_key = _expr_key(first_guard)
     if not _is_supported_pointwise_mask_guard(first_guard):
         raise TritonTVMContractError(
-            f"{name} pointwise_indexed stores must use an i < extent mask guard"
+            f"{name} pointwise_flat stores must use an i < extent mask guard"
         )
 
     allowed_loads: set[str] = set()
@@ -276,13 +295,13 @@ def _validate_pointwise_indexed_body(name: str, func: tvm.tirx.PrimFunc) -> None
         assert guard is not None
         if _expr_key(guard) != first_guard_key:
             raise TritonTVMContractError(
-                f"{name} pointwise_indexed stores must use the same mask guard"
+                f"{name} pointwise_flat stores must use the same mask guard"
             )
         for index in store.indices:
             _validate_supported_pointwise_index(name, index)
             if _buffer_load_keys(index):
                 raise TritonTVMContractError(
-                    f"{name} pointwise_indexed store indices must not contain BufferLoad"
+                    f"{name} pointwise_flat store indices must not contain BufferLoad"
                 )
         allowed_loads.update(_buffer_load_keys(store.value))
 
@@ -290,7 +309,7 @@ def _validate_pointwise_indexed_body(name: str, func: tvm.tirx.PrimFunc) -> None
     disallowed_loads = sorted(all_loads - allowed_loads)
     if disallowed_loads:
         raise TritonTVMContractError(
-            f"{name} pointwise_indexed direct BufferLoad must appear only in "
+            f"{name} pointwise_flat direct BufferLoad must appear only in "
             f"guarded store values: {', '.join(disallowed_loads[:3])}"
         )
 
@@ -405,7 +424,7 @@ def _validate_supported_pointwise_index(name: str, expr) -> None:
     if _is_supported_pointwise_index(expr):
         return
     raise TritonTVMContractError(
-        f"{name} pointwise_indexed only supports buffer indices i, i % C, i // C, and i * C"
+        f"{name} pointwise_flat only supports buffer indices i, i % C, i // C, and i * C"
     )
 
 

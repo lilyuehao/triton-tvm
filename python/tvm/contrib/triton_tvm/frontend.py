@@ -44,7 +44,11 @@ def lower_to_ttir(
     dump_path: str | Path | None = None,
     attrs: Any | None = None,
 ) -> TTIRArtifact:
-    """Lower a Triton JIT function to optimized TTIR.
+    """Lower a Triton JIT function to optimized textual TTIR.
+
+    This pre-M5 API is intentionally narrow and pinned to Triton 3.7.0.  It
+    does not compile TVM code, does not install an Inductor hook, and does not
+    silently fall back to native Triton when lowering fails.
 
     Parameters
     ----------

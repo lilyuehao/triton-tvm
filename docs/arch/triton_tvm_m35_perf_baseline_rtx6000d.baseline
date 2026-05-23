@@ -4,7 +4,7 @@
   "cases": [
     {
       "case": "vector_add",
-      "contract": "cuda_minimal",
+      "contract": "pointwise_minimal",
       "traffic_bytes": 50331648,
       "triton_gbps": 1020.4145626801372,
       "triton_us": 49.324705703731844,
@@ -14,7 +14,7 @@
     },
     {
       "case": "pointwise_chain",
-      "contract": "cuda_minimal",
+      "contract": "pointwise_minimal",
       "traffic_bytes": 67108864,
       "triton_gbps": 1014.8892567270336,
       "triton_us": 66.12432199393132,
@@ -24,7 +24,7 @@
     },
     {
       "case": "dual_store",
-      "contract": "cuda_pointwise_flat",
+      "contract": "pointwise_flat",
       "traffic_bytes": 67108864,
       "triton_gbps": 1149.0884894894439,
       "triton_us": 58.40182424054862,
@@ -34,7 +34,7 @@
     },
     {
       "case": "scalar_broadcast",
-      "contract": "cuda_pointwise_flat",
+      "contract": "pointwise_flat",
       "traffic_bytes": 50331648,
       "triton_gbps": 1189.8863731354184,
       "triton_us": 42.29954148258143,
@@ -44,7 +44,7 @@
     },
     {
       "case": "indexed_broadcast_relu",
-      "contract": "pointwise_indexed",
+      "contract": "pointwise_flat",
       "traffic_bytes": 50331648,
       "triton_gbps": 1662.6510321821831,
       "triton_us": 30.27192539251073,
@@ -54,7 +54,7 @@
     },
     {
       "case": "indexed_strided",
-      "contract": "pointwise_indexed",
+      "contract": "pointwise_flat",
       "traffic_bytes": 33554432,
       "triton_gbps": 720.4649652406177,
       "triton_us": 46.573301435682765,

@@ -192,3 +192,18 @@ M4 reduction boundary:
   unmasked parameter loads are supported for `n == BLOCK` style cases.
 - Leaves shared/allreduce lowering, cross-block reductions, Welford, `tl.max`,
   persistent kernels, and Inductor integration out of scope.
+
+## Pre-M5 Contract Cleanup Addendum
+
+The M3.5 `pointwise_indexed` contract name was retired during the Pre-M5 Debt
+Sprint.  Its implemented behavior remains covered, but it is now represented as
+capability under the canonical `pointwise_flat` contract.  Current metadata,
+cache keys, report buckets, and internal dispatch must use:
+
+- `pointwise_minimal`
+- `pointwise_flat`
+- `reduction_minimal`
+- `norm_single_row`
+
+Legacy `cuda_minimal` and `cuda_pointwise_flat` are compatibility aliases only.
+They warn at the public API boundary and canonicalize immediately.

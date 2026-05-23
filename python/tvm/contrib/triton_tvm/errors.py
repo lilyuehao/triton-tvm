@@ -35,3 +35,7 @@ class UnsupportedContractError(TritonTVMError, ValueError):
 
 class UnsupportedTargetPolicyError(TritonTVMError, ValueError):
     """Raised when no backend policy is registered for a target/contract pair."""
+
+
+class UnsupportedStreamError(TritonTVMError, NotImplementedError):
+    """Raised when a runtime stream value is outside the pre-M5 launcher boundary."""

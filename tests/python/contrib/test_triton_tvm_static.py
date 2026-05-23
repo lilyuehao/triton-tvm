@@ -24,21 +24,21 @@ import pytest
 
 import tvm
 import tvm.testing
+import tvm.contrib.triton_tvm as triton_tvm_pkg
 from tvm.contrib.triton_tvm import (
-    NormalizeTritonKernelTIR,
-    TTIRReader,
     TritonTVMContractError,
     UnsupportedTTIROpError,
     UnsupportedTargetPolicyError,
+    ValidateTritonKernelTIR,
     translate_ttir,
     validate_cuda_minimal_contract,
-    validate_cuda_pointwise_indexed_contract,
     validate_cuda_pointwise_flat_contract,
-    validate_pointwise_indexed_contract,
+    validate_norm_single_row_contract,
     validate_pointwise_flat_contract,
     validate_reduction_minimal_contract,
     validate_triton_tvm_contract,
 )
+from tvm.contrib.triton_tvm.ttir import TTIRReader
 
 
 _STATIC_DUAL_STORE_TTIR = """
@@ -303,6 +303,53 @@ def test_static_m25_reader_op_graph_snapshot():
     }
 
 
+def test_static_pre_m5_public_pass_surface():
+    assert hasattr(triton_tvm_pkg, "ValidateTritonKernelTIR")
+    assert not hasattr(triton_tvm_pkg, "NormalizeTritonKernelTIR")
+
+
+def test_static_pre_m5_public_api_freeze():
+    assert set(triton_tvm_pkg.__all__) == {
+        "TTIRArtifact",
+        "TritonTVMArtifact",
+        "TritonTVMContract",
+        "TritonTVMContractError",
+        "TritonTVMError",
+        "TritonTVMMeta",
+        "UnsupportedContractError",
+        "UnsupportedStreamError",
+        "UnsupportedTTIROpError",
+        "UnsupportedTargetPolicyError",
+        "ValidateTritonKernelTIR",
+        "build_triton_tvm",
+        "get_triton_tvm_contract",
+        "lower_to_ttir",
+        "normalize_triton_tvm_contract",
+        "translate_ttir",
+        "validate_norm_single_row_contract",
+        "validate_pointwise_flat_contract",
+        "validate_pointwise_minimal_contract",
+        "validate_reduction_minimal_contract",
+        "validate_triton_tvm_contract",
+    }
+    assert "TTIRReader" not in triton_tvm_pkg.__all__
+    assert "validate_cuda_minimal_contract" not in triton_tvm_pkg.__all__
+    assert "validate_cuda_pointwise_flat_contract" not in triton_tvm_pkg.__all__
+    assert hasattr(triton_tvm_pkg, "validate_cuda_minimal_contract")
+    assert hasattr(triton_tvm_pkg, "validate_cuda_pointwise_flat_contract")
+
+
+def test_static_pre_m5_ttir_parse_boundary():
+    from pathlib import Path  # pylint: disable=import-outside-toplevel
+
+    repo_root = Path(__file__).resolve().parents[3]
+    translator_source = (
+        repo_root / "python" / "tvm" / "contrib" / "triton_tvm" / "translator.py"
+    ).read_text(encoding="utf-8")
+    assert "TTIRReader" not in translator_source
+    assert "normalize_ttir_input" in translator_source
+
+
 def test_static_m4_reader_reduce_region_snapshot():
     graph = TTIRReader().read(_STATIC_REDUCTION_ROWSUM_TTIR)
     ops = [op.name for op in graph.ops]
@@ -326,7 +373,7 @@ def test_static_m4_reduction_minimal_contract_without_cuda_runtime():
         contract="reduction_minimal",
     )
     validate_reduction_minimal_contract(irmod)
-    NormalizeTritonKernelTIR(contract="reduction_minimal")(irmod)
+    ValidateTritonKernelTIR(contract="reduction_minimal")(irmod)
 
     script = irmod.script()
     assert meta.contract == "reduction_minimal"
@@ -344,6 +391,23 @@ def test_static_m4_reduction_minimal_contract_without_cuda_runtime():
     assert "out[row] = red_0[0]" in script
 
 
+def test_static_pre_m5_norm_single_row_contract_without_cuda_runtime():
+    irmod, meta = translate_ttir(
+        _STATIC_REDUCTION_ROWSUM_TTIR,
+        grid=(3,),
+        contract="norm_single_row",
+    )
+    validate_norm_single_row_contract(irmod)
+    ValidateTritonKernelTIR(contract="norm_single_row")(irmod)
+
+    assert meta.contract == "norm_single_row"
+    assert meta.contract_version == "norm_single_row_v1"
+    assert meta.indexing_kind == "single_row_norm"
+
+    with pytest.raises(UnsupportedTTIROpError, match="requires at least one tt.reduce"):
+        translate_ttir(_STATIC_DUAL_STORE_TTIR, grid=(1,), contract="norm_single_row")
+
+
 def test_static_m25_tirscript_golden_shape():
     irmod, meta = translate_ttir(
         _STATIC_DUAL_STORE_TTIR,
@@ -359,10 +423,10 @@ def test_static_m25_tirscript_golden_shape():
     assert meta.target_kind == "cuda"
     assert meta.extent_param == "n"
     assert meta.block_size == 64
-    assert meta.indexing_kind == "flat_contiguous"
+    assert meta.indexing_kind == "pointwise"
     assert meta.launch_policy_id == "cuda_block_thread"
-    assert meta.translator_version == "triton_tvm_python_m35_hardened_v1"
-    assert meta.contract_version == "pointwise_v1"
+    assert meta.translator_version == "triton_tvm_python_pre_m5_contracts_v1"
+    assert meta.contract_version == "pointwise_pre_m5_v1"
     assert meta.target_policy_version == "cuda_thread_binding_v1"
     assert meta.extent_kind == "runtime_param"
     assert meta.extent_value is None
@@ -380,6 +444,9 @@ def test_static_m25_tirscript_golden_shape():
         {"name": "o1", "kind": "pointer", "dtype": "float32"},
         {"name": "n", "kind": "scalar", "dtype": "int64"},
     ]
+    assert meta.cache_policy == "disabled"
+    assert meta.disk_cache_enabled is False
+    assert meta.fallback_reason == ""
     assert "def _sd(" in script
     assert script.count("T.match_buffer") == 4
     assert 'thread="blockIdx.x"' in script
@@ -395,19 +462,23 @@ def test_static_m25_contract_boundaries_without_cuda_runtime():
     with pytest.raises(UnsupportedTTIROpError, match="contract='pointwise_flat'"):
         translate_ttir(_STATIC_DUAL_STORE_TTIR, grid=(1,))
 
-    irmod, meta = translate_ttir(
-        _STATIC_DUAL_STORE_TTIR,
-        grid=(1,),
-        contract="cuda_pointwise_flat",
-    )
+    with pytest.warns(FutureWarning, match="cuda_pointwise_flat"):
+        irmod, meta = translate_ttir(
+            _STATIC_DUAL_STORE_TTIR,
+            grid=(1,),
+            contract="cuda_pointwise_flat",
+        )
     assert meta.contract == "pointwise_flat"
     assert meta.canonical_contract == "pointwise_flat"
-    assert meta.requested_contract == "cuda_pointwise_flat"
-    validate_cuda_pointwise_flat_contract(irmod)
-    NormalizeTritonKernelTIR(contract="cuda_pointwise_flat")(irmod)
+    assert meta.requested_contract == "pointwise_flat"
+    with pytest.warns(FutureWarning, match="cuda_pointwise_flat"):
+        validate_cuda_pointwise_flat_contract(irmod)
+    with pytest.warns(FutureWarning, match="cuda_pointwise_flat"):
+        ValidateTritonKernelTIR(contract="cuda_pointwise_flat")(irmod)
 
     with pytest.raises(TritonTVMContractError, match="exactly one BufferStore"):
-        validate_cuda_minimal_contract(irmod)
+        with pytest.warns(FutureWarning, match="cuda_minimal"):
+            validate_cuda_minimal_contract(irmod)
     with pytest.raises(ValueError, match="Unsupported Triton TVM contract"):
         validate_triton_tvm_contract(irmod, "cuda_unknown")
 
@@ -418,22 +489,24 @@ def test_static_m25_alias_cache_key_and_validator_equivalence():
         grid=(1,),
         contract="pointwise_flat",
     )
-    alias_mod, alias_meta = translate_ttir(
-        _STATIC_DUAL_STORE_TTIR,
-        grid=(1,),
-        contract="cuda_pointwise_flat",
-    )
+    with pytest.warns(FutureWarning, match="cuda_pointwise_flat"):
+        alias_mod, alias_meta = translate_ttir(
+            _STATIC_DUAL_STORE_TTIR,
+            grid=(1,),
+            contract="cuda_pointwise_flat",
+        )
 
     assert canonical_meta.canonical_contract == "pointwise_flat"
     assert alias_meta.canonical_contract == "pointwise_flat"
-    assert alias_meta.requested_contract == "cuda_pointwise_flat"
+    assert alias_meta.requested_contract == "pointwise_flat"
     assert canonical_meta.cache_key == alias_meta.cache_key
     assert canonical_mod.script() == alias_mod.script()
     validate_pointwise_flat_contract(alias_mod)
-    validate_cuda_pointwise_flat_contract(alias_mod)
+    with pytest.warns(FutureWarning, match="cuda_pointwise_flat"):
+        validate_cuda_pointwise_flat_contract(alias_mod)
 
 
-def test_static_m35_indexed_contract_without_cuda_runtime():
+def test_static_pre_m5_pointwise_flat_indexed_capability_without_cuda_runtime():
     graph = TTIRReader().read(_STATIC_M35_INDEXED_TTIR)
     assert graph.params[0].type.raw == "!tt.ptr<f32>"
     load = graph.op_by_result()["vy"]
@@ -443,16 +516,15 @@ def test_static_m35_indexed_contract_without_cuda_runtime():
     irmod, meta = translate_ttir(
         graph,
         grid=(1,),
-        contract="cuda_pointwise_indexed",
+        contract="pointwise_flat",
     )
-    validate_pointwise_indexed_contract(irmod)
-    validate_cuda_pointwise_indexed_contract(irmod)
-    NormalizeTritonKernelTIR(contract="pointwise_indexed")(irmod)
+    validate_pointwise_flat_contract(irmod)
+    ValidateTritonKernelTIR(contract="pointwise_flat")(irmod)
 
     script = irmod.script()
-    assert meta.contract == "pointwise_indexed"
-    assert meta.requested_contract == "cuda_pointwise_indexed"
-    assert meta.contract_version == "pointwise_indexed_v2"
+    assert meta.contract == "pointwise_flat"
+    assert meta.requested_contract == "pointwise_flat"
+    assert meta.contract_version == "pointwise_pre_m5_v1"
     assert meta.extent_kind == "constant"
     assert meta.extent_value == 64
     assert meta.extent_param == ""
@@ -467,13 +539,13 @@ def test_static_m35_indexed_contract_without_cuda_runtime():
     assert "T.if_then_else(mask" not in script
 
 
-def test_static_m35_bool_bitcast_store_without_cuda_runtime():
+def test_static_pre_m5_bool_bitcast_store_without_cuda_runtime():
     irmod, meta = translate_ttir(
         _STATIC_M35_BOOL_BITCAST_TTIR,
         grid=(1,),
-        contract="pointwise_indexed",
+        contract="pointwise_flat",
     )
-    validate_pointwise_indexed_contract(irmod)
+    validate_pointwise_flat_contract(irmod)
 
     script = irmod.script()
     assert meta.abi[-1] == {"name": "out", "kind": "pointer", "dtype": "bool"}
@@ -482,7 +554,7 @@ def test_static_m35_bool_bitcast_store_without_cuda_runtime():
     assert 'T.Cast("int8"' not in script
 
 
-def test_static_m35_hardening_pointwise_flat_rejects_indexed_only_surface():
+def test_static_pre_m5_pointwise_flat_accepts_indexed_capability_surface():
     indexed_with_other = _STATIC_M35_INDEXED_TTIR.replace(
         "%vx = tt.load %x_ptr, %mask :",
         "%vx = tt.load %x_ptr, %mask, %cst :",
@@ -492,22 +564,26 @@ def test_static_m35_hardening_pointwise_flat_rejects_indexed_only_surface():
         "%vy = tt.load %y_ptr, %mask, %cst :",
         1,
     )
-    with pytest.raises(UnsupportedTTIROpError, match="arith.remsi.*pointwise_flat"):
-        translate_ttir(indexed_with_other, grid=(1,), contract="pointwise_flat")
+    indexed_mod, indexed_meta = translate_ttir(
+        indexed_with_other, grid=(1,), contract="pointwise_flat"
+    )
+    validate_pointwise_flat_contract(indexed_mod)
+    assert indexed_meta.indexing_kind == "pointwise"
 
-    with pytest.raises(UnsupportedTTIROpError, match="tt.bitcast.*pointwise_flat"):
-        translate_ttir(
-            _STATIC_M35_BOOL_BITCAST_STORE_ONLY_TTIR,
-            grid=(1,),
-            contract="pointwise_flat",
-        )
+    bool_mod, bool_meta = translate_ttir(
+        _STATIC_M35_BOOL_BITCAST_STORE_ONLY_TTIR,
+        grid=(1,),
+        contract="pointwise_flat",
+    )
+    validate_pointwise_flat_contract(bool_mod)
+    assert bool_meta.abi[0] == {"name": "out", "kind": "pointer", "dtype": "bool"}
 
 
-def test_static_m35_hardening_indexed_validator_rejects_shape_only_matches():
+def test_static_pre_m5_pointwise_flat_validator_rejects_shape_only_matches():
     irmod, _ = translate_ttir(
         _STATIC_M35_INDEXED_TTIR,
         grid=(1,),
-        contract="pointwise_indexed",
+        contract="pointwise_flat",
     )
     script = irmod.script()
     old_store = (
@@ -525,11 +601,11 @@ def test_static_m35_hardening_indexed_validator_rejects_shape_only_matches():
         1,
     )
     with pytest.raises(TritonTVMContractError, match="BufferLoad"):
-        validate_pointwise_indexed_contract(_tirx_from_source(leaked_load))
+        validate_pointwise_flat_contract(_tirx_from_source(leaked_load))
 
     unsupported_index = script.replace("y[i % T.int64(16)]", "y[i + T.int64(1)]", 1)
     with pytest.raises(TritonTVMContractError, match="buffer indices"):
-        validate_pointwise_indexed_contract(_tirx_from_source(unsupported_index))
+        validate_pointwise_flat_contract(_tirx_from_source(unsupported_index))
 
     different_guard = script.replace(
         old_store,
@@ -541,17 +617,17 @@ def test_static_m35_hardening_indexed_validator_rejects_shape_only_matches():
         1,
     )
     with pytest.raises(TritonTVMContractError, match="same mask guard"):
-        validate_pointwise_indexed_contract(_tirx_from_source(different_guard))
+        validate_pointwise_flat_contract(_tirx_from_source(different_guard))
 
 
-def test_static_m35_unsafe_masked_load_without_other_rejected():
+def test_static_pre_m5_unsafe_masked_load_without_other_rejected():
     unguarded_store = _STATIC_M35_INDEXED_TTIR.replace(
         "tt.store %out_ptr, %sum, %mask :",
         "tt.store %out_ptr, %sum :",
         1,
     )
     with pytest.raises(UnsupportedTTIROpError, match="escapes the guarded store value"):
-        translate_ttir(unguarded_store, grid=(1,), contract="pointwise_indexed")
+        translate_ttir(unguarded_store, grid=(1,), contract="pointwise_flat")
 
     bitcast_load = _STATIC_M35_BOOL_BITCAST_TTIR.replace(
         "tt.store %out_i8, %both_i8, %mask :",
@@ -560,7 +636,7 @@ def test_static_m35_unsafe_masked_load_without_other_rejected():
         1,
     )
     with pytest.raises(UnsupportedTTIROpError, match="unsupported tt.bitcast"):
-        translate_ttir(bitcast_load, grid=(1,), contract="pointwise_indexed")
+        translate_ttir(bitcast_load, grid=(1,), contract="pointwise_flat")
 
 
 def test_static_m25_target_policy_dispatch_without_cuda_runtime():
@@ -587,6 +663,29 @@ def test_static_m25_target_policy_dispatch_without_cuda_runtime():
         contract="pointwise_flat",
     )
     assert "sm_80" in legacy_meta.target_attrs
+
+
+def test_static_pre_m5_target_spelling_and_cache_key_canonicalization():
+    from tvm import target as _target  # pylint: disable=import-outside-toplevel
+
+    from_string_mod, from_string_meta = translate_ttir(
+        _STATIC_DUAL_STORE_TTIR,
+        grid=(1,),
+        target="cuda -arch=sm_80",
+        contract="pointwise_flat",
+    )
+    from_object_mod, from_object_meta = translate_ttir(
+        _STATIC_DUAL_STORE_TTIR,
+        grid=(1,),
+        target=_target.Target({"kind": "cuda", "arch": "sm_80"}),
+        contract="pointwise_flat",
+    )
+
+    assert from_string_meta.target_attrs == from_object_meta.target_attrs
+    assert from_string_meta.cache_key == from_object_meta.cache_key
+    assert from_string_mod.script() == from_object_mod.script()
+    assert "cuda_" not in from_string_meta.canonical_contract
+    assert "cuda_" not in from_string_meta.requested_contract
 
 
 def test_static_m4_reduction_minimal_negative_boundaries():
@@ -702,13 +801,13 @@ def test_static_m25_rejects_inconsistent_memory_masks_without_cuda_runtime():
 
 
 def test_static_m25_negative_translate_without_cuda_runtime():
-    masked_load_without_other = _STATIC_DUAL_STORE_TTIR.replace(
+    masked_load_without_other = _STATIC_SCALAR_BEFORE_EXTENT_TTIR.replace(
         "tt.load %x_ptr, %mask, %cst :",
         "tt.load %x_ptr, %mask :",
         1,
     )
     with pytest.raises(UnsupportedTTIROpError, match="masked tt.load without other"):
-        translate_ttir(masked_load_without_other, grid=(1,), contract="pointwise_flat")
+        translate_ttir(masked_load_without_other, grid=(1,), contract="pointwise_minimal")
 
     reduction_ttir = _STATIC_DUAL_STORE_TTIR.replace(
         "    tt.return",
@@ -723,7 +822,7 @@ def test_static_m25_negative_translate_without_cuda_runtime():
         "%x_ptr = tt.addptr %x_splat, %offsets :",
         1,
     )
-    with pytest.raises(UnsupportedTTIROpError, match="non-contiguous pointer pattern"):
+    with pytest.raises(UnsupportedTTIROpError, match="unsupported composed indexing pattern"):
         translate_ttir(non_contiguous_ttir, grid=(1,), contract="pointwise_flat")
 
     unguarded_store_ttir = _STATIC_DUAL_STORE_TTIR.replace(

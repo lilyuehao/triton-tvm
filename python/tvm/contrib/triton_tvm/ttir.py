@@ -21,7 +21,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .frontend import TTIRArtifact
 from .op_graph import NormalizedTTIROpGraph, TTIROp, TTIRParam, TTIRType
+
+
+TTIRInput = str | TTIRArtifact | NormalizedTTIROpGraph
 
 
 _FUNC_RE = re.compile(
@@ -254,6 +258,24 @@ class TTIRReader:
             key, value = item.split("=", 1)
             attrs[key.strip()] = value.strip()
         return attrs
+
+
+def normalize_ttir_input(
+    ttir_or_graph: TTIRInput,
+) -> tuple[NormalizedTTIROpGraph, TTIRArtifact | None]:
+    """Normalize supported TTIR inputs to ``NormalizedTTIROpGraph``.
+
+    This is the controlled textual-parser boundary.  Translators and builders
+    should consume the normalized graph and should not parse raw textual TTIR
+    themselves.
+    """
+    if isinstance(ttir_or_graph, NormalizedTTIROpGraph):
+        return ttir_or_graph, None
+    if isinstance(ttir_or_graph, TTIRArtifact):
+        return TTIRReader().read(ttir_or_graph.ttir), ttir_or_graph
+    if isinstance(ttir_or_graph, str):
+        return TTIRReader().read(ttir_or_graph), None
+    raise TypeError(f"Unsupported TTIR input type: {type(ttir_or_graph)!r}")
 
 
 def parse_ttir_type(type_text: str) -> TTIRType:

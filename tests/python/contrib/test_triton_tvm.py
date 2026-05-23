@@ -23,17 +23,18 @@ import pytest
 import tvm
 import tvm.testing
 from tvm.contrib.triton_tvm import (
-    NormalizeTritonKernelTIR,
-    TTIRReader,
+    UnsupportedStreamError,
     UnsupportedTTIROpError,
+    ValidateTritonKernelTIR,
     build_triton_tvm,
     lower_to_ttir,
     translate_ttir,
-    validate_cuda_pointwise_flat_contract,
+    validate_norm_single_row_contract,
     validate_pointwise_flat_contract,
     validate_pointwise_minimal_contract,
     validate_reduction_minimal_contract,
 )
+from tvm.contrib.triton_tvm.ttir import TTIRReader
 
 try:
     import torch
@@ -456,6 +457,9 @@ def test_translate_ttir_contract_and_metadata():
         {"name": "out", "kind": "pointer", "dtype": "float32"},
         {"name": "n", "kind": "scalar", "dtype": "int64"},
     ]
+    assert meta.cache_policy == "disabled"
+    assert meta.disk_cache_enabled is False
+    assert meta.fallback_reason == ""
     assert len(meta.cache_key) == 64
 
 
@@ -539,7 +543,7 @@ def test_m25_dual_store_pointwise_flat_build_run():
     built = build_triton_tvm(
         irmod,
         meta,
-        passes=[NormalizeTritonKernelTIR(contract="pointwise_flat")],
+        passes=[ValidateTritonKernelTIR(contract="pointwise_flat")],
     )
 
     dev = tvm.cuda(0)
@@ -571,11 +575,11 @@ def test_m25_scalar_broadcast_pointwise_flat_build_run():
         artifact,
         grid=(triton.cdiv(n, block),),
         target="cuda",
-        contract="cuda_pointwise_flat",
+        contract="pointwise_flat",
     )
-    validate_cuda_pointwise_flat_contract(irmod)
+    validate_pointwise_flat_contract(irmod)
     assert meta.contract == "pointwise_flat"
-    assert meta.requested_contract == "cuda_pointwise_flat"
+    assert meta.requested_contract == "pointwise_flat"
     built = build_triton_tvm(irmod, meta)
 
     dev = tvm.cuda(0)
@@ -635,9 +639,9 @@ def test_m4_rms_core_reduction_minimal_build_run():
         artifact,
         grid=(rows,),
         target="cuda",
-        contract="reduction_minimal",
+        contract="norm_single_row",
     )
-    validate_reduction_minimal_contract(irmod)
+    validate_norm_single_row_contract(irmod)
     built = build_triton_tvm(irmod, meta)
 
     dev = tvm.cuda(0)
@@ -667,9 +671,9 @@ def test_m4_rmsnorm_reduction_minimal_build_run():
         artifact,
         grid=(rows,),
         target="cuda",
-        contract="reduction_minimal",
+        contract="norm_single_row",
     )
-    validate_reduction_minimal_contract(irmod)
+    validate_norm_single_row_contract(irmod)
     built = build_triton_tvm(irmod, meta)
 
     dev = tvm.cuda(0)
@@ -700,9 +704,9 @@ def test_m4_rmsnorm_runtime_eps_reduction_minimal_build_run():
         artifact,
         grid=(rows,),
         target="cuda",
-        contract="reduction_minimal",
+        contract="norm_single_row",
     )
-    validate_reduction_minimal_contract(irmod)
+    validate_norm_single_row_contract(irmod)
     assert meta.abi[-1] == {"name": "eps", "kind": "scalar", "dtype": "float32"}
     built = build_triton_tvm(irmod, meta)
 
@@ -738,9 +742,9 @@ def test_m4_layernorm_reduction_minimal_build_run():
         artifact,
         grid=(rows,),
         target="cuda",
-        contract="reduction_minimal",
+        contract="norm_single_row",
     )
-    validate_reduction_minimal_contract(irmod)
+    validate_norm_single_row_contract(irmod)
     assert len([op for op in TTIRReader().read(artifact.ttir).ops if op.name == "tt.reduce"]) == 2
     built = build_triton_tvm(irmod, meta)
 
@@ -783,9 +787,9 @@ def test_m4_layernorm_runtime_eps_reduction_minimal_build_run(lower_fn, n, seed)
         artifact,
         grid=(rows,),
         target="cuda",
-        contract="reduction_minimal",
+        contract="norm_single_row",
     )
-    validate_reduction_minimal_contract(irmod)
+    validate_norm_single_row_contract(irmod)
     assert meta.abi[-1] == {"name": "eps", "kind": "scalar", "dtype": "float32"}
     assert len([op for op in TTIRReader().read(artifact.ttir).ops if op.name == "tt.reduce"]) == 2
     built = build_triton_tvm(irmod, meta)
@@ -867,7 +871,7 @@ def test_m25_negative_non_contiguous_pointer_pattern():
             artifact,
             grid=(1,),
             target="cuda",
-            contract="cuda_pointwise_flat",
+            contract="pointwise_minimal",
         )
 
 
@@ -915,7 +919,7 @@ def test_negative_stream_not_supported():
     artifact = _lower(block=128)
     irmod, meta = translate_ttir(artifact, grid=(1,), target="cuda")
     built = build_triton_tvm(irmod, meta)
-    with pytest.raises(NotImplementedError, match="stream is not supported"):
+    with pytest.raises(UnsupportedStreamError, match="unsupported_stream"):
         built.run([], stream=object())
 
 

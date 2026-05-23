@@ -25,7 +25,7 @@ from typing import Any
 import tvm
 
 from .contracts import validate_triton_tvm_contract
-from .errors import TritonTVMContractError
+from .errors import TritonTVMContractError, UnsupportedStreamError
 from .translator import TritonTVMMeta
 
 
@@ -41,13 +41,22 @@ class TritonTVMArtifact:
     def run(self, args: list[Any] | tuple[Any, ...], grid=None, stream=None):
         """Run the compiled kernel.
 
-        ``grid`` is accepted to mirror the planned runtime API.  The current TIRX
-        kernel computes its launch extent from the runtime scalar, so a provided
-        grid is recorded by callers but not used by the launcher yet.
+        ABI boundary before M5:
+
+        - ``args`` must match ``meta.abi`` exactly: pointer entries are TVM
+          tensors with matching dtype, and scalar entries are Python numeric
+          values matching the TTIR scalar dtype.
+        - ``grid=None`` means use the grid captured in translation metadata.
+          A provided static grid is validated against ``meta.grid`` but is not a
+          separate launcher specialization yet.
+        - ``stream=None`` means the TVM runtime uses its current/default stream.
+          Raw PyTorch stream handles and non-default streams remain unsupported
+          until the M5 launcher hook owns stream handoff explicitly.
         """
         if stream is not None:
-            raise NotImplementedError(
-                "stream is not supported by TritonTVMArtifact.run in this prototype"
+            raise UnsupportedStreamError(
+                "unsupported_stream: TritonTVMArtifact.run only accepts stream=None "
+                "before the M5 launcher hook"
             )
         _validate_grid(grid, self.meta.grid)
         _validate_args(args, self.meta)
@@ -60,7 +69,12 @@ def build_triton_tvm(
     passes: list[Any] | tuple[Any, ...] | None = None,
     target: str = "cuda",
 ) -> TritonTVMArtifact:
-    """Apply optional TVM passes and compile the translated IRModule."""
+    """Apply optional TVM passes and compile the translated IRModule.
+
+    The build target must match the target policy captured in metadata.  This
+    helper validates the selected contract after user passes and raises on
+    unsupported input instead of falling back to native Triton.
+    """
     if tvm.target.Target(target).kind.name != tvm.target.Target(meta.target).kind.name:
         raise ValueError(
             f"Build target {target!r} does not match translated target {meta.target!r}"

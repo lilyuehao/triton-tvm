@@ -21,9 +21,8 @@ from .contracts import (
     get_triton_tvm_contract,
     normalize_triton_tvm_contract,
     validate_cuda_minimal_contract,
-    validate_cuda_pointwise_indexed_contract,
     validate_cuda_pointwise_flat_contract,
-    validate_pointwise_indexed_contract,
+    validate_norm_single_row_contract,
     validate_pointwise_flat_contract,
     validate_pointwise_minimal_contract,
     validate_reduction_minimal_contract,
@@ -33,41 +32,33 @@ from .errors import (
     TritonTVMContractError,
     TritonTVMError,
     UnsupportedContractError,
+    UnsupportedStreamError,
     UnsupportedTTIROpError,
     UnsupportedTargetPolicyError,
 )
 from .frontend import TTIRArtifact, lower_to_ttir
-from .op_graph import NormalizedTTIROpGraph, TTIROp, TTIRParam, TTIRType
-from .passes import NormalizeTritonKernelTIR
+from .passes import ValidateTritonKernelTIR
 from .runtime import TritonTVMArtifact, build_triton_tvm
 from .translator import TritonTVMMeta, translate_ttir
-from .ttir import TTIRReader
 
 __all__ = [
-    "NormalizedTTIROpGraph",
-    "NormalizeTritonKernelTIR",
     "TTIRArtifact",
-    "TTIROp",
-    "TTIRParam",
-    "TTIRReader",
-    "TTIRType",
     "TritonTVMArtifact",
     "TritonTVMContract",
     "TritonTVMContractError",
     "TritonTVMError",
     "TritonTVMMeta",
     "UnsupportedContractError",
+    "UnsupportedStreamError",
     "UnsupportedTTIROpError",
     "UnsupportedTargetPolicyError",
+    "ValidateTritonKernelTIR",
     "build_triton_tvm",
     "get_triton_tvm_contract",
     "lower_to_ttir",
     "normalize_triton_tvm_contract",
     "translate_ttir",
-    "validate_cuda_minimal_contract",
-    "validate_cuda_pointwise_indexed_contract",
-    "validate_cuda_pointwise_flat_contract",
-    "validate_pointwise_indexed_contract",
+    "validate_norm_single_row_contract",
     "validate_pointwise_flat_contract",
     "validate_pointwise_minimal_contract",
     "validate_reduction_minimal_contract",
