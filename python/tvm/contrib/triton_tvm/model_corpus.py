@@ -1,0 +1,980 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""M6/M6.5 model-level TorchInductor corpus audit helpers.
+
+The model corpus path intentionally audits native TorchInductor output instead
+of promising fallback-free model execution.  Its job is to make blockers stable,
+ranked, and reproducible for small external-library model fixtures.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+from .inductor import (
+    InductorKernel,
+    InductorTritonSource,
+    audit_inductor_kernel,
+    extract_inductor_triton_sources,
+    is_inductor_pointwise_kernel,
+    load_inductor_kernel,
+)
+from .reporting import (
+    build_capability_report,
+    make_report_status,
+    write_capability_report,
+)
+
+
+MODEL_CORPUS = "m6_model_corpus"
+PRE_M7_TAXONOMY_VERSION = 1
+PRE_M7_BUILDER_DECISION = "keep_tvmscript_source_builder_for_m7_entry"
+_PRE_M7_READER_CLASSES = (
+    "pointwise",
+    "broadcast_view_index",
+    "reduction",
+    "matmul_dot",
+    "atomic_grid",
+    "attention_adjacent",
+)
+_PRE_M7_EXCLUDED_M7_BLOCKER_CLASSES = {
+    "atomic",
+    "grid",
+    "matmul_dot",
+    "reduction",
+    "zero_triton_kernels",
+}
+
+
+@dataclass(frozen=True)
+class TritonTVMModelAuditConfig:
+    """Configuration for the experimental M6/M6.5 model corpus audit."""
+
+    seed: int = 0
+    contract: str = "pointwise_flat"
+    target: str = "cuda"
+    min_models: int = 1
+
+
+@dataclass(frozen=True)
+class TritonTVMModelAuditCase:
+    """One model fixture in the M6/M6.5 audit corpus."""
+
+    model_family: str
+    case_name: str
+    make_model: Callable[[Any], Any]
+    make_inputs: Callable[[Any], tuple[tuple[Any, ...], dict[str, Any]]]
+
+
+def builtin_model_audit_cases() -> list[TritonTVMModelAuditCase]:
+    """Return the external-library tiny model fixtures used by M6/M6.5."""
+    return [
+        TritonTVMModelAuditCase(
+            model_family="vit",
+            case_name="vit_tiny_random",
+            make_model=_make_vit_tiny,
+            make_inputs=_make_vit_inputs,
+        ),
+        TritonTVMModelAuditCase(
+            model_family="llama",
+            case_name="llama_tiny_random",
+            make_model=_make_llama_tiny,
+            make_inputs=_make_llama_inputs,
+        ),
+        TritonTVMModelAuditCase(
+            model_family="yolo",
+            case_name="yolov8n_yaml_random",
+            make_model=_make_yolo_tiny,
+            make_inputs=_make_yolo_inputs,
+        ),
+    ]
+
+
+def run_model_corpus_audit(
+    cases: list[TritonTVMModelAuditCase] | None = None,
+    *,
+    out_dir: str | Path,
+    config: TritonTVMModelAuditConfig | None = None,
+) -> dict[str, Any]:
+    """Run the M6/M6.5 model corpus audit and write report artifacts."""
+    cfg = config or TritonTVMModelAuditConfig()
+    selected_cases = list(cases or builtin_model_audit_cases())
+    if len(selected_cases) < cfg.min_models:
+        raise ValueError(
+            f"M6 model corpus requires at least {cfg.min_models} cases, "
+            f"got {len(selected_cases)}"
+        )
+
+    out_path = Path(out_dir)
+    wrapper_dir = out_path / "wrappers"
+    kernel_dir = out_path / "kernels"
+    ttir_dir = out_path / "ttir"
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    kernel_dir.mkdir(parents=True, exist_ok=True)
+    ttir_dir.mkdir(parents=True, exist_ok=True)
+
+    kernel_records: list[dict[str, Any]] = []
+    model_records: list[dict[str, Any]] = []
+    collection_errors: list[dict[str, Any]] = []
+
+    for case in selected_cases:
+        model_record, records, errors = _run_one_model_case(
+            case,
+            cfg,
+            wrapper_dir=wrapper_dir,
+            kernel_dir=kernel_dir,
+            ttir_dir=ttir_dir,
+        )
+        model_records.append(model_record)
+        kernel_records.extend(records)
+        collection_errors.extend(errors)
+
+    report = build_model_corpus_report(
+        kernel_records,
+        model_records,
+        dependency_versions=_dependency_versions(),
+        errors=collection_errors,
+    )
+    write_model_corpus_report(report, out_path)
+    return report
+
+
+def build_model_corpus_report(
+    kernel_records: list[dict[str, Any]],
+    model_records: list[dict[str, Any]],
+    *,
+    dependency_versions: dict[str, Any] | None = None,
+    errors: list[dict[str, Any]] | None = None,
+    generated_at: str | None = None,
+) -> dict[str, Any]:
+    """Build the JSON-serializable M6/M6.5 model corpus report."""
+    normalized_models = [_normalize_model_record(record) for record in model_records]
+    normalized_kernels = [_normalize_model_kernel_record(record) for record in kernel_records]
+    report = build_capability_report(
+        normalized_kernels,
+        purpose="m6/m6.5 external model corpus audit",
+        corpus=MODEL_CORPUS,
+        generated_at=generated_at,
+        errors=errors,
+    )
+    report["dependency_versions"] = dict(sorted((dependency_versions or {}).items()))
+    report["model_summary"] = _model_summary(normalized_models, normalized_kernels)
+    report["models"] = normalized_models
+    report["blockers"] = _rank_blockers(normalized_kernels, normalized_models, errors or [])
+    report["pre_m7"] = _pre_m7_report_section(
+        normalized_kernels,
+        report["blockers"],
+        errors or [],
+    )
+    report["full_tvm_runnable"] = (
+        bool(normalized_models)
+        and all(model.get("full_tvm_runnable", False) for model in normalized_models)
+    )
+    return report
+
+
+def write_model_corpus_report(report: dict[str, Any], out_dir: str | Path) -> None:
+    """Write ``report.json`` and ``report.md`` for a model corpus audit."""
+    write_capability_report(
+        report,
+        out_dir,
+        markdown_title="M6/M6.5 Model Corpus Audit",
+        footer_lines=_model_corpus_footer_lines(),
+    )
+
+
+def diff_capability_reports(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Compare two capability reports while ignoring unstable timestamps and paths."""
+    before_buckets = Counter((before.get("summary") or {}).get("status_buckets", {}))
+    after_buckets = Counter((after.get("summary") or {}).get("status_buckets", {}))
+    before_blockers = _blocker_counter(before)
+    after_blockers = _blocker_counter(after)
+    before_model_status = Counter(
+        str(model.get("status", ""))
+        for model in before.get("models", [])
+        if model.get("status")
+    )
+    after_model_status = Counter(
+        str(model.get("status", ""))
+        for model in after.get("models", [])
+        if model.get("status")
+    )
+    return {
+        "schema_version": 1,
+        "report_kind": "triton_tvm_capability_report_diff",
+        "before": _diff_summary(before),
+        "after": _diff_summary(after),
+        "bucket_delta": _counter_delta(before_buckets, after_buckets),
+        "blocker_delta": _counter_delta(before_blockers, after_blockers),
+        "model_status_delta": _counter_delta(before_model_status, after_model_status),
+        "translated_delta": int(after.get("translated_kernels", 0))
+        - int(before.get("translated_kernels", 0)),
+        "total_kernel_delta": int(after.get("total_kernels", 0))
+        - int(before.get("total_kernels", 0)),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point for ``python -m tvm.contrib.triton_tvm.model_corpus``."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--builtin-model-corpus", action="store_true")
+    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--contract", default="pointwise_flat")
+    parser.add_argument("--min-models", type=int, default=1)
+    args = parser.parse_args(argv)
+
+    if not args.builtin_model_corpus:
+        raise RuntimeError("M6 model corpus CLI currently requires --builtin-model-corpus")
+    report = run_model_corpus_audit(
+        builtin_model_audit_cases(),
+        out_dir=args.out_dir,
+        config=TritonTVMModelAuditConfig(
+            seed=args.seed,
+            contract=args.contract,
+            min_models=args.min_models,
+        ),
+    )
+    print(
+        "Wrote M6/M6.5 model corpus audit with "
+        f"{len(report['models'])} models and {report['total_kernels']} kernels "
+        f"to {args.out_dir}"
+    )
+    return 0
+
+
+def _run_one_model_case(
+    case: TritonTVMModelAuditCase,
+    cfg: TritonTVMModelAuditConfig,
+    *,
+    wrapper_dir: Path,
+    kernel_dir: Path,
+    ttir_dir: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    errors: list[dict[str, Any]] = []
+    kernel_records: list[dict[str, Any]] = []
+    wrappers: list[str] = []
+    model_record = _base_model_record(case)
+    try:
+        wrappers = _capture_inductor_wrappers(case, cfg)
+    except Exception as err:  # pylint: disable=broad-except
+        entry = _collection_error(case, "compile_error", err)
+        errors.append(entry)
+        model_record.update(
+            {
+                "status": "compile_error",
+                "error_type": entry["error_type"],
+                "message": entry["message"],
+                "full_tvm_runnable": False,
+            }
+        )
+        return model_record, kernel_records, errors
+
+    sources: list[InductorTritonSource] = []
+    for wrapper_index, wrapper_source in enumerate(wrappers):
+        wrapper_path = wrapper_dir / f"{_safe_name(case.case_name)}_{wrapper_index}.py"
+        wrapper_path.write_text(wrapper_source, encoding="utf-8")
+        model_record["wrapper_paths"].append(str(wrapper_path))
+        sources.extend(
+            extract_inductor_triton_sources(
+                wrapper_source,
+                case_name=case.case_name,
+                wrapper_path=str(wrapper_path),
+            )
+        )
+
+    for source in sources:
+        kernel_path = kernel_dir / f"{_safe_name(case.case_name)}_{source.kernel_name}.py"
+        kernel_path.write_text(source.source, encoding="utf-8")
+        record = _audit_one_model_kernel(
+            case,
+            source,
+            kernel_path=kernel_path,
+            ttir_dir=ttir_dir,
+            contract=cfg.contract,
+        )
+        kernel_records.append(record)
+
+    _finalize_model_record(model_record, kernel_records)
+    if not sources:
+        entry = {
+            "model_family": case.model_family,
+            "model_case": case.case_name,
+            "case_name": case.case_name,
+            "kernel_name": "",
+            "bucket": "collection_error",
+            "fallback_reason": "zero_triton_kernels",
+            "error_type": "RuntimeError",
+            "message": "TorchInductor produced no captured Triton kernels for this model case",
+        }
+        errors.append(entry)
+        model_record["status"] = "zero_kernels"
+        model_record["full_tvm_runnable"] = False
+    return model_record, kernel_records, errors
+
+
+def _capture_inductor_wrappers(
+    case: TritonTVMModelAuditCase,
+    cfg: TritonTVMModelAuditConfig,
+) -> list[str]:
+    import torch  # pylint: disable=import-outside-toplevel
+    import torch._dynamo  # pylint: disable=import-outside-toplevel
+    import torch._inductor.config as inductor_config  # pylint: disable=import-outside-toplevel
+    from torch._inductor.graph import GraphLowering  # pylint: disable=import-outside-toplevel
+
+    if cfg.target != "cuda":
+        raise ValueError(f"M6 model corpus currently supports target='cuda', got {cfg.target!r}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("M6 model corpus audit requires CUDA")
+
+    _set_offline_env()
+    _seed_torch(torch, cfg.seed)
+    captured: list[str] = []
+    old_save_output_code = GraphLowering.save_output_code
+    old_fx_graph_cache = inductor_config.fx_graph_cache
+    GraphLowering.save_output_code = captured.append
+    inductor_config.fx_graph_cache = False
+    try:
+        torch._dynamo.reset()
+        model = case.make_model(torch)
+        if hasattr(model, "eval"):
+            model.eval()
+        if hasattr(model, "to"):
+            model = model.to("cuda")
+        args, kwargs = case.make_inputs(torch)
+        compiled = torch.compile(model, backend="inductor")
+        with torch.no_grad():
+            compiled(*args, **kwargs)
+        torch.cuda.synchronize()
+    finally:
+        GraphLowering.save_output_code = old_save_output_code
+        inductor_config.fx_graph_cache = old_fx_graph_cache
+        torch._dynamo.reset()
+    return captured
+
+
+def _audit_one_model_kernel(
+    case: TritonTVMModelAuditCase,
+    source: InductorTritonSource,
+    *,
+    kernel_path: Path,
+    ttir_dir: Path,
+    contract: str,
+) -> dict[str, Any]:
+    kernel: InductorKernel | None = None
+    try:
+        kernel = load_inductor_kernel(source)
+        record = audit_inductor_kernel(kernel, ttir_dir=ttir_dir, contract=contract)
+    except Exception as err:  # pylint: disable=broad-except
+        record = {
+            "corpus": MODEL_CORPUS,
+            "case_name": case.case_name,
+            "kernel_name": source.kernel_name,
+            "contract": contract,
+            "source_hash": "",
+            "ttir_hash": "",
+            "signature": {},
+            "constexprs": {},
+            "unique_ops": [],
+            "op_counts": {},
+            "types": [],
+            "raw_load_store_attrs": [],
+            "load_count": 0,
+            "store_count": 0,
+            "mask_forms": [],
+            "indexing_summary": {},
+            "translate_status": make_report_status(
+                ok=False,
+                bucket="internal_error",
+                fallback_reason="load_or_audit_error",
+                error_type=type(err).__name__,
+                message=str(err),
+            ),
+        }
+
+    record["corpus"] = MODEL_CORPUS
+    record["case_name"] = case.case_name
+    record["model_family"] = case.model_family
+    record["model_case"] = case.case_name
+    record["kernel_source_path"] = str(kernel_path)
+    if kernel is not None:
+        _attach_inductor_metadata(record, kernel)
+        if not is_inductor_pointwise_kernel(kernel):
+            record["candidate_translate_status"] = dict(record["translate_status"])
+            record["translate_status"] = make_report_status(
+                ok=False,
+                bucket="contract_error",
+                fallback_reason="unsupported_inductor_kernel",
+                message=(
+                    "M6 model audit only marks Grid1D non-atomic pointwise "
+                    "Inductor kernels as TVM-replaceable"
+                ),
+            )
+    else:
+        record.setdefault("grid_type", "")
+        record.setdefault("num_reduction", 0)
+        record.setdefault("atomic_add_found", False)
+        record.setdefault("size_hints", {})
+    record["blocker_class"] = _blocker_class(record)
+    return record
+
+
+def _attach_inductor_metadata(record: dict[str, Any], kernel: InductorKernel) -> None:
+    meta = kernel.inductor_meta
+    record.update(
+        {
+            "grid_type": meta.get("grid_type", ""),
+            "num_reduction": int(meta.get("num_reduction", 0) or 0),
+            "atomic_add_found": bool(meta.get("atomic_add_found", False)),
+            "size_hints": dict(kernel.size_hints),
+        }
+    )
+
+
+def _finalize_model_record(model_record: dict[str, Any], records: list[dict[str, Any]]) -> None:
+    model_records = [
+        record for record in records if record.get("model_case") == model_record["model_case"]
+    ]
+    status_buckets = Counter(
+        record["translate_status"].get("bucket", "unknown") for record in model_records
+    )
+    blockers = Counter(
+        record.get("blocker_class", "unknown")
+        for record in model_records
+        if not record["translate_status"].get("ok", False)
+    )
+    model_record.update(
+        {
+            "status": "completed",
+            "kernel_count": len(model_records),
+            "translated_kernels": sum(
+                1 for record in model_records if record["translate_status"].get("ok", False)
+            ),
+            "native_fallback_kernels": sum(
+                1 for record in model_records if not record["translate_status"].get("ok", False)
+            ),
+            "status_buckets": dict(sorted(status_buckets.items())),
+            "blocker_classes": dict(sorted(blockers.items())),
+        }
+    )
+    model_record["full_tvm_runnable"] = (
+        model_record["kernel_count"] > 0
+        and model_record["native_fallback_kernels"] == 0
+        and model_record["translated_kernels"] == model_record["kernel_count"]
+    )
+
+
+def _base_model_record(case: TritonTVMModelAuditCase) -> dict[str, Any]:
+    return {
+        "model_family": case.model_family,
+        "model_case": case.case_name,
+        "status": "not_run",
+        "kernel_count": 0,
+        "translated_kernels": 0,
+        "native_fallback_kernels": 0,
+        "status_buckets": {},
+        "blocker_classes": {},
+        "wrapper_paths": [],
+        "full_tvm_runnable": False,
+    }
+
+
+def _normalize_model_record(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(record)
+    normalized.setdefault("model_family", "")
+    normalized.setdefault("model_case", normalized.get("case_name", ""))
+    normalized.setdefault("status", "not_run")
+    normalized.setdefault("kernel_count", 0)
+    normalized.setdefault("translated_kernels", 0)
+    normalized.setdefault("native_fallback_kernels", 0)
+    normalized.setdefault("status_buckets", {})
+    normalized.setdefault("blocker_classes", {})
+    normalized.setdefault("wrapper_paths", [])
+    normalized.setdefault("full_tvm_runnable", False)
+    return normalized
+
+
+def _normalize_model_kernel_record(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(record)
+    normalized.setdefault("corpus", MODEL_CORPUS)
+    normalized.setdefault("model_family", "")
+    normalized.setdefault("model_case", normalized.get("case_name", ""))
+    normalized.setdefault("grid_type", "")
+    normalized.setdefault("num_reduction", 0)
+    normalized.setdefault("atomic_add_found", False)
+    normalized.setdefault("size_hints", {})
+    normalized.setdefault("blocker_class", _blocker_class(normalized))
+    return normalized
+
+
+def _model_summary(
+    model_records: list[dict[str, Any]],
+    kernel_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    families = Counter(record["model_family"] for record in model_records)
+    model_status = Counter(record["status"] for record in model_records)
+    blocker_classes = Counter(
+        record.get("blocker_class", "unknown")
+        for record in kernel_records
+        if not record.get("translate_status", {}).get("ok", False)
+    )
+    return {
+        "total_models": len(model_records),
+        "completed_models": sum(
+            1 for record in model_records if record.get("status") == "completed"
+        ),
+        "failed_models": sum(
+            1
+            for record in model_records
+            if record.get("status") not in ("completed", "not_run")
+        ),
+        "zero_kernel_models": sum(
+            1 for record in model_records if record.get("status") == "zero_kernels"
+        ),
+        "full_tvm_runnable_models": sum(
+            1 for record in model_records if record.get("full_tvm_runnable")
+        ),
+        "total_kernels": len(kernel_records),
+        "translated_kernels": sum(
+            1 for record in kernel_records if record.get("translate_status", {}).get("ok")
+        ),
+        "fallback_kernels": sum(
+            1 for record in kernel_records if not record.get("translate_status", {}).get("ok")
+        ),
+        "families": dict(sorted(families.items())),
+        "model_status": dict(sorted(model_status.items())),
+        "blocker_classes": dict(sorted(blocker_classes.items())),
+    }
+
+
+def _pre_m7_report_section(
+    kernel_records: list[dict[str, Any]],
+    blockers: list[dict[str, Any]],
+    errors: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "taxonomy_version": PRE_M7_TAXONOMY_VERSION,
+        "builder_decision": PRE_M7_BUILDER_DECISION,
+        "builder_decision_reason": (
+            "Direct node construction was evaluated for the Pre-M7 gate but is "
+            "not adopted before M7 because it would duplicate the current "
+            "pointwise/reduction TVMScript template builders without yet "
+            "reducing M7 blocker risk."
+        ),
+        "unsupported_taxonomy": _pre_m7_unsupported_taxonomy(),
+        "reader_snapshot_classes": _pre_m7_reader_snapshot_classes(kernel_records),
+        "m7_entry_blockers": _pre_m7_entry_blockers(blockers),
+        "collection_error_count": len(errors),
+    }
+
+
+def _pre_m7_unsupported_taxonomy() -> dict[str, Any]:
+    return {
+        "top_level_bucket_policy": "preserve_existing_buckets",
+        "detail_fields": ["fallback_reason", "blocker_class"],
+        "stable_top_level_buckets": [
+            "translated",
+            "unsupported_ttir_op",
+            "contract_error",
+            "target_policy_error",
+            "unsupported_stream",
+            "input_error",
+            "collection_error",
+            "triton_tvm_error",
+            "internal_error",
+        ],
+        "blocker_class_policy": {
+            "atomic": "classify through blocker_class without adding a top-level bucket",
+            "broadcast_view_index": (
+                "keep the existing exception bucket and use fallback_reason or "
+                "blocker_class for M7 ordering"
+            ),
+            "collection": "keep non-kernel failures in collection_error",
+            "grid": "classify through blocker_class without adding a top-level bucket",
+            "matmul_dot": "classify through blocker_class without adding a top-level bucket",
+            "reduction": "classify through blocker_class without adding a top-level bucket",
+        },
+    }
+
+
+def _pre_m7_reader_snapshot_classes(
+    kernel_records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    grouped = {
+        name: {
+            "kernel_count": 0,
+            "example_kernel": "",
+            "example_ops": [],
+        }
+        for name in _PRE_M7_READER_CLASSES
+    }
+    for record in kernel_records:
+        name = _pre_m7_reader_class(record)
+        entry = grouped[name]
+        entry["kernel_count"] += 1
+        if not entry["example_kernel"]:
+            entry["example_kernel"] = str(record.get("kernel_name", ""))
+            entry["example_ops"] = list(record.get("unique_ops", []))[:12]
+    return grouped
+
+
+def _pre_m7_reader_class(record: dict[str, Any]) -> str:
+    unique_ops = set(record.get("unique_ops", []))
+    blocker_class = str(record.get("blocker_class", ""))
+    if bool(record.get("atomic_add_found", False)) or blocker_class in ("atomic", "grid"):
+        return "atomic_grid"
+    if record.get("grid_type") and record.get("grid_type") != "Grid1D":
+        return "atomic_grid"
+    if int(record.get("num_reduction", 0) or 0) > 0 or "tt.reduce" in unique_ops:
+        return "reduction"
+    if "tt.dot" in unique_ops or blocker_class == "matmul_dot":
+        return "matmul_dot"
+    if _pre_m7_attention_adjacent(record):
+        return "attention_adjacent"
+    if _pre_m7_broadcast_view_index(record):
+        return "broadcast_view_index"
+    return "pointwise"
+
+
+def _pre_m7_attention_adjacent(record: dict[str, Any]) -> bool:
+    text = _pre_m7_record_text(record)
+    if any(token in text for token in ("attention", "softmax", "causal", "qkv", "rope")):
+        return True
+    unique_ops = set(record.get("unique_ops", []))
+    return bool(unique_ops & {"tt.trans", "tt.expand_dims"})
+
+
+def _pre_m7_broadcast_view_index(record: dict[str, Any]) -> bool:
+    text = _pre_m7_record_text(record)
+    if any(token in text for token in ("broadcast", "index", "stride", "view")):
+        return True
+    indexing = record.get("indexing_summary") or {}
+    return int(indexing.get("addptr_count", 0) or 0) > 1
+
+
+def _pre_m7_record_text(record: dict[str, Any]) -> str:
+    status = record.get("translate_status", {})
+    parts = [
+        str(record.get("blocker_class", "")),
+        str(record.get("kernel_name", "")),
+        str(status.get("bucket", "")),
+        str(status.get("fallback_reason", "")),
+        str(status.get("message", "")),
+    ]
+    return " ".join(parts).lower()
+
+
+def _pre_m7_entry_blockers(blockers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    entries = []
+    for blocker in blockers:
+        if not _is_pre_m7_entry_blocker(blocker):
+            continue
+        entries.append(
+            {
+                "bucket": blocker.get("bucket", ""),
+                "fallback_reason": blocker.get("fallback_reason", ""),
+                "blocker_class": blocker.get("blocker_class", ""),
+                "models_impacted": blocker.get("models_impacted", 0),
+                "kernel_count": blocker.get("kernel_count", 0),
+                "models": list(blocker.get("models", [])),
+                "example_kernel": blocker.get("example_kernel", ""),
+                "example_message": blocker.get("example_message", ""),
+                "example_ops": list(blocker.get("example_ops", [])),
+            }
+        )
+    return sorted(
+        entries,
+        key=lambda item: (
+            -int(item.get("models_impacted", 0)),
+            -int(item.get("kernel_count", 0)),
+            str(item.get("blocker_class", "")),
+            str(item.get("example_kernel", "")),
+        ),
+    )
+
+
+def _is_pre_m7_entry_blocker(blocker: dict[str, Any]) -> bool:
+    bucket = str(blocker.get("bucket", ""))
+    reason = str(blocker.get("fallback_reason", ""))
+    blocker_class = str(blocker.get("blocker_class", ""))
+    if bucket == "collection_error":
+        return False
+    if blocker_class in _PRE_M7_EXCLUDED_M7_BLOCKER_CLASSES:
+        return False
+    text = " ".join([bucket, reason, blocker_class, str(blocker.get("example_message", ""))])
+    text = text.lower()
+    example_ops = set(blocker.get("example_ops", []))
+    if example_ops & {"tt.trans", "tt.expand_dims"}:
+        return False
+    if any(token in text for token in ("attention", "softmax", "causal", "qkv", "rope")):
+        return False
+    return (
+        bucket == "unsupported_ttir_op"
+        or any(token in text for token in ("pointwise", "broadcast", "index", "stride", "view"))
+    )
+
+
+def _rank_blockers(
+    kernel_records: list[dict[str, Any]],
+    model_records: list[dict[str, Any]],
+    errors: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def get_entry(bucket: str, reason: str, blocker_class: str) -> dict[str, Any]:
+        key = (bucket, reason, blocker_class)
+        if key not in buckets:
+            buckets[key] = {
+                "bucket": bucket,
+                "fallback_reason": reason,
+                "blocker_class": blocker_class,
+                "kernel_count": 0,
+                "model_error_count": 0,
+                "models": set(),
+                "example_kernel": "",
+                "example_message": "",
+                "example_ops": [],
+            }
+        return buckets[key]
+
+    for record in kernel_records:
+        status = record.get("translate_status", {})
+        if status.get("ok", False):
+            continue
+        bucket = str(status.get("bucket", "unknown"))
+        reason = str(status.get("fallback_reason", "")) or bucket
+        blocker_class = str(record.get("blocker_class", "")) or reason
+        entry = get_entry(bucket, reason, blocker_class)
+        entry["kernel_count"] += 1
+        entry["models"].add(record.get("model_case", ""))
+        if not entry["example_kernel"]:
+            entry["example_kernel"] = record.get("kernel_name", "")
+            entry["example_message"] = str(status.get("message", ""))
+            entry["example_ops"] = list(record.get("unique_ops", []))[:12]
+
+    known_models = {
+        (record.get("model_family", ""), record.get("model_case", "")): record
+        for record in model_records
+    }
+    for error in errors:
+        model_case = error.get("model_case") or error.get("case_name", "")
+        model_family = error.get("model_family", "")
+        if not model_family and ("", model_case) not in known_models:
+            model_family = "unknown"
+        bucket = str(error.get("bucket", "collection_error"))
+        reason = str(error.get("fallback_reason", "")) or bucket
+        blocker_class = reason
+        entry = get_entry(bucket, reason, blocker_class)
+        entry["model_error_count"] += 1
+        entry["models"].add(model_case)
+        if not entry["example_message"]:
+            entry["example_message"] = str(error.get("message", ""))
+
+    ranked = []
+    for entry in buckets.values():
+        models = sorted(model for model in entry.pop("models") if model)
+        entry["models"] = models
+        entry["models_impacted"] = len(models)
+        ranked.append(entry)
+    return sorted(
+        ranked,
+        key=lambda item: (
+            -int(item.get("models_impacted", 0)),
+            -int(item.get("kernel_count", 0)),
+            str(item.get("bucket", "")),
+            str(item.get("blocker_class", "")),
+            item.get("models", [""])[0] if item.get("models") else "",
+        ),
+    )
+
+
+def _blocker_class(record: dict[str, Any]) -> str:
+    status = record.get("translate_status", {})
+    if status.get("ok", False):
+        return "none"
+    unique_ops = set(record.get("unique_ops", []))
+    if bool(record.get("atomic_add_found", False)) or any("atomic" in op for op in unique_ops):
+        return "atomic"
+    if int(record.get("num_reduction", 0) or 0) > 0 or "tt.reduce" in unique_ops:
+        return "reduction"
+    if "tt.dot" in unique_ops:
+        return "matmul_dot"
+    if record.get("grid_type") and record.get("grid_type") != "Grid1D":
+        return "grid"
+    reason = str(status.get("fallback_reason", "")) or str(status.get("bucket", "unknown"))
+    if reason == "unsupported_inductor_kernel":
+        return "unsupported_inductor_kernel"
+    return reason
+
+
+def _blocker_counter(report: dict[str, Any]) -> Counter:
+    counter: Counter[str] = Counter()
+    for blocker in report.get("blockers", []):
+        key = "|".join(
+            [
+                str(blocker.get("bucket", "")),
+                str(blocker.get("fallback_reason", "")),
+                str(blocker.get("blocker_class", "")),
+            ]
+        )
+        counter[key] += int(blocker.get("kernel_count", 0)) + int(
+            blocker.get("model_error_count", 0)
+        )
+    return counter
+
+
+def _counter_delta(before: Counter, after: Counter) -> dict[str, int]:
+    delta = {}
+    for key in sorted(set(before) | set(after)):
+        value = int(after.get(key, 0)) - int(before.get(key, 0))
+        if value:
+            delta[key] = value
+    return delta
+
+
+def _diff_summary(report: dict[str, Any]) -> dict[str, Any]:
+    model_summary = report.get("model_summary") or {}
+    return {
+        "total_models": int(model_summary.get("total_models", 0)),
+        "total_kernels": int(report.get("total_kernels", 0)),
+        "translated_kernels": int(report.get("translated_kernels", 0)),
+        "status_buckets": dict(sorted((report.get("summary") or {}).get("status_buckets", {}).items())),
+    }
+
+
+def _collection_error(
+    case: TritonTVMModelAuditCase,
+    bucket: str,
+    err: Exception,
+) -> dict[str, Any]:
+    return {
+        "model_family": case.model_family,
+        "model_case": case.case_name,
+        "case_name": case.case_name,
+        "kernel_name": "",
+        "bucket": bucket,
+        "fallback_reason": bucket,
+        "error_type": type(err).__name__,
+        "message": str(err),
+    }
+
+
+def _dependency_versions() -> dict[str, Any]:
+    versions = {}
+    for name in ("torch", "triton", "transformers", "ultralytics", "torchvision", "tvm"):
+        try:
+            module = __import__(name)
+        except Exception as err:  # pylint: disable=broad-except
+            versions[name] = {"available": False, "error": f"{type(err).__name__}: {err}"}
+            continue
+        versions[name] = {
+            "available": True,
+            "version": str(getattr(module, "__version__", "")),
+        }
+    try:
+        import torch  # pylint: disable=import-outside-toplevel
+
+        versions["cuda_available"] = bool(torch.cuda.is_available())
+        versions["cuda_device_count"] = int(torch.cuda.device_count())
+    except Exception:  # pylint: disable=broad-except
+        versions["cuda_available"] = False
+        versions["cuda_device_count"] = 0
+    versions["generated_at"] = datetime.now(timezone.utc).isoformat()
+    return versions
+
+
+def _set_offline_env() -> None:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+
+def _seed_torch(torch, seed: int) -> None:
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _make_vit_tiny(torch):
+    from transformers import ViTConfig, ViTModel  # pylint: disable=import-outside-toplevel
+
+    config = ViTConfig(
+        image_size=32,
+        patch_size=16,
+        num_channels=3,
+        hidden_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        intermediate_size=128,
+    )
+    return ViTModel(config)
+
+
+def _make_vit_inputs(torch) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    return (torch.randn((1, 3, 32, 32), device="cuda"),), {}
+
+
+def _make_llama_tiny(torch):
+    from transformers import LlamaConfig, LlamaModel  # pylint: disable=import-outside-toplevel
+
+    config = LlamaConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=32,
+    )
+    return LlamaModel(config)
+
+
+def _make_llama_inputs(torch) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    return (torch.randint(0, 128, (1, 16), device="cuda"),), {}
+
+
+def _make_yolo_tiny(torch):
+    from ultralytics import YOLO  # pylint: disable=import-outside-toplevel
+
+    return YOLO("yolov8n.yaml").model
+
+
+def _make_yolo_inputs(torch) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    return (torch.randn((1, 3, 64, 64), device="cuda"),), {}
+
+
+def _model_corpus_footer_lines() -> list[str]:
+    return [
+        "## M6/M6.5 Boundary",
+        "",
+        "- This report explains model blockers; it is not a fallback-free success claim.",
+        "- External model libraries use random initialization and small fixed shapes.",
+        "- Native Inductor capture is audited offline; M5/M5.5 hook tests own live replacement.",
+    ]
+
+
+def _safe_name(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

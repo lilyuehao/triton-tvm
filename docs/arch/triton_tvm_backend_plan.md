@@ -1075,6 +1075,8 @@ Status: implemented as the mandatory M6 entry gate.
 
 #### Pre-M6 Debt: Integration Contract Cleanup
 
+Status: implemented as the M6 entry integration-contract cleanup gate.
+
 Reality check after M5.5:
 
 - 与最初预估一致：Pre-M6 仍然应该是 integration contract cleanup，不新增
@@ -1128,6 +1130,24 @@ Reality check after M5.5:
   必须决定 M6 是否保留 eager write、改为 explicit flush，或只在 `report_dir`
   存在时写，以免模型 corpus 的 runtime hot path 被 report I/O 污染。
 
+实现结果：
+
+- `m5_inductor_hook` schema snapshot 已覆盖 `summary`、`graph_summary`、
+  `graphs`、`kernels[*].graph_id`、`kernels[*].graph_kernel_index`、
+  `cache_key`、`cache_hit`、`native_fallback_count` 和 `run_count`。
+- graph/kernels 双向一致性已有测试；Markdown report 展示 graph summary，并明确
+  JSON `graphs` / `kernels` 是 graph detail 的权威来源。
+- hook entry 在 patch `AsyncCompile.triton` 前检查 `torch.compile`、
+  TorchInductor `compile_fx`、Triton version metadata 和
+  `AsyncCompile.triton` signature；不匹配时以 `input_error` 进入
+  `collection_errors`，并保持未 patch 状态。
+- `TritonTVMMeta.cache_key` 的回归测试禁止 `graph_id`、compile region、
+  `run_count`、session transient identity 进入 artifact cache identity。
+- runtime counter policy 已固定：`run_count` 只表示 TVM-backed launcher 成功调用；
+  native fallback 的 `native_fallback_count` 是 compile-time fallback decision。
+- report flush policy 已固定为 `eager_when_report_dir_set`：compile/run 路径只在
+  `report_dir` 存在时写报告；也可显式 `write_report(out_dir=...)`。
+
 完成标准：
 
 - `m5_inductor_hook` report schema snapshot 进入测试，且 capability matrix 与
@@ -1140,6 +1160,9 @@ Reality check after M5.5:
 
 #### M6: Graph-Level Inductor Integration
 
+Status: implemented as model-level audit/report integration rather than a
+fallback-free model execution milestone.
+
 Entry gate:
 
 - M5.5 必须保持绿色。尤其是 graph-level report、hook reentrancy/thread
@@ -1150,27 +1173,41 @@ Entry gate:
 
 目标：
 
-- 从单 kernel hook 提升到 graph-level integration prototype。
-- 一个 `torch.compile` graph 内多个 supported Triton kernel 走 TVM artifact；
-  unsupported kernel 继续显式 native fallback。
-- 建立模型 corpus audit 入口，为后续 ViT/YOLO/Llama coverage 排序。
+- 将 M6 的成功标准固定为“稳定解释为什么模型还不能 full TVM /
+  fallback-free”，而不是要求模型完全跑通。
+- 建立外部库驱动的模型 corpus audit 入口，为后续 ViT/YOLO/Llama coverage
+  排序。
+- 保持 M5/M5.5 live hook 语义边界：模型 corpus 默认 capture native Inductor
+  产物并离线分类，不扩 TTIR op/model coverage。
 
 产物：
 
-- graph session object：inputs、outputs、kernel list、artifact list、fallback
-  list、runtime launch order。
-- `torch.compile` graph smoke tests：multi-pointwise、pointwise+reduction、
-  pointwise+unsupported。
-- corpus collector：对 ViT、YOLO、Llama2 小 shape 运行 Inductor，收集
-  wrapper source、TTIR、report、fallback buckets。
+- `python/tvm/contrib/triton_tvm/model_corpus.py`：
+  `TritonTVMModelAuditConfig`、`TritonTVMModelAuditCase`、
+  `builtin_model_audit_cases()`、`run_model_corpus_audit(...)`、
+  `diff_capability_reports(...)`。
+- balanced external stack 安装在 `tvm-0.24.0`：
+  `transformers>=4,<5`、`ultralytics>=8,<9`；不下载 pretrained weights。
+- builtin corpus：
+  `transformers.ViTModel(ViTConfig(...))`、
+  `transformers.LlamaModel(LlamaConfig(...))`、
+  `ultralytics.YOLO("yolov8n.yaml").model`。
+- report schema 扩展：`dependency_versions`、`model_summary`、`models`、
+  `blockers`，以及 kernel-level `model_family`、`model_case`、Inductor
+  shape metadata 和 `blocker_class`。
 
 完成标准：
 
-- multi-kernel graph correctness 通过。
-- graph report 能定位每个 model blocker 的 TTIR op、contract、dtype、shape。
-- native fallback 仍允许，但不能缺 report。
+- 每个模型 case 都进入 `models`，即使 compile failed 或 zero-kernel 也必须有
+  stable collection blocker。
+- kernel/blocker report 能定位每个 model blocker 的 TTIR op、contract、dtype、
+  Inductor grid/reduction/atomic metadata 和 shape hints。
+- native fallback 仍允许，但不能缺 report 或 `fallback_reason`。
 
 #### M6.5 Hardening: Model Corpus Audit
+
+Status: implemented as reproducibility/report-diff hardening for the M6 model
+corpus audit.
 
 目标：
 
@@ -1183,30 +1220,86 @@ Entry gate:
   Inductor corpus reports。
 - blocker ranking：按出现次数、模型影响、实现风险排序。
 - report diff 工具：比较两个 commit 的 translated/fallback bucket 变化。
+- CUDA corpus test 默认 opt-in：设置 `TRITON_TVM_RUN_MODEL_CORPUS=1` 后运行。
 
 完成标准：
 
 - 每个模型族至少有一个固定 shape audit fixture。
 - coverage regression 能在 CI 或 opt-in CUDA job 中复现。
+- report diff 忽略 timestamp、绝对路径和临时目录，只比较 bucket/blocker/model
+  状态变化。
 
 #### Pre-M7 Debt: TTIR Reader and Builder Cleanup
+
+Status: implemented as the M7 entry reader/builder/taxonomy debt gate.
+
+Reality check after M6.5:
+
+- 与最初预估一致：Pre-M7 仍然是 M7 coverage expansion 前的
+  reader/builder cleanup gate，不新增 Triton 语义、模型 coverage、调度优化或
+  live model replacement 行为。
+- 与最初预估不同：M6 已经给出 builder 决策。由于 M6/M6.5 只做 model
+  corpus audit/report，不扩 TTIR 语义、contract 或 rewrite pass，因此继续保留
+  TVMScript source builder；direct node construction 正式推迟到 Pre-M7 评估。
+- M6.5 已经提供 ViT/YOLO/Llama tiny corpus 的 blocker ranking。Pre-M7 的
+  reader snapshot、unsupported reason 和 M7 coverage 顺序必须由这些真实
+  blocker 反推，而不是只按手写 kernel 分类补齐。
+- 当前 report 分层已经包含 top-level bucket、`fallback_reason` 和
+  `blocker_class`。Pre-M7 细分错误语义时必须明确是在 bucket 层新增，还是保留
+  bucket 并细分 `fallback_reason` / `blocker_class`，避免破坏 M6.5 report diff
+  的稳定性。
 
 目标：
 
 - 解决继续扩 pointwise/broadcast/indexing 前的 reader/builder 债务。
-- 评估 direct node builder；若继续使用 TVMScript source builder，必须写出保留理由。
+- 基于 M6.5 model corpus blocker ranking，先固定
+  pointwise/broadcast/view/indexing 的 reader/report 边界，再扩 M7 coverage。
+- 重新评估 direct node builder；若继续使用 TVMScript source builder，必须写出
+  保留理由和风险控制规则。
 
 产物：
 
-- `NormalizedTTIROpGraph` snapshot 分类：pointwise、broadcast、view/index、
-  reduction、matmul、attention。
-- TVMScript source builder 风险登记和 direct builder 评估结论。
-- unsupported indexing/broadcast bucket 细分，避免都落到 generic
-  `unsupported_ttir_op`。
+- M6.5 corpus blocker-driven `NormalizedTTIROpGraph` snapshot 分类：
+  pointwise、broadcast、view/index、reduction、matmul/dot、atomic/grid、
+  attention-adjacent fused kernels。
+- TVMScript source builder 风险登记和 direct builder spike 评估结论；若保留
+  source builder，必须明确单一 builder 入口、TVMScript golden 覆盖、字符串生成
+  禁止外溢到 translator/reader、以及 parse/build failure 的稳定 report 语义。
+- Unsupported reason taxonomy：明确哪些 case 需要新增 top-level bucket，哪些只
+  细分 `fallback_reason` / `blocker_class`；至少覆盖 unsupported
+  indexing/broadcast/view、non-Grid1D、atomic、reduction、matmul/dot 和
+  collection failure，避免全部落到 generic `unsupported_ttir_op` 或
+  `unsupported_inductor_kernel`。
+- M7 entry blocker list：从 M6.5 ranked blockers 中筛出属于
+  pointwise/broadcast/view/indexing 的高频项，形成 M7 实现顺序和负例测试清单。
 
 完成标准：
 
-- 新增 pointwise/indexing coverage 前，reader snapshot 与 error bucket 都先稳定。
+- 新增 pointwise/broadcast/view/indexing coverage 前，reader snapshot、builder
+  评估结论和 error taxonomy 都先稳定。
+- M6.5 report diff 在忽略 timestamp/path churn 后仍稳定；Pre-M7 的 bucket /
+  `fallback_reason` / `blocker_class` 调整必须有迁移说明或 snapshot 覆盖。
+
+实现结果：
+
+- M6/M6.5 model corpus report 增加 additive `pre_m7` section：记录
+  `taxonomy_version = 1`、
+  `builder_decision = "keep_tvmscript_source_builder_for_m7_entry"`、
+  unsupported taxonomy、reader snapshot classes 和 M7 entry blockers。
+- Direct node builder spike 结论固定为 M7 entry 前不替换 builder。原因是当前
+  pointwise/reduction TVMScript template builder 已有 contract/golden 覆盖，M7
+  前直接改成 node construction 会复制现有模板复杂度，却不会先降低 M7 blocker
+  风险。
+- Source builder 风险控制规则固定：translator 只在一个受控边界调用
+  `tvm.script.from_source`；`translator.py` 不实例化 `TTIRReader`，只消费
+  `normalize_ttir_input(...)` 之后的 `NormalizedTTIROpGraph`。
+- Pre-M7 reader snapshot tests 覆盖 pointwise、broadcast/view/index、
+  reduction、matmul/dot、atomic/grid、attention-adjacent fused kernel 类别；这些
+  snapshot 只验证 reader/report 边界，不声称新增 translation support。
+- Unsupported taxonomy 不新增 top-level bucket；atomic、reduction、matmul/dot、
+  grid 继续通过 `blocker_class` 细分，collection failure 保持
+  `collection_error`，M7 entry blocker list 只筛选 pointwise/broadcast/view/index
+  候选。
 
 #### M7: Pointwise, Broadcast, View, and Indexing Completion
 

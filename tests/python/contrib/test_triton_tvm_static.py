@@ -235,6 +235,63 @@ module {
 """
 
 
+_STATIC_PRE_M7_DOT_TTIR = """
+module {
+  tt.func @_pre_m7_dot(%a:!tt.ptr<f32>,%b:!tt.ptr<f32>,%out:!tt.ptr<f32>) {
+    %pid = tt.get_program_id x : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+    %a_splat = tt.splat %a : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %b_splat = tt.splat %b : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %a_ptr = tt.addptr %a_splat, %range : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    %b_ptr = tt.addptr %b_splat, %range : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    %va = tt.load %a_ptr : tensor<64x!tt.ptr<f32>>
+    %vb = tt.load %b_ptr : tensor<64x!tt.ptr<f32>>
+    %dot = tt.dot %va, %vb : tensor<64xf32>, tensor<64xf32>
+    %out_ptr = tt.addptr %out, %pid : !tt.ptr<f32>, i32
+    tt.store %out_ptr, %dot : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
+_STATIC_PRE_M7_ATOMIC_GRID_TTIR = """
+module {
+  tt.func @_pre_m7_atomic_grid(%x:!tt.ptr<f32>,%out:!tt.ptr<f32>) {
+    %zero = arith.constant dense<0.000000e+00> : tensor<64xf32>
+    %pid_y = tt.get_program_id y : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+    %mask = arith.cmpf ogt, %zero, %zero : tensor<64xf32>
+    %x_splat = tt.splat %x : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %x_ptr = tt.addptr %x_splat, %range : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    %vx = tt.load %x_ptr, %mask, %zero : tensor<64x!tt.ptr<f32>>
+    %out_splat = tt.splat %out : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %out_ptr = tt.addptr %out_splat, %range : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    tt.atomic_add %out_ptr, %vx, %mask : tensor<64x!tt.ptr<f32>>, tensor<64xf32>
+    tt.return
+  }
+}
+"""
+
+
+_STATIC_PRE_M7_ATTENTION_ADJACENT_TTIR = """
+module {
+  tt.func @_pre_m7_attention_adjacent(%x:!tt.ptr<f32>,%out:!tt.ptr<f32>) {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+    %x_splat = tt.splat %x : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %x_ptr = tt.addptr %x_splat, %range : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    %vx = tt.load %x_ptr : tensor<64x!tt.ptr<f32>>
+    %trans = tt.trans %vx : tensor<64xf32>
+    %soft = tt.softmax %trans : tensor<64xf32>
+    %out_splat = tt.splat %out : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %out_ptr = tt.addptr %out_splat, %range : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    tt.store %out_ptr, %soft : tensor<64x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
+
 def test_static_m25_reader_op_graph_snapshot():
     graph = TTIRReader().read(_STATIC_DUAL_STORE_TTIR)
 
@@ -350,6 +407,19 @@ def test_static_pre_m5_ttir_parse_boundary():
     assert "normalize_ttir_input" in translator_source
 
 
+def test_static_pre_m7_builder_boundary_keeps_single_tvmscript_source_builder():
+    from pathlib import Path  # pylint: disable=import-outside-toplevel
+
+    repo_root = Path(__file__).resolve().parents[3]
+    translator_source = (
+        repo_root / "python" / "tvm" / "contrib" / "triton_tvm" / "translator.py"
+    ).read_text(encoding="utf-8")
+    assert translator_source.count("tvm.script.from_source(") == 1
+    assert "source = builder.build_source()" in translator_source
+    assert "normalize_ttir_input(ttir_or_graph)" in translator_source
+    assert "TTIRReader" not in translator_source
+
+
 def test_static_m4_reader_reduce_region_snapshot():
     graph = TTIRReader().read(_STATIC_REDUCTION_ROWSUM_TTIR)
     ops = [op.name for op in graph.ops]
@@ -364,6 +434,28 @@ def test_static_m4_reader_reduce_region_snapshot():
     assert [[op.name for op in region] for region in reduce_op.regions] == [
         ["arith.addf", "tt.reduce.return"]
     ]
+
+
+def test_static_pre_m7_reader_snapshot_classes_without_translation():
+    snapshots = {
+        "pointwise": TTIRReader().read(_STATIC_DUAL_STORE_TTIR),
+        "broadcast_view_index": TTIRReader().read(_STATIC_M35_INDEXED_TTIR),
+        "reduction": TTIRReader().read(_STATIC_REDUCTION_ROWSUM_TTIR),
+        "matmul_dot": TTIRReader().read(_STATIC_PRE_M7_DOT_TTIR),
+        "atomic_grid": TTIRReader().read(_STATIC_PRE_M7_ATOMIC_GRID_TTIR),
+        "attention_adjacent": TTIRReader().read(_STATIC_PRE_M7_ATTENTION_ADJACENT_TTIR),
+    }
+
+    assert "tt.store" in [op.name for op in snapshots["pointwise"].ops]
+    assert "arith.remsi" in [op.name for op in snapshots["broadcast_view_index"].ops]
+    assert "tt.reduce" in [op.name for op in snapshots["reduction"].ops]
+    assert "tt.dot" in [op.name for op in snapshots["matmul_dot"].ops]
+    atomic_grid_ops = snapshots["atomic_grid"].op_by_result()
+    assert atomic_grid_ops["pid_y"].attrs["axis"] == "y"
+    assert "tt.atomic_add" in [op.name for op in snapshots["atomic_grid"].ops]
+    assert {"tt.trans", "tt.softmax"} <= {
+        op.name for op in snapshots["attention_adjacent"].ops
+    }
 
 
 def test_static_m4_reduction_minimal_contract_without_cuda_runtime():
@@ -686,6 +778,40 @@ def test_static_pre_m5_target_spelling_and_cache_key_canonicalization():
     assert from_string_mod.script() == from_object_mod.script()
     assert "cuda_" not in from_string_meta.canonical_contract
     assert "cuda_" not in from_string_meta.requested_contract
+
+
+def test_static_pre_m6_cache_key_policy_excludes_graph_and_runtime_identity(monkeypatch):
+    import tvm.contrib.triton_tvm.translator as translator_mod  # pylint: disable=import-outside-toplevel
+
+    captured = {}
+    original_cache_key = translator_mod._cache_key  # pylint: disable=protected-access
+
+    def capture_cache_key(**kwargs):
+        captured.update(kwargs)
+        return original_cache_key(**kwargs)
+
+    monkeypatch.setattr(
+        translator_mod,
+        "_cache_key",
+        capture_cache_key,
+    )
+    translate_ttir(_STATIC_DUAL_STORE_TTIR, grid=(1,), contract="pointwise_flat")
+
+    assert {
+        "compile_region_name",
+        "graph_id",
+        "graph_kernel_index",
+        "run_count",
+        "session_id",
+    }.isdisjoint(captured)
+    assert {
+        "abi",
+        "canonical_contract",
+        "cache_policy",
+        "source_hash",
+        "target",
+        "ttir_hash",
+    } <= set(captured)
 
 
 def test_static_m4_reduction_minimal_negative_boundaries():

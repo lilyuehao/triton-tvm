@@ -1063,6 +1063,7 @@ conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm
 conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_inductor_subset.py
 conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm.py
 conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_perf.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_perf.py
 ```
 
 Results:
@@ -1269,6 +1270,270 @@ Results:
 py_compile: passed
 inductor_hook torch_compile subset: 3 passed
 reporting/static/inductor_subset/inductor_hook: 49 passed
+test_triton_tvm.py: 24 passed
+test_triton_tvm_perf.py: 1 skipped
+```
+
+## 2026-05-23: Pre-M6 Integration Contract Cleanup
+
+### Scope
+
+Pre-M6 is the integration-contract cleanup gate before M6.  It does not add
+TTIR op semantics, model coverage, or scheduling changes.  The goal is to
+freeze the M5/M5.5 Inductor hook API boundary, report schema, private API guard,
+cache identity, runtime counter semantics, and report flushing policy.
+
+### Implementation Changes
+
+- Extended `TritonTVMInductorSession.report()` with Pre-M6 contract fields:
+  `private_api_guard`, `runtime_counter_policy`, and `report_flush_policy`.
+- Added `collection_errors` support to M5 hook session reports so hook-entry
+  private API failures can be bucketed without pretending a kernel was observed.
+- Added hook-entry checks before patching `AsyncCompile.triton`: `torch.compile`
+  must exist, TorchInductor `compile_fx` must be callable, torch/triton versions
+  must be discoverable, and `AsyncCompile.triton` must accept the expected
+  callable shape.
+- Private API guard failures now fail fast with an `input_error`
+  `collection_errors` entry and leave `AsyncCompile.triton` unpatched.
+- Extended graph summary aggregation with cache hits, cache misses, and TVM
+  `run_count`.
+- Markdown reports now include a graph summary section and state that JSON
+  `graphs` / `kernels` remain authoritative for per-graph reverse lookup.
+- Runtime counter policy is explicit: TVM-backed kernels increment `run_count`;
+  native fallback records use `native_fallback_count` as a compile-time fallback
+  decision count.
+- Report flush policy is explicit: compile/run paths write eagerly only when
+  `report_dir` is configured; callers can still explicitly call
+  `write_report(out_dir=...)`.
+
+### Tests Added
+
+- Added a Pre-M6 session report schema snapshot covering `summary`,
+  `graph_summary`, `graphs`, kernel graph ownership fields, `cache_key`,
+  `cache_hit`, `native_fallback_count`, and `run_count`.
+- Added graph/kernels consistency checks for `kernel_record_indices`,
+  `graph_id`, and `graph_kernel_index`.
+- Added Markdown/JSON consistency coverage for graph summary rendering.
+- Added a private API guard regression that verifies signature drift fails
+  before patching and records an `input_error` guard bucket.
+- Added cache-key policy coverage proving graph/run/session transient fields do
+  not enter `TritonTVMMeta.cache_key`.
+
+### Documentation
+
+- Marked Pre-M6 as implemented in the backend plan.
+- Updated the capability matrix with Pre-M6 schema fields, guard policy,
+  graph/kernel consistency rules, runtime counter policy, and report flush
+  policy.
+
+### Validation
+
+Commands:
+
+```bash
+conda run -n tvm-0.24.0 python -m py_compile python/tvm/contrib/triton_tvm/inductor.py python/tvm/contrib/triton_tvm/reporting.py tests/python/contrib/test_triton_tvm_inductor_hook.py tests/python/contrib/test_triton_tvm_static.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_inductor_hook.py -k 'pre_m6 or m55_graph_report_tracks_fallback'
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_static.py -k 'pre_m6_cache_key_policy'
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_inductor_hook.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_reporting.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_static.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_inductor_subset.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm.py
+```
+
+Results:
+
+```text
+py_compile: passed
+pre_m6/m55 focused hook tests: 3 passed
+pre_m6 cache-key focused static test: 1 passed
+test_triton_tvm_inductor_hook.py: 11 passed
+test_triton_tvm_reporting.py: 3 passed
+test_triton_tvm_static.py: 22 passed
+test_triton_tvm_inductor_subset.py: 16 passed
+test_triton_tvm.py: 24 passed
+test_triton_tvm_perf.py: 1 skipped
+```
+
+## 2026-05-23: M6/M6.5 External Model Corpus Audit
+
+### Scope
+
+M6/M6.5 redefines model-level success for this checkpoint as stable,
+reproducible diagnosis instead of fallback-free execution.  The model corpus
+audit captures native TorchInductor output for external-library tiny models,
+classifies which kernels are TVM-replaceable under the current M5/M6 surface,
+and ranks why the full model is not yet full TVM / fallback-free.
+
+This checkpoint does not add TTIR op semantics, contract semantics, scheduling
+changes, or live model-level TVM replacement.
+
+### Dependency Setup
+
+Installed the balanced external stack into the `tvm-0.24.0` conda environment:
+
+```bash
+conda run -n tvm-0.24.0 python -m pip install --upgrade-strategy only-if-needed "transformers>=4,<5" "ultralytics>=8,<9"
+```
+
+Observed installed versions:
+
+```text
+transformers: 4.57.6
+ultralytics: 8.4.53
+torchvision: 0.27.0+cu130
+```
+
+The builtin corpus uses random initialization and fixed small shapes; it does
+not download pretrained weights.
+
+### Implementation Changes
+
+- Added `python/tvm/contrib/triton_tvm/model_corpus.py` as the experimental
+  M6/M6.5 model audit module.  It is not exported from top-level
+  `tvm.contrib.triton_tvm.__all__`.
+- Added `TritonTVMModelAuditConfig`, `TritonTVMModelAuditCase`,
+  `builtin_model_audit_cases()`, `run_model_corpus_audit(...)`,
+  `build_model_corpus_report(...)`, `write_model_corpus_report(...)`, and
+  `diff_capability_reports(...)`.
+- Builtin model fixtures cover:
+  - `transformers.ViTModel(ViTConfig(...))`;
+  - `transformers.LlamaModel(LlamaConfig(...))`;
+  - `ultralytics.YOLO("yolov8n.yaml").model`.
+- The audit path disables Inductor FX graph cache, fixes the torch seed, runs
+  models in eval/no-grad mode, captures `GraphLowering.save_output_code`,
+  extracts `AsyncCompile.triton(...)` sources, saves wrapper/kernel/TTIR
+  artifacts, and writes `report.json` / `report.md`.
+- Model reports now add `dependency_versions`, `model_summary`, `models`, and
+  ranked `blockers` while preserving the shared
+  `triton_tvm_capability_report` schema.
+- Kernel records from the model corpus carry `model_family`, `model_case`,
+  `grid_type`, `num_reduction`, `atomic_add_found`, `size_hints`, and
+  `blocker_class`.
+- Non-Grid1D/non-pointwise/atomic/reduction kernels are explicit model blockers
+  under `unsupported_inductor_kernel`; any candidate offline translate status
+  is preserved separately without claiming M6 live replaceability.
+- Added report diff support that ignores timestamps and path churn and compares
+  translated/fallback buckets, model statuses, and blocker deltas.
+
+### Tests Added
+
+- Added `tests/python/contrib/test_triton_tvm_model_corpus.py`.
+- Unit coverage checks:
+  - experimental API stays out of top-level `__all__`;
+  - model summary, per-model records, dependency versions, and blockers render
+    into JSON/Markdown reports;
+  - unsupported kernels always carry non-empty `fallback_reason`;
+  - zero-kernel model cases become stable collection blockers;
+  - report diff ignores `generated_at` and path changes but catches bucket and
+    blocker regressions.
+- Added an opt-in CUDA corpus test gated by `TRITON_TVM_RUN_MODEL_CORPUS=1`.
+  It runs the builtin ViT/Llama/YOLO corpus and requires every model family to
+  appear in the report; it does not require fallback-free execution.
+
+### Documentation
+
+- Updated the backend plan to mark M6/M6.5 implemented as model-level
+  audit/report integration rather than fallback-free model execution.
+- Updated the capability matrix with M6/M6.5 report fields, model/blocker
+  records, dependency policy, blocker ranking, CLI entry point, and the M6
+  decision to keep the TVMScript source builder until Pre-M7.
+
+### Validation
+
+Commands:
+
+```bash
+conda run -n tvm-0.24.0 python -m py_compile python/tvm/contrib/triton_tvm/model_corpus.py python/tvm/contrib/triton_tvm/reporting.py tests/python/contrib/test_triton_tvm_model_corpus.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_model_corpus.py
+TRITON_TVM_RUN_MODEL_CORPUS=1 conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_model_corpus.py -k cuda_builtin_model_corpus
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_reporting.py tests/python/contrib/test_triton_tvm_static.py tests/python/contrib/test_triton_tvm_model_corpus.py tests/python/contrib/test_triton_tvm_inductor_subset.py tests/python/contrib/test_triton_tvm_inductor_hook.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_perf.py
+```
+
+Results:
+
+```text
+py_compile: passed
+test_triton_tvm_model_corpus.py: 4 passed, 1 skipped
+model corpus CUDA opt-in: 1 passed, 4 deselected
+reporting/static/model_corpus/inductor_subset/inductor_hook: 56 passed, 1 skipped
+test_triton_tvm.py: 24 passed
+test_triton_tvm_perf.py: 1 skipped
+```
+
+## 2026-05-23: Pre-M7 Reader/Builder Debt Gate
+
+### Scope
+
+Pre-M7 closes the M7 entry debt gate.  It does not add TTIR op semantics, model
+coverage, scheduling changes, or live model replacement behavior.  The goal is
+to stabilize reader snapshots, builder policy, unsupported taxonomy, and M7
+entry blocker ordering before expanding pointwise/broadcast/view/indexing
+coverage.
+
+### Implementation Changes
+
+- Added an additive `pre_m7` section to M6/M6.5 model corpus reports.
+- The section records `taxonomy_version = 1`,
+  `builder_decision = "keep_tvmscript_source_builder_for_m7_entry"`,
+  unsupported taxonomy policy, reader snapshot classes, and M7 entry blockers.
+- Direct node builder was evaluated for the Pre-M7 gate but not adopted before
+  M7.  The current pointwise/reduction TVMScript source builders already have
+  contract and golden coverage; replacing them now would duplicate template
+  complexity without first reducing M7 blocker risk.
+- The source builder boundary is now guarded as policy: `translator.py` keeps a
+  single `tvm.script.from_source` call after `builder.build_source()`, does not
+  instantiate `TTIRReader`, and consumes only `normalize_ttir_input(...)`.
+- Pre-M7 taxonomy preserves existing top-level buckets.  Unsupported detail is
+  classified through `fallback_reason` and `blocker_class`; collection failures
+  remain `collection_error`.
+- `m7_entry_blockers` filters ranked model blockers to
+  pointwise/broadcast/view/index candidates while excluding collection,
+  reduction, matmul/dot, atomic, grid, and attention-adjacent blockers.
+- Markdown capability reports now render a compact Pre-M7 Gate section when
+  `pre_m7` metadata is present.
+
+### Tests Added
+
+- Added model corpus snapshot coverage for the `pre_m7` report section,
+  unsupported taxonomy policy, reader snapshot class aggregation, and M7 entry
+  blocker filtering.
+- Added static TTIR reader snapshots for pointwise, broadcast/view/index,
+  reduction, matmul/dot, atomic/grid, and attention-adjacent classes.  These
+  snapshots intentionally parse with `TTIRReader` only and do not claim
+  translation support.
+- Added a Pre-M7 builder-boundary static test that verifies the translator keeps
+  a single TVMScript source-builder boundary and still does not consume
+  `TTIRReader` directly.
+
+### Documentation
+
+- Marked Pre-M7 as implemented in the backend plan.
+- Updated the capability matrix with the Pre-M7 report field, builder decision,
+  taxonomy policy, reader snapshot classes, and M7 entry blocker filtering.
+
+### Validation
+
+Commands:
+
+```bash
+conda run -n tvm-0.24.0 python -m py_compile python/tvm/contrib/triton_tvm/model_corpus.py python/tvm/contrib/triton_tvm/reporting.py python/tvm/contrib/triton_tvm/translator.py tests/python/contrib/test_triton_tvm_static.py tests/python/contrib/test_triton_tvm_model_corpus.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_static.py -k 'pre_m7 or reader'
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_model_corpus.py -k 'pre_m7 or m65_report_diff'
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_reporting.py tests/python/contrib/test_triton_tvm_static.py tests/python/contrib/test_triton_tvm_model_corpus.py tests/python/contrib/test_triton_tvm_inductor_subset.py tests/python/contrib/test_triton_tvm_inductor_hook.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm.py
+conda run -n tvm-0.24.0 python -m pytest -q tests/python/contrib/test_triton_tvm_perf.py
+```
+
+Results:
+
+```text
+py_compile: passed
+static pre_m7/reader focused tests: 4 passed, 20 deselected
+model corpus pre_m7/diff focused tests: 2 passed, 4 deselected
+reporting/static/model_corpus/inductor_subset/inductor_hook: 59 passed, 1 skipped
 test_triton_tvm.py: 24 passed
 test_triton_tvm_perf.py: 1 skipped
 ```

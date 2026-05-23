@@ -160,11 +160,179 @@ def render_capability_markdown(
         f"- Status buckets: {_format_histogram(summary['status_buckets'])}",
         f"- Contracts: {_format_histogram(summary['contracts'])}",
         "",
-        "## TTIR Op Coverage",
-        "",
-        "| Op | Count |",
-        "|---|---:|",
     ]
+    if "graph_summary" in report:
+        graph_summary = report.get("graph_summary") or {}
+        lines.extend(
+            [
+                "## Graph Summary",
+                "",
+                f"- Total graphs: {graph_summary.get('total_graphs', 0)}",
+                f"- Completed graphs: {graph_summary.get('completed_graphs', 0)}",
+                f"- Failed graphs: {graph_summary.get('failed_graphs', 0)}",
+                f"- Total kernels: {graph_summary.get('total_kernels', 0)}",
+                f"- Translated kernels: {graph_summary.get('translated_kernels', 0)}",
+                f"- Native fallback kernels: {graph_summary.get('native_fallback_kernels', 0)}",
+                f"- Cache hits: {graph_summary.get('cache_hits', 0)}",
+                f"- Cache misses: {graph_summary.get('cache_misses', 0)}",
+                f"- TVM run count: {graph_summary.get('run_count', 0)}",
+                "",
+                "Markdown graph details are a summary; JSON `graphs` and `kernels` "
+                "are authoritative for `kernel_record_indices` and reverse lookup.",
+            ]
+        )
+        graphs = report.get("graphs") or []
+        if graphs:
+            lines.extend(
+                [
+                    "",
+                    "| Graph | Status | Kernels | TVM | Native | Cache hit/miss | TVM runs |",
+                    "|---|---|---:|---:|---:|---:|---:|",
+                ]
+            )
+            for graph in graphs:
+                lines.append(
+                    "| {graph_id} | {status} | {total} | {translated} | {native} | "
+                    "{cache_hits}/{cache_misses} | {runs} |".format(
+                        graph_id=_escape_markdown_cell(str(graph.get("graph_id", ""))),
+                        status=_escape_markdown_cell(str(graph.get("status", ""))),
+                        total=graph.get("total_kernels", 0),
+                        translated=graph.get("translated_kernels", 0),
+                        native=graph.get("native_fallback_kernels", 0),
+                        cache_hits=graph.get("cache_hits", 0),
+                        cache_misses=graph.get("cache_misses", 0),
+                        runs=graph.get("run_count", 0),
+                    )
+                )
+        lines.append("")
+    if "model_summary" in report:
+        model_summary = report.get("model_summary") or {}
+        lines.extend(
+            [
+                "## Model Summary",
+                "",
+                f"- Total models: {model_summary.get('total_models', 0)}",
+                f"- Completed models: {model_summary.get('completed_models', 0)}",
+                f"- Failed models: {model_summary.get('failed_models', 0)}",
+                f"- Full TVM runnable models: {model_summary.get('full_tvm_runnable_models', 0)}",
+                f"- Fallback kernels: {model_summary.get('fallback_kernels', 0)}",
+                f"- Model status: {_format_histogram(model_summary.get('model_status', {}))}",
+                f"- Blocker classes: {_format_histogram(model_summary.get('blocker_classes', {}))}",
+                "",
+            ]
+        )
+        models = report.get("models") or []
+        if models:
+            lines.extend(
+                [
+                    "| Family | Model | Status | Kernels | TVM | Fallback | Full TVM |",
+                    "|---|---|---|---:|---:|---:|---|",
+                ]
+            )
+            for model in models:
+                lines.append(
+                    "| {family} | {case} | {status} | {kernels} | {translated} | "
+                    "{fallback} | {full_tvm} |".format(
+                        family=_escape_markdown_cell(str(model.get("model_family", ""))),
+                        case=_escape_markdown_cell(str(model.get("model_case", ""))),
+                        status=_escape_markdown_cell(str(model.get("status", ""))),
+                        kernels=model.get("kernel_count", 0),
+                        translated=model.get("translated_kernels", 0),
+                        fallback=model.get("native_fallback_kernels", 0),
+                        full_tvm="yes" if model.get("full_tvm_runnable") else "no",
+                    )
+                )
+            lines.append("")
+        blockers = report.get("blockers") or []
+        if blockers:
+            lines.extend(
+                [
+                    "## Blockers",
+                    "",
+                    "| Bucket | Reason | Class | Models | Kernels | Model Errors | Example |",
+                    "|---|---|---|---:|---:|---:|---|",
+                ]
+            )
+            for blocker in blockers:
+                lines.append(
+                    "| {bucket} | {reason} | {cls} | {models} | {kernels} | "
+                    "{model_errors} | {example} |".format(
+                        bucket=_escape_markdown_cell(str(blocker.get("bucket", ""))),
+                        reason=_escape_markdown_cell(str(blocker.get("fallback_reason", ""))),
+                        cls=_escape_markdown_cell(str(blocker.get("blocker_class", ""))),
+                        models=blocker.get("models_impacted", 0),
+                        kernels=blocker.get("kernel_count", 0),
+                        model_errors=blocker.get("model_error_count", 0),
+                        example=_escape_markdown_cell(
+                            str(
+                                blocker.get("example_kernel", "")
+                                or blocker.get("example_message", "")
+                            )[:160]
+                        ),
+                    )
+                )
+            lines.append("")
+        dependency_versions = report.get("dependency_versions") or {}
+        if dependency_versions:
+            lines.extend(["## Dependency Versions", ""])
+            for name, value in sorted(dependency_versions.items()):
+                if isinstance(value, dict):
+                    version = value.get("version", "")
+                    available = value.get("available", "")
+                    error = value.get("error", "")
+                    text = f"available={available}"
+                    if version:
+                        text += f", version={version}"
+                    if error:
+                        text += f", error={error}"
+                else:
+                    text = str(value)
+                lines.append(f"- `{name}`: {_escape_markdown_cell(text)}")
+            lines.append("")
+    if "pre_m7" in report:
+        pre_m7 = report.get("pre_m7") or {}
+        lines.extend(
+            [
+                "## Pre-M7 Gate",
+                "",
+                f"- Taxonomy version: {pre_m7.get('taxonomy_version', '')}",
+                f"- Builder decision: `{pre_m7.get('builder_decision', '')}`",
+                "",
+            ]
+        )
+        entry_blockers = pre_m7.get("m7_entry_blockers") or []
+        if entry_blockers:
+            lines.extend(
+                [
+                    "| Bucket | Reason | Class | Models | Kernels | Example |",
+                    "|---|---|---|---:|---:|---|",
+                ]
+            )
+            for blocker in entry_blockers:
+                lines.append(
+                    "| {bucket} | {reason} | {cls} | {models} | {kernels} | {example} |".format(
+                        bucket=_escape_markdown_cell(str(blocker.get("bucket", ""))),
+                        reason=_escape_markdown_cell(str(blocker.get("fallback_reason", ""))),
+                        cls=_escape_markdown_cell(str(blocker.get("blocker_class", ""))),
+                        models=blocker.get("models_impacted", 0),
+                        kernels=blocker.get("kernel_count", 0),
+                        example=_escape_markdown_cell(
+                            str(
+                                blocker.get("example_kernel", "")
+                                or blocker.get("example_message", "")
+                            )[:160]
+                        ),
+                    )
+                )
+            lines.append("")
+    lines.extend(
+        [
+            "## TTIR Op Coverage",
+            "",
+            "| Op | Count |",
+            "|---|---:|",
+        ]
+    )
     lines.extend(f"| `{op}` | {count} |" for op, count in report["op_histogram"].items())
     lines.extend(
         [

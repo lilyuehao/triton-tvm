@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import inspect
 import importlib.util
 import json
 import tempfile
@@ -115,6 +116,8 @@ class TritonTVMInductorSession:
     artifacts: dict[str, TritonTVMArtifact] = field(default_factory=dict)
     records: list[dict[str, Any]] = field(default_factory=list)
     graphs: list[dict[str, Any]] = field(default_factory=list)
+    collection_errors: list[dict[str, Any]] = field(default_factory=list)
+    private_api_guard: dict[str, Any] = field(default_factory=dict)
     counters: Counter = field(default_factory=Counter)
     _active_graphs: list[dict[str, Any]] = field(
         default_factory=list, init=False, repr=False
@@ -204,11 +207,15 @@ class TritonTVMInductorSession:
             self.records,
             purpose="m5 inductor integration prototype",
             corpus="m5_inductor_hook",
+            errors=self.collection_errors,
         )
         report["artifact_cache_size"] = len(self.artifacts)
         report["counters"] = dict(sorted(self.counters.items()))
         report["graph_summary"] = self._graph_summary()
         report["graphs"] = [_jsonable(dict(graph)) for graph in self.graphs]
+        report["private_api_guard"] = _jsonable(dict(self.private_api_guard))
+        report["runtime_counter_policy"] = _m5_runtime_counter_policy()
+        report["report_flush_policy"] = "eager_when_report_dir_set"
         return report
 
     def write_report(self, out_dir: str | Path | None = None) -> None:
@@ -398,6 +405,25 @@ class TritonTVMInductorSession:
             None,
         )
 
+    def _record_private_api_guard(self, guard: dict[str, Any]) -> None:
+        self.private_api_guard.update(_jsonable(dict(guard)))
+        self.private_api_guard["ok"] = True
+        self.counters["private_api_guard_checks"] += 1
+
+    def _record_private_api_guard_error(self, err: Exception) -> None:
+        status = status_from_exception(err)
+        entry = {
+            "stage": "private_api_guard",
+            "bucket": status["bucket"],
+            "fallback_reason": status["fallback_reason"],
+            "error_type": status.get("error_type", type(err).__name__),
+            "message": status.get("message", str(err)),
+        }
+        self.collection_errors.append(entry)
+        self.private_api_guard = {"ok": False, **entry}
+        self.counters["private_api_guard_failures"] += 1
+        self.write_report()
+
     def _graph_summary(self) -> dict[str, Any]:
         return {
             "total_graphs": len(self.graphs),
@@ -416,6 +442,9 @@ class TritonTVMInductorSession:
             "native_fallback_kernels": sum(
                 int(graph.get("native_fallback_kernels", 0)) for graph in self.graphs
             ),
+            "cache_hits": sum(int(graph.get("cache_hits", 0)) for graph in self.graphs),
+            "cache_misses": sum(int(graph.get("cache_misses", 0)) for graph in self.graphs),
+            "run_count": sum(int(graph.get("run_count", 0)) for graph in self.graphs),
         }
 
 
@@ -673,17 +702,38 @@ def make_triton_tvm_inductor_backend(
         session = TritonTVMInductorSession(config or TritonTVMInductorConfig())
 
     def triton_tvm_inductor_backend(model_, example_inputs_, **kwargs):
-        from torch._inductor.async_compile import (  # pylint: disable=import-outside-toplevel
-            AsyncCompile,
-        )
-        from torch._inductor.compile_fx import compile_fx  # pylint: disable=import-outside-toplevel
+        try:
+            import torch  # pylint: disable=import-outside-toplevel
+            import triton  # pylint: disable=import-outside-toplevel
+            from torch._inductor.async_compile import (  # pylint: disable=import-outside-toplevel
+                AsyncCompile,
+            )
+            import torch._inductor.compile_fx as compile_fx_mod  # pylint: disable=import-outside-toplevel
 
-        original_triton = _install_async_compile_triton_hook(AsyncCompile, session)
+            session._record_private_api_guard(  # pylint: disable=protected-access
+                _validate_torch_inductor_private_api(
+                    torch_module=torch,
+                    compile_fx=compile_fx_mod.compile_fx,
+                    triton_module=triton,
+                )
+            )
+            original_triton = _install_async_compile_triton_hook(AsyncCompile, session)
+        except ImportError as err:
+            guard_err = ValueError(
+                "triton_tvm_inductor_private_api_guard: PyTorch, TorchInductor, "
+                f"and Triton must be importable before installing the hook: {err}"
+            )
+            _record_private_api_guard_error_once(session, guard_err)
+            raise guard_err from err
+        except Exception as err:
+            _record_private_api_guard_error_once(session, err)
+            raise
+
         graph = session.begin_graph(
             compile_region_name=str(kwargs.get("compile_region_name", ""))
         )
         try:
-            result = compile_fx(model_, example_inputs_, **kwargs)
+            result = compile_fx_mod.compile_fx(model_, example_inputs_, **kwargs)
         except Exception as err:
             session.end_graph(graph, ok=False, err=err)
             raise
@@ -700,6 +750,14 @@ def make_triton_tvm_inductor_backend(
 
 def _install_async_compile_triton_hook(async_compile_cls, session: TritonTVMInductorSession):
     global _ACTIVE_HOOK  # pylint: disable=global-statement
+
+    try:
+        session._record_private_api_guard(  # pylint: disable=protected-access
+            _validate_async_compile_triton_api(async_compile_cls)
+        )
+    except Exception as err:
+        _record_private_api_guard_error_once(session, err)
+        raise
 
     _HOOK_LOCK.acquire()
     original_triton = async_compile_cls.triton
@@ -733,6 +791,76 @@ def _restore_async_compile_triton_hook(async_compile_cls, original_triton) -> No
         _ACTIVE_HOOK = None
     finally:
         _HOOK_LOCK.release()
+
+
+def _validate_torch_inductor_private_api(
+    *,
+    torch_module,
+    compile_fx,
+    triton_module,
+) -> dict[str, Any]:
+    torch_compile = getattr(torch_module, "compile", None)
+    if not callable(torch_compile):
+        raise ValueError(
+            "triton_tvm_inductor_private_api_guard: torch.compile must be callable"
+        )
+    if not callable(compile_fx):
+        raise ValueError(
+            "triton_tvm_inductor_private_api_guard: torch._inductor.compile_fx.compile_fx "
+            "must be callable"
+        )
+
+    torch_version = str(getattr(torch_module, "__version__", ""))
+    triton_version = str(getattr(triton_module, "__version__", ""))
+    if not torch_version or not triton_version:
+        raise ValueError(
+            "triton_tvm_inductor_private_api_guard: torch and triton versions must "
+            f"be discoverable, got torch={torch_version!r}, triton={triton_version!r}"
+        )
+
+    return {
+        "torch_compile": "callable",
+        "torch_inductor_compile_fx": "callable",
+        "torch_version": torch_version,
+        "torch_inductor_version": torch_version,
+        "triton_version": triton_version,
+    }
+
+
+def _validate_async_compile_triton_api(async_compile_cls) -> dict[str, Any]:
+    original_triton = getattr(async_compile_cls, "triton", None)
+    if not callable(original_triton):
+        raise ValueError(
+            "triton_tvm_inductor_private_api_guard: AsyncCompile.triton must be callable"
+        )
+    try:
+        signature = inspect.signature(original_triton)
+    except (TypeError, ValueError) as err:
+        raise ValueError(
+            "triton_tvm_inductor_private_api_guard: AsyncCompile.triton must expose "
+            "an inspectable Python signature"
+        ) from err
+    try:
+        signature.bind(object(), "kernel_name", "source_code", "cuda")
+    except TypeError as err:
+        raise ValueError(
+            "triton_tvm_inductor_private_api_guard: AsyncCompile.triton signature "
+            "must accept (async_compile, kernel_name, source_code, device_str)"
+        ) from err
+    return {"async_compile_triton_signature": str(signature)}
+
+
+def _record_private_api_guard_error_once(
+    session: TritonTVMInductorSession,
+    err: Exception,
+) -> None:
+    if getattr(err, "_triton_tvm_guard_recorded", False):
+        return
+    session._record_private_api_guard_error(err)  # pylint: disable=protected-access
+    try:
+        setattr(err, "_triton_tvm_guard_recorded", True)
+    except Exception:  # pylint: disable=broad-except
+        pass
 
 
 class _TritonTVMInductorKernel:
@@ -1491,13 +1619,21 @@ def _base_m5_record(
 
 def _m5_boundary_lines() -> list[str]:
     return [
-        "## M5 Boundary",
+        "## M5 / Pre-M6 Boundary",
         "",
         "- Experimental `torch.compile` backend; no stable Inductor ABI is promised.",
         "- Supported `pointwise_flat` kernels run through TVM.",
         "- Unsupported kernels use explicit native Triton fallback by default.",
         "- Disk cache remains disabled; artifact cache is process-local.",
+        "- Markdown shows graph summaries; JSON remains authoritative for graph details.",
     ]
+
+
+def _m5_runtime_counter_policy() -> dict[str, str]:
+    return {
+        "run_count": "successful_tvm_launcher_calls_only",
+        "native_fallback_count": "compile_time_native_fallback_decisions_only",
+    }
 
 
 def _error_status(bucket: str, err: Exception) -> dict[str, Any]:

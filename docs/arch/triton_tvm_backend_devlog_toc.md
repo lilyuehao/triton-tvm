@@ -103,20 +103,39 @@ awk '/^#/ { line = $0; level = 0; while (substr(line, level + 1, 1) == "#") leve
 | 1034 | H3 | Workflow 3: Contract Matrix | [L1034](triton_tvm_backend_devlog.md#L1034) |
 | 1043 | H3 | Workflow 4: Runtime, Cache, Stream Boundary | [L1043](triton_tvm_backend_devlog.md#L1043) |
 | 1057 | H3 | Validation | [L1057](triton_tvm_backend_devlog.md#L1057) |
-| 1077 | H2 | 2026-05-22: Pre-M5 Debt Sprint Workflows 5-8 | [L1077](triton_tvm_backend_devlog.md#L1077) |
-| 1079 | H3 | Workflow 5: TTIRReader and Builder Debt | [L1079](triton_tvm_backend_devlog.md#L1079) |
-| 1092 | H3 | Workflow 6: Unified Reporting | [L1092](triton_tvm_backend_devlog.md#L1092) |
-| 1104 | H3 | Workflow 7: Test Structure | [L1104](triton_tvm_backend_devlog.md#L1104) |
-| 1115 | H3 | Workflow 8: Public API Freeze | [L1115](triton_tvm_backend_devlog.md#L1115) |
-| 1126 | H3 | Validation | [L1126](triton_tvm_backend_devlog.md#L1126) |
-| 1148 | H2 | 2026-05-23: M5 Inductor Integration Prototype | [L1148](triton_tvm_backend_devlog.md#L1148) |
-| 1150 | H3 | Scope | [L1150](triton_tvm_backend_devlog.md#L1150) |
-| 1157 | H3 | Implementation Changes | [L1157](triton_tvm_backend_devlog.md#L1157) |
-| 1175 | H3 | Tests Added | [L1175](triton_tvm_backend_devlog.md#L1175) |
-| 1188 | H3 | Validation | [L1188](triton_tvm_backend_devlog.md#L1188) |
-| 1206 | H2 | 2026-05-23: M5.5 Inductor Hook Hardening Gate | [L1206](triton_tvm_backend_devlog.md#L1206) |
-| 1208 | H3 | Scope | [L1208](triton_tvm_backend_devlog.md#L1208) |
-| 1215 | H3 | Implementation Changes | [L1215](triton_tvm_backend_devlog.md#L1215) |
-| 1234 | H3 | Tests Added | [L1234](triton_tvm_backend_devlog.md#L1234) |
-| 1246 | H3 | Documentation | [L1246](triton_tvm_backend_devlog.md#L1246) |
-| 1254 | H3 | Validation | [L1254](triton_tvm_backend_devlog.md#L1254) |
+| 1078 | H2 | 2026-05-22: Pre-M5 Debt Sprint Workflows 5-8 | [L1078](triton_tvm_backend_devlog.md#L1078) |
+| 1080 | H3 | Workflow 5: TTIRReader and Builder Debt | [L1080](triton_tvm_backend_devlog.md#L1080) |
+| 1093 | H3 | Workflow 6: Unified Reporting | [L1093](triton_tvm_backend_devlog.md#L1093) |
+| 1105 | H3 | Workflow 7: Test Structure | [L1105](triton_tvm_backend_devlog.md#L1105) |
+| 1116 | H3 | Workflow 8: Public API Freeze | [L1116](triton_tvm_backend_devlog.md#L1116) |
+| 1127 | H3 | Validation | [L1127](triton_tvm_backend_devlog.md#L1127) |
+| 1149 | H2 | 2026-05-23: M5 Inductor Integration Prototype | [L1149](triton_tvm_backend_devlog.md#L1149) |
+| 1151 | H3 | Scope | [L1151](triton_tvm_backend_devlog.md#L1151) |
+| 1158 | H3 | Implementation Changes | [L1158](triton_tvm_backend_devlog.md#L1158) |
+| 1176 | H3 | Tests Added | [L1176](triton_tvm_backend_devlog.md#L1176) |
+| 1189 | H3 | Validation | [L1189](triton_tvm_backend_devlog.md#L1189) |
+| 1207 | H2 | 2026-05-23: M5.5 Inductor Hook Hardening Gate | [L1207](triton_tvm_backend_devlog.md#L1207) |
+| 1209 | H3 | Scope | [L1209](triton_tvm_backend_devlog.md#L1209) |
+| 1216 | H3 | Implementation Changes | [L1216](triton_tvm_backend_devlog.md#L1216) |
+| 1235 | H3 | Tests Added | [L1235](triton_tvm_backend_devlog.md#L1235) |
+| 1247 | H3 | Documentation | [L1247](triton_tvm_backend_devlog.md#L1247) |
+| 1255 | H3 | Validation | [L1255](triton_tvm_backend_devlog.md#L1255) |
+| 1277 | H2 | 2026-05-23: Pre-M6 Integration Contract Cleanup | [L1277](triton_tvm_backend_devlog.md#L1277) |
+| 1279 | H3 | Scope | [L1279](triton_tvm_backend_devlog.md#L1279) |
+| 1286 | H3 | Implementation Changes | [L1286](triton_tvm_backend_devlog.md#L1286) |
+| 1309 | H3 | Tests Added | [L1309](triton_tvm_backend_devlog.md#L1309) |
+| 1322 | H3 | Documentation | [L1322](triton_tvm_backend_devlog.md#L1322) |
+| 1329 | H3 | Validation | [L1329](triton_tvm_backend_devlog.md#L1329) |
+| 1358 | H2 | 2026-05-23: M6/M6.5 External Model Corpus Audit | [L1358](triton_tvm_backend_devlog.md#L1358) |
+| 1360 | H3 | Scope | [L1360](triton_tvm_backend_devlog.md#L1360) |
+| 1371 | H3 | Dependency Setup | [L1371](triton_tvm_backend_devlog.md#L1371) |
+| 1390 | H3 | Implementation Changes | [L1390](triton_tvm_backend_devlog.md#L1390) |
+| 1419 | H3 | Tests Added | [L1419](triton_tvm_backend_devlog.md#L1419) |
+| 1434 | H3 | Documentation | [L1434](triton_tvm_backend_devlog.md#L1434) |
+| 1442 | H3 | Validation | [L1442](triton_tvm_backend_devlog.md#L1442) |
+| 1466 | H2 | 2026-05-23: Pre-M7 Reader/Builder Debt Gate | [L1466](triton_tvm_backend_devlog.md#L1466) |
+| 1468 | H3 | Scope | [L1468](triton_tvm_backend_devlog.md#L1468) |
+| 1476 | H3 | Implementation Changes | [L1476](triton_tvm_backend_devlog.md#L1476) |
+| 1498 | H3 | Tests Added | [L1498](triton_tvm_backend_devlog.md#L1498) |
+| 1511 | H3 | Documentation | [L1511](triton_tvm_backend_devlog.md#L1511) |
+| 1517 | H3 | Validation | [L1517](triton_tvm_backend_devlog.md#L1517) |

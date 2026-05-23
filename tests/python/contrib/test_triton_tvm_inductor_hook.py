@@ -111,9 +111,12 @@ def test_m55_graph_report_tracks_fallback_kernel_and_cache_lifecycle():
     report = session.report()
     assert report["artifact_cache_size"] == 0
     assert report["graph_summary"] == {
+        "cache_hits": 0,
+        "cache_misses": 0,
         "completed_graphs": 1,
         "failed_graphs": 0,
         "native_fallback_kernels": 1,
+        "run_count": 0,
         "total_graphs": 1,
         "total_kernels": 1,
         "translated_kernels": 0,
@@ -121,6 +124,101 @@ def test_m55_graph_report_tracks_fallback_kernel_and_cache_lifecycle():
     assert report["graphs"][0]["compile_region_name"] == "unit"
     assert report["graphs"][0]["fallback_reasons"] == {"unsupported_ttir_op": 1}
     assert report["kernels"][0]["graph_id"] == report["graphs"][0]["graph_id"]
+
+
+def test_pre_m6_inductor_report_schema_snapshot_and_graph_consistency(tmp_path):
+    session = TritonTVMInductorSession()
+    graph = session.begin_graph(compile_region_name="pre_m6")
+
+    class FakeTTIRArtifact:
+        ttir = "not valid ttir"
+
+    class FakeMeta:
+        cache_key = "a" * 64
+        cache_policy = "disabled"
+        disk_cache_enabled = False
+
+    class FakeBuilt:
+        meta = FakeMeta()
+
+    translated = session._record_translated(  # pylint: disable=protected-access
+        kernel=inductor_mod.InductorKernel(
+            case_name="good",
+            kernel_name="good_kernel",
+            source="@triton.jit\ndef good_kernel():\n    pass\n",
+            device_str="cuda",
+            fn=None,
+            signature={"x": "*fp32"},
+            constexprs={"BLOCK": 64},
+            attrs=None,
+            triton_meta={},
+            inductor_meta={},
+            size_hints={},
+        ),
+        artifact=FakeTTIRArtifact(),
+        built=FakeBuilt(),
+        cache_hit=False,
+    )
+    session._record_run(translated)  # pylint: disable=protected-access
+    session._record_fallback(  # pylint: disable=protected-access
+        InductorTritonSource(
+            case_name="bad",
+            kernel_name="bad_kernel",
+            source="not_a_triton_kernel = 1",
+        ),
+        {
+            "ok": False,
+            "bucket": "contract_error",
+            "fallback_reason": "unsupported_inductor_kernel",
+        },
+    )
+    session.end_graph(graph, ok=True)
+
+    report = session.report()
+    assert {
+        "summary",
+        "graph_summary",
+        "graphs",
+        "kernels",
+        "private_api_guard",
+        "runtime_counter_policy",
+        "report_flush_policy",
+    } <= set(report)
+    assert report["graph_summary"]["cache_misses"] == 1
+    assert report["graph_summary"]["run_count"] == 1
+    assert report["runtime_counter_policy"] == {
+        "native_fallback_count": "compile_time_native_fallback_decisions_only",
+        "run_count": "successful_tvm_launcher_calls_only",
+    }
+    assert report["report_flush_policy"] == "eager_when_report_dir_set"
+
+    kernels = report["kernels"]
+    graph_record = report["graphs"][0]
+    for expected_kernel_index, record_index in enumerate(graph_record["kernel_record_indices"]):
+        assert 0 <= record_index < len(kernels)
+        kernel_record = kernels[record_index]
+        assert kernel_record["graph_id"] == graph_record["graph_id"]
+        assert kernel_record["graph_kernel_index"] == expected_kernel_index
+        assert {
+            "cache_key",
+            "cache_hit",
+            "native_fallback_count",
+            "run_count",
+            "graph_id",
+            "graph_kernel_index",
+        } <= set(kernel_record)
+
+    assert kernels[0]["cache_key"] == "a" * 64
+    assert kernels[0]["run_count"] == 1
+    assert kernels[1]["native_fallback_count"] == 1
+    assert kernels[1]["run_count"] == 0
+
+    session.write_report(tmp_path)
+    markdown = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert "## Graph Summary" in markdown
+    assert "JSON `graphs` and `kernels` are authoritative" in markdown
+    written = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert written["graphs"][0]["kernel_record_indices"] == [0, 1]
 
 
 @pytest.mark.skipif(torch is None, reason="PyTorch is not available")
@@ -146,6 +244,28 @@ def test_m55_hook_reentrancy_guard_and_restore():
             installed,
         )
     assert AsyncCompile.triton is original
+
+
+def test_pre_m6_private_api_guard_fails_fast_before_patch_and_reports_bucket():
+    class BadAsyncCompile:
+        def triton(self, kernel_name):  # pylint: disable=unused-argument
+            return None
+
+    session = TritonTVMInductorSession()
+    original = BadAsyncCompile.triton
+
+    with pytest.raises(ValueError, match="AsyncCompile.triton signature"):
+        inductor_mod._install_async_compile_triton_hook(  # pylint: disable=protected-access
+            BadAsyncCompile,
+            session,
+        )
+
+    assert BadAsyncCompile.triton is original
+    assert inductor_mod._ACTIVE_HOOK is None  # pylint: disable=protected-access
+    report = session.report()
+    assert report["collection_errors"][0]["bucket"] == "input_error"
+    assert report["collection_errors"][0]["stage"] == "private_api_guard"
+    assert report["private_api_guard"]["ok"] is False
 
 
 @pytest.mark.skipif(torch is None, reason="PyTorch is not available")
