@@ -25,12 +25,15 @@ import tvm.contrib.triton_tvm as triton_tvm_pkg
 import tvm.testing
 from tvm.contrib.triton_tvm.model_corpus import (
     TritonTVMModelAuditConfig,
+    _is_model_kernel_replaceable,
+    _select_model_kernel_contract,
     build_model_corpus_report,
     builtin_model_audit_cases,
     diff_capability_reports,
     run_model_corpus_audit,
     write_model_corpus_report,
 )
+from tvm.contrib.triton_tvm.inductor import InductorKernel, extract_inductor_wrapper_extern_calls
 from tvm.contrib.triton_tvm.reporting import make_report_status, render_capability_markdown
 
 try:
@@ -42,6 +45,56 @@ except ImportError:
 def test_m6_model_corpus_api_is_experimental_not_top_level_public_api():
     assert "TritonTVMModelAuditConfig" not in triton_tvm_pkg.__all__
     assert "run_model_corpus_audit" not in triton_tvm_pkg.__all__
+
+
+def test_m8_auto_contract_selection_keeps_deferred_grid_explicit():
+    pointwise = _fake_inductor_kernel("triton_poi_fused_add_0")
+    layernorm = _fake_inductor_kernel("triton_per_fused_native_layer_norm_0", num_reduction=2)
+    rms = _fake_inductor_kernel("triton_per_fused_embedding_mean_mul_pow_rsqrt_0", num_reduction=1)
+    pool = _fake_inductor_kernel("triton_per_fused_max_pool2d_with_indices_40", num_reduction=1)
+    softmax = _fake_inductor_kernel("triton_per_fused__softmax_prepare_64", num_reduction=2)
+    grid = _fake_inductor_kernel("triton_poi_fused_convolution_0", grid_type="Grid2D")
+
+    assert _select_model_kernel_contract(pointwise, "auto_m8") == "pointwise_flat"
+    assert _select_model_kernel_contract(layernorm, "auto_m8") == "norm_row"
+    assert _select_model_kernel_contract(rms, "auto_m8") == "norm_row"
+    assert _select_model_kernel_contract(pool, "auto_m8") == "row_reduction"
+    assert _select_model_kernel_contract(softmax, "auto_m8") == "masked_softmax_row"
+
+    assert _is_model_kernel_replaceable(pointwise, "pointwise_flat")
+    assert _is_model_kernel_replaceable(layernorm, "norm_row")
+    assert not _is_model_kernel_replaceable(grid, "pointwise_flat")
+
+
+def test_pre_m9_wrapper_extern_extraction_classifies_matmul_conv_attention():
+    wrapper_source = """
+def call(arg0, arg1):
+    buf0 = extern_kernels.mm(arg0, arg1, out=None)
+    buf1 = extern_kernels.addmm(arg0, arg1, arg1, alpha=1, beta=1, out=None)
+    buf2 = extern_kernels.convolution(arg0, arg1, stride=(1, 1), padding=(0, 0))
+    buf3 = torch.ops.aten._scaled_dot_product_efficient_attention.default(
+        arg0, arg1, arg1, None, False, scale=0.25
+    )
+    return buf0, buf1, buf2, buf3
+"""
+
+    calls = extract_inductor_wrapper_extern_calls(
+        wrapper_source,
+        case_name="toy",
+        wrapper_path="/tmp/toy.py",
+    )
+
+    assert [(call.op_name, call.op_family) for call in calls] == [
+        ("extern_kernels.mm", "extern_gemm"),
+        ("extern_kernels.addmm", "extern_addmm_bias"),
+        ("extern_kernels.convolution", "deferred_convolution"),
+        (
+            "torch.ops.aten._scaled_dot_product_efficient_attention.default",
+            "deferred_attention",
+        ),
+    ]
+    assert calls[0].case_name == "toy"
+    assert calls[0].wrapper_path == "/tmp/toy.py"
 
 
 def test_m6_model_report_groups_models_and_ranks_blockers(tmp_path):
@@ -92,6 +145,7 @@ def test_m6_model_report_groups_models_and_ranks_blockers(tmp_path):
     assert "## Model Summary" in markdown
     assert "## Blockers" in markdown
     assert "## Pre-M7 Gate" in markdown
+    assert "## Pre-M9 Gate" in markdown
     written = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
     assert written["model_summary"] == report["model_summary"]
     assert written["pre_m7"] == report["pre_m7"]
@@ -213,6 +267,214 @@ def test_pre_m7_report_section_preserves_buckets_and_orders_m7_blockers():
     assert entry_blockers[0]["models_impacted"] == 1
 
 
+def test_pre_m8_report_section_splits_reduction_family_debt_without_new_buckets():
+    records = [
+        _kernel_record(
+            "vit",
+            "vit_tiny",
+            "triton_per_fused_native_layer_norm_0",
+            make_report_status(
+                ok=False,
+                bucket="contract_error",
+                fallback_reason="unsupported_inductor_kernel",
+            ),
+            op_counts={"tt.reduce": 4, "tt.load": 4},
+            num_reduction=4,
+        ),
+        _kernel_record(
+            "llama",
+            "llama_tiny",
+            "triton_per_fused_add_embedding_mean_mul_pow_rsqrt_0",
+            make_report_status(
+                ok=False,
+                bucket="contract_error",
+                fallback_reason="unsupported_inductor_kernel",
+            ),
+            op_counts={"tt.reduce": 1, "tt.load": 3},
+            num_reduction=1,
+        ),
+        _kernel_record(
+            "yolo",
+            "yolo_tiny",
+            "triton_per_fused_max_pool2d_with_indices_40",
+            make_report_status(
+                ok=False,
+                bucket="contract_error",
+                fallback_reason="unsupported_inductor_kernel",
+            ),
+            op_counts={"tt.reduce": 1, "tt.load": 2},
+            num_reduction=1,
+        ),
+        _kernel_record(
+            "yolo",
+            "yolo_tiny",
+            "triton_per_fused__softmax_prepare_softmax_online_transpose_view_64",
+            make_report_status(
+                ok=False,
+                bucket="contract_error",
+                fallback_reason="unsupported_inductor_kernel",
+            ),
+            op_counts={"tt.reduce": 4, "tt.load": 4},
+            num_reduction=4,
+        ),
+        _kernel_record(
+            "llama",
+            "llama_tiny",
+            "triton_poi_fused_attention_masked_load_1",
+            make_report_status(
+                ok=False,
+                bucket="unsupported_ttir_op",
+                fallback_reason="unsupported_ttir_op",
+                message="masked tt.load without other in attention softmax",
+            ),
+            op_counts={"tt.load": 2, "tt.store": 1},
+        ),
+        _kernel_record(
+            "yolo",
+            "yolo_tiny",
+            "triton_poi_fused_convolution_0",
+            make_report_status(
+                ok=False,
+                bucket="contract_error",
+                fallback_reason="unsupported_inductor_kernel",
+            ),
+            grid_type="Grid2D",
+        ),
+    ]
+    models = [
+        _model_record("vit", "vit_tiny", kernel_count=1, translated=0, fallback=1),
+        _model_record("llama", "llama_tiny", kernel_count=2, translated=0, fallback=2),
+        _model_record("yolo", "yolo_tiny", kernel_count=3, translated=0, fallback=3),
+    ]
+
+    report = build_model_corpus_report(
+        records,
+        models,
+        generated_at="2026-05-24T00:00:00+00:00",
+    )
+
+    assert report["summary"]["status_buckets"] == {
+        "contract_error": 5,
+        "unsupported_ttir_op": 1,
+    }
+    pre_m8 = report["pre_m8"]
+    assert pre_m8["taxonomy_version"] == 1
+    assert pre_m8["unsupported_taxonomy"]["top_level_bucket_policy"] == (
+        "preserve_existing_buckets"
+    )
+    assert pre_m8["unsupported_taxonomy"]["detail_fields"] == [
+        "fallback_reason",
+        "blocker_class",
+        "pre_m8_family",
+    ]
+
+    families = pre_m8["family_classes"]
+    assert families["norm_layernorm"]["kernel_count"] == 1
+    assert families["norm_rmsnorm"]["kernel_count"] == 1
+    assert families["pooling_reduction"]["kernel_count"] == 1
+    assert families["softmax_like"]["kernel_count"] == 1
+    assert families["masked_attention_adjacent"]["kernel_count"] == 1
+    assert families["deferred_grid"]["kernel_count"] == 1
+    assert {entry["pre_m8_family"] for entry in pre_m8["deferred_debt"]} == {
+        "deferred_grid"
+    }
+    assert report["model_summary"]["pre_m8_families"]["softmax_like"] == 1
+    assert report["kernels"][0]["pre_m8_family"] == "norm_layernorm"
+
+    markdown = render_capability_markdown(report, title="Pre-M8 Snapshot")
+    assert "## Pre-M8 Gate" in markdown
+    assert "softmax_like" in markdown
+
+
+def test_pre_m9_report_section_splits_extern_gemm_from_deferred_grid_conv_attention():
+    records = [
+        _kernel_record(
+            "vit",
+            "vit_tiny",
+            "triton_vit_pointwise_0",
+            make_report_status(ok=True, bucket="translated"),
+        ),
+        _kernel_record(
+            "yolo",
+            "yolo_tiny",
+            "triton_yolo_grid_0",
+            make_report_status(
+                ok=False,
+                bucket="contract_error",
+                fallback_reason="unsupported_inductor_kernel",
+            ),
+            grid_type="Grid2D",
+        ),
+    ]
+    models = [
+        _model_record(
+            "vit",
+            "vit_tiny",
+            kernel_count=1,
+            translated=1,
+            fallback=0,
+            extern_calls=[
+                _extern_call("vit", "vit_tiny", "extern_kernels.addmm", "extern_addmm_bias"),
+                _extern_call("vit", "vit_tiny", "extern_kernels.mm", "extern_gemm"),
+                _extern_call(
+                    "vit",
+                    "vit_tiny",
+                    "torch.ops.aten._scaled_dot_product_efficient_attention.default",
+                    "deferred_attention",
+                ),
+            ],
+        ),
+        _model_record(
+            "yolo",
+            "yolo_tiny",
+            kernel_count=1,
+            translated=0,
+            fallback=1,
+            extern_calls=[
+                _extern_call(
+                    "yolo",
+                    "yolo_tiny",
+                    "extern_kernels.convolution",
+                    "deferred_convolution",
+                )
+            ],
+        ),
+    ]
+
+    report = build_model_corpus_report(
+        records,
+        models,
+        generated_at="2026-05-24T00:00:00+00:00",
+    )
+
+    assert report["model_summary"]["extern_op_count"] == 4
+    assert report["model_summary"]["full_tvm_runnable_models"] == 0
+    assert report["model_summary"]["triton_kernel_runnable_models"] == 1
+    assert report["extern_ops"][0]["op_family"] == "extern_addmm_bias"
+
+    pre_m9 = report["pre_m9"]
+    assert pre_m9["taxonomy_version"] == 1
+    assert pre_m9["observed_ttir_dot_kernels"] == 0
+    assert pre_m9["observed_grid_fallback_kernels"] == 1
+    assert pre_m9["extern_family_classes"]["extern_gemm"]["call_count"] == 1
+    assert pre_m9["extern_family_classes"]["extern_addmm_bias"]["call_count"] == 1
+    assert pre_m9["extern_family_classes"]["deferred_convolution"]["call_count"] == 1
+    assert pre_m9["extern_family_classes"]["deferred_attention"]["call_count"] == 1
+    assert {entry["op_family"] for entry in pre_m9["m9_entry_debt"]} == {
+        "extern_addmm_bias",
+        "extern_gemm",
+    }
+    assert {entry["op_family"] for entry in pre_m9["deferred_debt"]} == {
+        "deferred_attention",
+        "deferred_convolution",
+    }
+
+    markdown = render_capability_markdown(report, title="Pre-M9 Snapshot")
+    assert "## Pre-M9 Gate" in markdown
+    assert "extern_gemm" in markdown
+    assert "deferred_convolution" in markdown
+
+
 def test_m6_zero_kernel_model_is_a_stable_collection_blocker():
     report = build_model_corpus_report(
         [],
@@ -311,6 +573,62 @@ def test_m65_report_diff_ignores_timestamps_and_paths():
     }
 
 
+def test_m75_model_supported_kernel_report_is_golden_guard():
+    records = [
+        _kernel_record(
+            "vit",
+            "vit_tiny",
+            "triton_vit_fp32_flat",
+            make_report_status(ok=True, bucket="translated"),
+            indexing_summary={"index_kinds": {"flat": 3}},
+            types=["tensor<64xf32>", "tensor<64xi1>"],
+        ),
+        _kernel_record(
+            "yolo",
+            "yolo_tiny",
+            "triton_yolo_fp16_strided",
+            make_report_status(ok=True, bucket="translated"),
+            indexing_summary={"index_kinds": {"flat": 1, "mul": 1}},
+            types=["tensor<128xf16>", "tensor<128xbf16>"],
+        ),
+        _kernel_record(
+            "llama",
+            "llama_tiny",
+            "triton_llama_attention_no_other",
+            make_report_status(
+                ok=False,
+                bucket="unsupported_ttir_op",
+                fallback_reason="unsupported_ttir_op",
+                message="masked tt.load without other requires load/store masks to use the same flat extent predicate",
+            ),
+            op_counts={"tt.load": 2, "tt.store": 1},
+        ),
+    ]
+    models = [
+        _model_record("vit", "vit_tiny", kernel_count=1, translated=1, fallback=0),
+        _model_record("yolo", "yolo_tiny", kernel_count=1, translated=1, fallback=0),
+        _model_record("llama", "llama_tiny", kernel_count=1, translated=0, fallback=1),
+    ]
+
+    report = build_model_corpus_report(
+        records,
+        models,
+        generated_at="2026-05-24T00:00:00+00:00",
+    )
+    supported = report["supported_kernel_report"]
+
+    assert supported["kernel_count"] == 2
+    assert supported["contracts"] == {"pointwise_flat": 2}
+    assert supported["dtypes"]["float32"] == 1
+    assert supported["dtypes"]["float16"] == 1
+    assert supported["dtypes"]["bfloat16"] == 1
+    assert supported["tensor_shapes"] == {"128": 2, "64": 2}
+    assert supported["layout_index_kinds"] == {"flat": 4, "mul": 1}
+    assert supported["legacy_contract_records"] == []
+    assert supported["silent_fallback_records"] == []
+    assert supported["ok"] is True
+
+
 @pytest.mark.skipif(torch is None, reason="PyTorch is not available")
 @pytest.mark.skipif(
     os.environ.get("TRITON_TVM_RUN_MODEL_CORPUS") != "1",
@@ -347,6 +665,7 @@ def _kernel_record(
     atomic_add_found=False,
     kernel_source_path="",
     indexing_summary=None,
+    types=None,
 ):
     op_counts = op_counts or {"tt.load": 1, "tt.store": 1}
     return {
@@ -358,7 +677,7 @@ def _kernel_record(
         "contract": "pointwise_flat",
         "unique_ops": sorted(op_counts),
         "op_counts": op_counts,
-        "types": ["tensor<64xf32>"],
+        "types": types or ["tensor<64xf32>"],
         "load_count": op_counts.get("tt.load", 0),
         "store_count": op_counts.get("tt.store", 0),
         "grid_type": grid_type,
@@ -371,7 +690,15 @@ def _kernel_record(
     }
 
 
-def _model_record(family, model_case, *, kernel_count, translated, fallback):
+def _model_record(
+    family,
+    model_case,
+    *,
+    kernel_count,
+    translated,
+    fallback,
+    extern_calls=None,
+):
     return {
         "model_family": family,
         "model_case": model_case,
@@ -382,8 +709,49 @@ def _model_record(family, model_case, *, kernel_count, translated, fallback):
         "status_buckets": {},
         "blocker_classes": {},
         "wrapper_paths": [],
+        "extern_calls": extern_calls or [],
+        "triton_kernel_runnable": kernel_count > 0 and fallback == 0 and translated == kernel_count,
         "full_tvm_runnable": kernel_count > 0 and fallback == 0 and translated == kernel_count,
     }
+
+
+def _extern_call(family, model_case, op_name, op_family):
+    return {
+        "model_family": family,
+        "model_case": model_case,
+        "case_name": model_case,
+        "op_name": op_name,
+        "op_family": op_family,
+        "line_no": 10,
+        "wrapper_path": f"/tmp/{model_case}.py",
+        "source": f"{op_name}(...)",
+    }
+
+
+def _fake_inductor_kernel(
+    kernel_name,
+    *,
+    grid_type="Grid1D",
+    num_reduction=0,
+    atomic_add_found=False,
+):
+    return InductorKernel(
+        case_name="case",
+        kernel_name=kernel_name,
+        source=("triton_heuristics.pointwise " if num_reduction == 0 else "") + kernel_name,
+        device_str="cuda",
+        fn=object(),
+        signature={},
+        constexprs={},
+        attrs=None,
+        triton_meta={},
+        inductor_meta={
+            "grid_type": grid_type,
+            "num_reduction": num_reduction,
+            "atomic_add_found": atomic_add_found,
+        },
+        size_hints={},
+    )
 
 
 if __name__ == "__main__":

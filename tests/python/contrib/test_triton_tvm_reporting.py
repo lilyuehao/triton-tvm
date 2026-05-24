@@ -90,6 +90,13 @@ def test_reporting_schema_snapshot_for_pointwise_reduction_and_norm():
         "tt.store": 3,
     }
     assert report["kernels"][2]["translate_status"]["fallback_reason"] == "unsupported_ttir_op"
+    assert report["supported_kernel_report"]["kernel_count"] == 3
+    assert report["supported_kernel_report"]["contracts"] == {
+        "norm_single_row": 1,
+        "pointwise_flat": 2,
+    }
+    assert report["supported_kernel_report"]["legacy_contract_records"] == []
+    assert report["supported_kernel_report"]["silent_fallback_records"] == []
 
 
 def test_reporting_error_bucket_mapping_is_stable():
@@ -138,6 +145,79 @@ def test_reporting_markdown_and_json_are_consistent(tmp_path):
     assert written["summary"] == report["summary"]
     assert "unsupported_ttir_op=1" in written_markdown
     assert "`reduction_minimal`" in written_markdown
+
+
+def test_m75_supported_kernel_report_tracks_shape_dtype_layout_and_guards():
+    records = [
+        _record(
+            "m7",
+            "fp16_broadcast",
+            "pointwise_flat",
+            make_report_status(ok=True, bucket="translated"),
+            op_counts={"tt.load": 2, "tt.store": 1, "arith.remsi": 1},
+        )
+        | {
+            "signature": {"x": "*fp16", "y": "*bf16", "out": "*fp32", "n": "i64"},
+            "types": [
+                "tensor<8x64xf16>",
+                "tensor<64xbf16>",
+                "tensor<64xi1>",
+                "tensor<8x!tt.ptr<f16>>",
+            ],
+            "indexing_summary": {"index_kinds": {"flat": 2, "rem": 1}},
+        },
+        _record(
+            "m7",
+            "legacy_alias_input",
+            "cuda_pointwise_flat",
+            make_report_status(ok=True, bucket="translated"),
+        ),
+        _record(
+            "m7",
+            "missing_reason",
+            "pointwise_flat",
+            {"ok": False, "bucket": "unsupported_ttir_op"},
+        ),
+    ]
+
+    report = build_capability_report(
+        records,
+        purpose="m7.5 supported kernel guard",
+        corpus="m7",
+        generated_at="2026-05-24T00:00:00+00:00",
+    )
+    supported = report["supported_kernel_report"]
+
+    assert "cuda_" not in json.dumps(report)
+    assert report["kernels"][1]["contract"] == "pointwise_flat"
+    assert supported["kernel_count"] == 2
+    assert supported["dtypes"]["float16"] >= 1
+    assert supported["dtypes"]["bfloat16"] >= 1
+    assert supported["dtypes"]["float32"] >= 1
+    assert all(not dtype.startswith("!tt.ptr") for dtype in supported["dtypes"])
+    assert supported["tensor_shapes"]["8x64"] == 1
+    assert supported["layout_index_kinds"] == {"flat": 2, "rem": 1}
+    assert supported["legacy_contract_records"] == [
+        {
+            "corpus": "m7",
+            "case_name": "legacy_alias_input",
+            "kernel_name": "legacy_alias_input_kernel",
+            "contract": "pointwise_flat",
+            "bucket": "translated",
+            "fallback_reason": "",
+        }
+    ]
+    assert supported["silent_fallback_records"] == [
+        {
+            "corpus": "m7",
+            "case_name": "missing_reason",
+            "kernel_name": "missing_reason_kernel",
+            "contract": "pointwise_flat",
+            "bucket": "unsupported_ttir_op",
+            "fallback_reason": "unsupported_ttir_op",
+        }
+    ]
+    assert supported["ok"] is False
 
 
 def _record(corpus, case, contract, status, op_counts=None):

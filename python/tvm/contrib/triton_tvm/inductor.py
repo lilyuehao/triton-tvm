@@ -49,6 +49,7 @@ from .errors import (
     UnsupportedTargetPolicyError,
 )
 from .frontend import TTIRArtifact, lower_to_ttir
+from .indexing import summarize_ttir_indexing
 from .op_graph import NormalizedTTIROpGraph
 from .reporting import (
     build_capability_report,
@@ -75,6 +76,18 @@ class InductorTritonSource:
     source: str
     device_str: str = "cuda"
     wrapper_path: str = ""
+
+
+@dataclass(frozen=True)
+class InductorWrapperExternCall:
+    """A wrapper-level non-Triton call emitted by TorchInductor."""
+
+    case_name: str
+    op_name: str
+    op_family: str
+    line_no: int
+    wrapper_path: str = ""
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -481,6 +494,18 @@ def _builtin_relu_add(x, y):
     return torch.relu(x) + y
 
 
+def _builtin_gelu(x):
+    import torch  # pylint: disable=import-outside-toplevel
+
+    return torch.nn.functional.gelu(x)
+
+
+def _builtin_silu(x):
+    import torch  # pylint: disable=import-outside-toplevel
+
+    return torch.nn.functional.silu(x)
+
+
 def _builtin_sigmoid_mul(x, y):
     import torch  # pylint: disable=import-outside-toplevel
 
@@ -601,6 +626,63 @@ def extract_inductor_triton_sources(
             )
         )
     return sources
+
+
+def extract_inductor_wrapper_extern_calls(
+    wrapper_source: str,
+    *,
+    case_name: str = "",
+    wrapper_path: str = "",
+) -> list[InductorWrapperExternCall]:
+    """Extract wrapper-level extern/ATen calls that are not Triton kernels."""
+    tree = ast.parse(wrapper_source)
+    lines = wrapper_source.splitlines()
+    calls: list[InductorWrapperExternCall] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        op_name = _attribute_chain(node.func)
+        op_family = _wrapper_extern_family(op_name)
+        if not op_family:
+            continue
+        line_no = int(getattr(node, "lineno", 0) or 0)
+        source_line = lines[line_no - 1].strip() if 0 < line_no <= len(lines) else ""
+        calls.append(
+            InductorWrapperExternCall(
+                case_name=case_name,
+                op_name=op_name,
+                op_family=op_family,
+                line_no=line_no,
+                wrapper_path=wrapper_path,
+                source=source_line,
+            )
+        )
+    return sorted(calls, key=lambda call: (call.line_no, call.op_name))
+
+
+def _attribute_chain(node: ast.AST) -> str:
+    parts: list[str] = []
+    current: ast.AST | None = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+    else:
+        return ""
+    return ".".join(reversed(parts))
+
+
+def _wrapper_extern_family(op_name: str) -> str:
+    if op_name in {"extern_kernels.mm", "extern_kernels.bmm"}:
+        return "extern_gemm"
+    if op_name == "extern_kernels.addmm":
+        return "extern_addmm_bias"
+    if op_name == "extern_kernels.convolution":
+        return "deferred_convolution"
+    if op_name == "torch.ops.aten._scaled_dot_product_efficient_attention.default":
+        return "deferred_attention"
+    return ""
 
 
 def load_inductor_kernel(
@@ -1325,13 +1407,15 @@ def _indexing_summary(graph: NormalizedTTIROpGraph) -> dict[str, Any]:
         if op.name == "tt.get_program_id"
     ]
     addptr_ops = [op for op in graph.ops if op.name == "tt.addptr"]
-    return {
+    summary = {
         "kind": "flat_or_broadcast_candidate" if addptr_ops else "no_addptr",
         "addptr_count": len(addptr_ops),
         "make_range_count": sum(1 for op in graph.ops if op.name == "tt.make_range"),
         "program_id_axes": sorted(set(program_id_axes)),
         "addptr_operands": [list(op.operands) for op in addptr_ops],
     }
+    summary.update(summarize_ttir_indexing(graph))
+    return summary
 
 
 def _load_builtin_corpus_module():
@@ -1356,6 +1440,12 @@ def _load_builtin_corpus_module():
 
         def m3_relu_add(x, y):
             return torch.relu(x) + y
+
+        def m3_gelu(x):
+            return torch.nn.functional.gelu(x)
+
+        def m3_silu(x):
+            return torch.nn.functional.silu(x)
 
         def m3_sigmoid_mul(x, y):
             return torch.sigmoid(x) * y
@@ -1451,6 +1541,8 @@ def _builtin_cases(torch, module=None) -> list[_BuiltinCase]:
             fn("relu_add"),
             lambda _: (rand((256,)), rand((256,))),
         ),
+        _BuiltinCase("gelu", fn("gelu"), lambda _: (rand((256,)),)),
+        _BuiltinCase("silu", fn("silu"), lambda _: (rand((256,)),)),
         _BuiltinCase(
             "sigmoid_mul",
             fn("sigmoid_mul"),

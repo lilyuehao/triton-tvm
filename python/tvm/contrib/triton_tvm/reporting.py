@@ -36,6 +36,10 @@ from .errors import (
 
 REPORT_SCHEMA_VERSION = 1
 REPORT_KIND = "triton_tvm_capability_report"
+_LEGACY_CONTRACT_ALIASES = {
+    "cuda_minimal": "pointwise_minimal",
+    "cuda_pointwise_flat": "pointwise_flat",
+}
 
 
 def make_report_status(
@@ -96,7 +100,18 @@ def build_capability_report(
     errors: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the shared JSON report used by pointwise, reduction, and norm audits."""
-    records = [_normalize_record(record) for record in kernel_records]
+    records = []
+    diagnostics = {
+        "legacy_contract_records": [],
+        "silent_fallback_records": [],
+    }
+    for record in kernel_records:
+        normalized = _normalize_record(record)
+        if _is_legacy_contract(record.get("contract", "")):
+            diagnostics["legacy_contract_records"].append(_record_ref(normalized))
+        if _is_raw_silent_fallback(record):
+            diagnostics["silent_fallback_records"].append(_record_ref(normalized))
+        records.append(normalized)
     collection_errors = [_normalize_collection_error(error) for error in (errors or [])]
     op_histogram: Counter[str] = Counter()
     type_histogram: Counter[str] = Counter()
@@ -133,6 +148,7 @@ def build_capability_report(
         "op_histogram": dict(sorted(op_histogram.items())),
         "type_histogram": dict(sorted(type_histogram.items())),
         "unsupported_buckets": summary["status_buckets"],
+        "supported_kernel_report": _build_supported_kernel_report(records, diagnostics),
         "filtered_kernels": list(filtered or []),
         "collection_errors": collection_errors,
         "kernels": records,
@@ -205,6 +221,22 @@ def render_capability_markdown(
                     )
                 )
         lines.append("")
+    supported_kernel_report = report.get("supported_kernel_report") or {}
+    if supported_kernel_report:
+        lines.extend(
+            [
+                "## Supported Kernel Report",
+                "",
+                f"- Supported kernels: {supported_kernel_report.get('kernel_count', 0)}",
+                f"- Contracts: {_format_histogram(supported_kernel_report.get('contracts', {}))}",
+                f"- DTypes: {_format_histogram(supported_kernel_report.get('dtypes', {}))}",
+                f"- Tensor shapes: {_format_histogram(supported_kernel_report.get('tensor_shapes', {}))}",
+                f"- Layout/index kinds: {_format_histogram(supported_kernel_report.get('layout_index_kinds', {}))}",
+                f"- Legacy contract records: {len(supported_kernel_report.get('legacy_contract_records', []))}",
+                f"- Silent fallback records: {len(supported_kernel_report.get('silent_fallback_records', []))}",
+                "",
+            ]
+        )
     if "model_summary" in report:
         model_summary = report.get("model_summary") or {}
         lines.extend(
@@ -215,8 +247,11 @@ def render_capability_markdown(
                 f"- Completed models: {model_summary.get('completed_models', 0)}",
                 f"- Failed models: {model_summary.get('failed_models', 0)}",
                 f"- Full TVM runnable models: {model_summary.get('full_tvm_runnable_models', 0)}",
+                f"- Triton-kernel runnable models: {model_summary.get('triton_kernel_runnable_models', 0)}",
                 f"- Fallback kernels: {model_summary.get('fallback_kernels', 0)}",
+                f"- Wrapper extern calls: {model_summary.get('extern_op_count', 0)}",
                 f"- Model status: {_format_histogram(model_summary.get('model_status', {}))}",
+                f"- Extern op families: {_format_histogram(model_summary.get('extern_op_families', {}))}",
                 f"- Blocker classes: {_format_histogram(model_summary.get('blocker_classes', {}))}",
                 "",
             ]
@@ -323,6 +358,84 @@ def render_capability_markdown(
                             )[:160]
                         ),
                     )
+            )
+            lines.append("")
+    if "pre_m8" in report:
+        pre_m8 = report.get("pre_m8") or {}
+        taxonomy = pre_m8.get("unsupported_taxonomy") or {}
+        lines.extend(
+            [
+                "## Pre-M8 Gate",
+                "",
+                f"- Taxonomy version: {pre_m8.get('taxonomy_version', '')}",
+                f"- Detail fields: {', '.join(taxonomy.get('detail_fields', []))}",
+                f"- M8 entry debt families: {len(pre_m8.get('m8_entry_debt') or [])}",
+                f"- Deferred debt families: {len(pre_m8.get('deferred_debt') or [])}",
+                "",
+            ]
+        )
+        family_classes = pre_m8.get("family_classes") or {}
+        if family_classes:
+            lines.extend(
+                [
+                    "| Family | Kernels | Buckets | Blocker classes | Example |",
+                    "|---|---:|---|---|---|",
+                ]
+            )
+            for family, entry in sorted(family_classes.items()):
+                lines.append(
+                    "| {family} | {kernels} | {buckets} | {classes} | {example} |".format(
+                        family=_escape_markdown_cell(str(family)),
+                        kernels=entry.get("kernel_count", 0),
+                        buckets=_escape_markdown_cell(
+                            _format_histogram(entry.get("buckets", {}))
+                        ),
+                        classes=_escape_markdown_cell(
+                            _format_histogram(entry.get("blocker_classes", {}))
+                        ),
+                        example=_escape_markdown_cell(
+                            str(entry.get("example_kernel", ""))[:160]
+                        ),
+                    )
+                )
+            lines.append("")
+    if "pre_m9" in report:
+        pre_m9 = report.get("pre_m9") or {}
+        lines.extend(
+            [
+                "## Pre-M9 Gate",
+                "",
+                f"- Taxonomy version: {pre_m9.get('taxonomy_version', '')}",
+                f"- Detail fields: {', '.join(pre_m9.get('detail_fields', []))}",
+                f"- M9 entry debt families: {len(pre_m9.get('m9_entry_debt') or [])}",
+                f"- Deferred debt families: {len(pre_m9.get('deferred_debt') or [])}",
+                f"- Observed TTIR dot kernels: {pre_m9.get('observed_ttir_dot_kernels', 0)}",
+                f"- Observed grid fallback kernels: {pre_m9.get('observed_grid_fallback_kernels', 0)}",
+                "",
+            ]
+        )
+        extern_family_classes = pre_m9.get("extern_family_classes") or {}
+        if extern_family_classes:
+            lines.extend(
+                [
+                    "| Family | Calls | Models | Ops | Example model | Example op |",
+                    "|---|---:|---:|---|---|---|",
+                ]
+            )
+            for family, entry in sorted(extern_family_classes.items()):
+                lines.append(
+                    "| {family} | {calls} | {models} | {ops} | {example_model} | {example_op} |".format(
+                        family=_escape_markdown_cell(str(family)),
+                        calls=entry.get("call_count", 0),
+                        models=entry.get("models_impacted", 0),
+                        ops=_escape_markdown_cell(
+                            _format_histogram(entry.get("op_names", {}))
+                        ),
+                        example_model=_escape_markdown_cell(
+                            str(entry.get("example_model", ""))
+                        ),
+                        example_op=_escape_markdown_cell(str(entry.get("example_op", ""))),
+                    )
                 )
             lines.append("")
     lines.extend(
@@ -408,7 +521,7 @@ def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:
     normalized["translate_status"] = status
     normalized.setdefault("case_name", "")
     normalized.setdefault("kernel_name", "")
-    normalized.setdefault("contract", "")
+    normalized["contract"] = _canonical_report_contract(str(normalized.get("contract") or ""))
     normalized.setdefault("corpus", "")
     normalized.setdefault("op_counts", {})
     normalized.setdefault("types", [])
@@ -433,6 +546,135 @@ def _normalize_collection_error(error: dict[str, Any]) -> dict[str, Any]:
     bucket = str(normalized.get("bucket", "collection_error"))
     normalized.setdefault("fallback_reason", bucket)
     return normalized
+
+
+def _build_supported_kernel_report(
+    records: list[dict[str, Any]],
+    diagnostics: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    supported = [
+        record for record in records if record.get("translate_status", {}).get("ok", False)
+    ]
+    contracts: Counter[str] = Counter()
+    dtypes: Counter[str] = Counter()
+    tensor_shapes: Counter[str] = Counter()
+    layout_index_kinds: Counter[str] = Counter()
+
+    for record in supported:
+        contract = str(record.get("contract", ""))
+        if contract:
+            contracts[contract] += 1
+        for raw_type in record.get("types", []):
+            dtype, shape = _dtype_shape_from_ttir_type(str(raw_type))
+            if dtype:
+                dtypes[dtype] += 1
+            if shape:
+                tensor_shapes[shape] += 1
+        for dtype in _signature_dtypes(record.get("signature", {})):
+            dtypes[dtype] += 1
+        indexing = record.get("indexing_summary") or {}
+        index_kinds = indexing.get("index_kinds") or {}
+        if index_kinds:
+            layout_index_kinds.update(index_kinds)
+        else:
+            kind = str(indexing.get("kind", ""))
+            if kind:
+                layout_index_kinds[kind] += 1
+
+    return {
+        "schema_version": 1,
+        "purpose": "m7_supported_kernel_guard",
+        "kernel_count": len(supported),
+        "contracts": dict(sorted(contracts.items())),
+        "dtypes": dict(sorted(dtypes.items())),
+        "tensor_shapes": dict(sorted(tensor_shapes.items())),
+        "layout_index_kinds": dict(sorted(layout_index_kinds.items())),
+        "legacy_contract_records": list(diagnostics.get("legacy_contract_records", [])),
+        "silent_fallback_records": list(diagnostics.get("silent_fallback_records", [])),
+        "ok": not diagnostics.get("legacy_contract_records")
+        and not diagnostics.get("silent_fallback_records"),
+    }
+
+
+def _record_ref(record: dict[str, Any]) -> dict[str, Any]:
+    status = record.get("translate_status", {})
+    return {
+        "corpus": record.get("corpus", ""),
+        "case_name": record.get("case_name", ""),
+        "kernel_name": record.get("kernel_name", ""),
+        "contract": record.get("contract", ""),
+        "bucket": status.get("bucket", ""),
+        "fallback_reason": status.get("fallback_reason", ""),
+    }
+
+
+def _is_legacy_contract(contract: Any) -> bool:
+    return str(contract) in _LEGACY_CONTRACT_ALIASES
+
+
+def _canonical_report_contract(contract: str) -> str:
+    return _LEGACY_CONTRACT_ALIASES.get(contract, contract)
+
+
+def _is_raw_silent_fallback(record: dict[str, Any]) -> bool:
+    status = record.get("translate_status") or record.get("status")
+    native_fallback_count = int(record.get("native_fallback_count", 0) or 0)
+    if not isinstance(status, dict):
+        return bool(native_fallback_count)
+    fallback_reason = str(status.get("fallback_reason", ""))
+    if native_fallback_count and not fallback_reason:
+        return True
+    return not bool(status.get("ok", False)) and not fallback_reason
+
+
+def _dtype_shape_from_ttir_type(raw_type: str) -> tuple[str, str]:
+    if raw_type.startswith("tensor<") and raw_type.endswith(">"):
+        inner = raw_type[len("tensor<") : -1]
+        parts = inner.split("x")
+        if len(parts) >= 2:
+            return _canonical_report_dtype(parts[-1]), "x".join(parts[:-1])
+        return _canonical_report_dtype(inner), ""
+    if raw_type.startswith("!tt.ptr<") and raw_type.endswith(">"):
+        return _canonical_report_dtype(raw_type[len("!tt.ptr<") : -1]), ""
+    return _canonical_report_dtype(raw_type), ""
+
+
+def _signature_dtypes(signature: dict[str, Any]) -> list[str]:
+    dtypes = []
+    for raw_type in signature.values():
+        text = str(raw_type)
+        if text == "constexpr":
+            continue
+        if text.startswith("*"):
+            text = text[1:]
+        dtype = _canonical_report_dtype(text)
+        if dtype:
+            dtypes.append(dtype)
+    return dtypes
+
+
+def _canonical_report_dtype(dtype: str) -> str:
+    if dtype.startswith("!tt.ptr<") and dtype.endswith(">"):
+        return _canonical_report_dtype(dtype[len("!tt.ptr<") : -1])
+    mapping = {
+        "bf16": "bfloat16",
+        "f16": "float16",
+        "f32": "float32",
+        "f64": "float64",
+        "fp16": "float16",
+        "fp32": "float32",
+        "fp64": "float64",
+        "i1": "bool",
+        "i8": "int8",
+        "i16": "int16",
+        "i32": "int32",
+        "i64": "int64",
+        "ui8": "uint8",
+        "ui16": "uint16",
+        "ui32": "uint32",
+        "ui64": "uint64",
+    }
+    return mapping.get(dtype, dtype)
 
 
 def _format_histogram(values: dict[str, int]) -> str:

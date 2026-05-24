@@ -22,10 +22,14 @@ from .contracts import (
     normalize_triton_tvm_contract,
     validate_cuda_minimal_contract,
     validate_cuda_pointwise_flat_contract,
+    validate_masked_softmax_row_contract,
     validate_norm_single_row_contract,
+    validate_norm_row_contract,
     validate_pointwise_flat_contract,
     validate_pointwise_minimal_contract,
     validate_reduction_minimal_contract,
+    validate_row_reduction_contract,
+    validate_softmax_row_contract,
     validate_triton_tvm_contract,
 )
 from .errors import (
@@ -58,9 +62,13 @@ __all__ = [
     "lower_to_ttir",
     "normalize_triton_tvm_contract",
     "translate_ttir",
+    "validate_masked_softmax_row_contract",
     "validate_norm_single_row_contract",
+    "validate_norm_row_contract",
     "validate_pointwise_flat_contract",
     "validate_pointwise_minimal_contract",
     "validate_reduction_minimal_contract",
+    "validate_row_reduction_contract",
+    "validate_softmax_row_contract",
     "validate_triton_tvm_contract",
 ]

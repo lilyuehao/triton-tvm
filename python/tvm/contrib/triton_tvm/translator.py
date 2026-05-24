@@ -22,6 +22,7 @@ import hashlib
 import json
 import keyword
 import re
+import struct
 from dataclasses import dataclass
 from numbers import Integral, Real
 from typing import Any
@@ -34,6 +35,7 @@ from .contracts import (
     validate_triton_tvm_contract,
 )
 from .errors import UnsupportedContractError, UnsupportedTargetPolicyError, UnsupportedTTIROpError
+from .indexing import TTIRIndexClassifier, TTIRIndexInfo
 from .op_graph import NormalizedTTIROpGraph, TTIROp, TTIRType
 from .ttir import TTIRInput, normalize_ttir_input
 
@@ -67,9 +69,12 @@ _M35_INDEXED_EXTRA_OPS = frozenset(
         "arith.divf",
         "arith.divsi",
         "arith.extf",
+        "arith.fptosi",
+        "arith.fptoui",
         "arith.ori",
         "arith.remsi",
         "arith.select",
+        "arith.sitofp",
         "arith.truncf",
         "math.absf",
         "math.cos",
@@ -117,6 +122,23 @@ _SUPPORTED_OPS_BY_CONTRACT = {
 _SUPPORTED_OPS_BY_CONTRACT["norm_single_row"] = _SUPPORTED_OPS_BY_CONTRACT[
     "reduction_minimal"
 ]
+_M8_RANK2_OPS = _SUPPORTED_OPS_BY_CONTRACT["reduction_minimal"] | frozenset(
+    {
+        "arith.andi",
+        "arith.cmpf",
+        "arith.divsi",
+        "arith.ori",
+        "arith.remsi",
+        "math.exp",
+        "tt.broadcast",
+        "tt.expand_dims",
+        "tt.extern_elementwise",
+    }
+)
+_SUPPORTED_OPS_BY_CONTRACT["row_reduction"] = _M8_RANK2_OPS
+_SUPPORTED_OPS_BY_CONTRACT["norm_row"] = _M8_RANK2_OPS
+_SUPPORTED_OPS_BY_CONTRACT["softmax_row"] = _M8_RANK2_OPS
+_SUPPORTED_OPS_BY_CONTRACT["masked_softmax_row"] = _M8_RANK2_OPS
 
 _BINARY_OP_SYMBOLS = {
     "arith.addf": "+",
@@ -135,6 +157,9 @@ _BINARY_OP_SYMBOLS = {
 _TRANSLATOR_VERSION = "triton_tvm_python_pre_m5_contracts_v1"
 _CUDA_TARGET_POLICY_VERSION = "cuda_thread_binding_v1"
 _CACHE_POLICY = "disabled"
+_M8_ROW_CONTRACTS = frozenset(
+    {"row_reduction", "norm_row", "softmax_row", "masked_softmax_row"}
+)
 
 
 @dataclass(frozen=True)
@@ -145,12 +170,7 @@ class _ExtentInfo:
     value: int | None = None
 
 
-@dataclass(frozen=True)
-class _IndexInfo:
-    kind: str
-    expr: str
-    extent_expr: str
-    factor: int | None = None
+_NOT_APPLICABLE_REDUCTION_EXTENT = _ExtentInfo(kind="not_applicable", expr="")
 
 
 @dataclass(frozen=True)
@@ -206,9 +226,18 @@ class TritonTVMMeta:
     extent_param: str
     extent_kind: str
     extent_value: int | None
+    reduction_extent_param: str
+    reduction_extent_kind: str
+    reduction_extent_value: int | None
     buffer_extents: dict[str, str]
     block_size: int
     indexing_kind: str
+    execution_kind: str
+    accumulator_dtype_policy: str
+    epsilon_policy: str
+    mask_policy: str
+    axis_policy: str
+    layout_policy: str
     launch_policy_id: str
     abi: list[dict[str, str]]
     cache_policy: str
@@ -242,7 +271,9 @@ def translate_ttir(
     graph, artifact = normalize_ttir_input(ttir_or_graph)
     _validate_supported_subset(graph, canonical_contract)
 
-    if canonical_contract in ("reduction_minimal", "norm_single_row"):
+    if canonical_contract in _M8_ROW_CONTRACTS:
+        builder = _TIRXRank2RowBuilder(graph, target_policy, canonical_contract)
+    elif canonical_contract in ("reduction_minimal", "norm_single_row"):
         builder = _TIRXReductionBuilder(graph, target_policy, grid)
     else:
         builder = _TIRXTemplateBuilder(graph, target_policy, canonical_contract)
@@ -280,9 +311,18 @@ def translate_ttir(
         extent_param=builder.extent_info.param_name,
         extent_kind=builder.extent_info.kind,
         extent_value=builder.extent_info.value,
+        reduction_extent_param=builder.reduction_extent_info.param_name,
+        reduction_extent_kind=builder.reduction_extent_info.kind,
+        reduction_extent_value=builder.reduction_extent_info.value,
         buffer_extents=builder.buffer_extents,
         block_size=builder.block_size,
         indexing_kind=contract_spec.indexing_kind,
+        execution_kind=contract_spec.execution_kind,
+        accumulator_dtype_policy=contract_spec.accumulator_dtype_policy,
+        epsilon_policy=contract_spec.epsilon_policy,
+        mask_policy=contract_spec.mask_policy,
+        axis_policy=contract_spec.axis_policy,
+        layout_policy=contract_spec.layout_policy,
         launch_policy_id=target_policy.launch_policy_id,
         target_attrs=target_policy.target_attrs,
         cache_policy=_CACHE_POLICY,
@@ -309,9 +349,18 @@ def translate_ttir(
         extent_param=builder.extent_info.param_name,
         extent_kind=builder.extent_info.kind,
         extent_value=builder.extent_info.value,
+        reduction_extent_param=builder.reduction_extent_info.param_name,
+        reduction_extent_kind=builder.reduction_extent_info.kind,
+        reduction_extent_value=builder.reduction_extent_info.value,
         buffer_extents=builder.buffer_extents,
         block_size=builder.block_size,
         indexing_kind=contract_spec.indexing_kind,
+        execution_kind=contract_spec.execution_kind,
+        accumulator_dtype_policy=contract_spec.accumulator_dtype_policy,
+        epsilon_policy=contract_spec.epsilon_policy,
+        mask_policy=contract_spec.mask_policy,
+        axis_policy=contract_spec.axis_policy,
+        layout_policy=contract_spec.layout_policy,
         launch_policy_id=target_policy.launch_policy_id,
         abi=abi,
         cache_policy=_CACHE_POLICY,
@@ -342,6 +391,13 @@ class _TIRXTemplateBuilder:
         self.lane_index_ssa = self._find_lane_index_ssa()
         self._validate_flat_mask_policy()
         self.extent_info = self._find_extent_info()
+        self.reduction_extent_info = _NOT_APPLICABLE_REDUCTION_EXTENT
+        self.index_classifier = TTIRIndexClassifier(
+            self.graph,
+            block_size=self.block_size,
+            extent_expr=self.extent_info.expr,
+            lane_index_ssa=self.lane_index_ssa,
+        )
         self.buffer_extents = self._infer_buffer_extents()
         self.safe_no_other_loads = self._prove_safe_masked_loads_without_other()
         self.aliases: dict[str, str] = {}
@@ -353,8 +409,15 @@ class _TIRXTemplateBuilder:
 
         mask_values = self._collect_mask_values()
         mask_defs = [(mask, self.expr(mask)) for mask in mask_values]
+        mask_alias_by_expr: dict[str, str] = {}
         for i, (mask, _) in enumerate(mask_defs):
-            self.aliases[mask] = "mask" if i == 0 else f"mask_{i}"
+            mask_expr = mask_defs[i][1]
+            if mask_expr in mask_alias_by_expr:
+                self.aliases[mask] = mask_alias_by_expr[mask_expr]
+                continue
+            alias = "mask" if not mask_alias_by_expr else f"mask_{len(mask_alias_by_expr)}"
+            mask_alias_by_expr[mask_expr] = alias
+            self.aliases[mask] = alias
 
         lines: list[str] = [
             "# from tvm.script import ir as I",
@@ -393,19 +456,25 @@ class _TIRXTemplateBuilder:
                 f'T.Cast("int64", {self.target_policy.lane_var})',
             ]
         )
+        emitted_mask_aliases: set[str] = set()
         for mask, mask_expr in mask_defs:
-            lines.append(f"                {self.aliases[mask]} = {mask_expr}")
+            alias = self.aliases[mask]
+            if alias in emitted_mask_aliases:
+                continue
+            emitted_mask_aliases.add(alias)
+            lines.append(f"                {alias} = {mask_expr}")
         for store in self.stores:
             store_ptr, store_value = store.operands[0], store.operands[1]
             out_buffer, out_index = self.pointer_ref(store_ptr, allow_store_bitcast=True)
             value_expr = self.store_value_expr(store)
             store_mask = store.operands[2] if len(store.operands) >= 3 else None
-            if store_mask is not None:
-                mask_expr = self.aliases.get(store_mask, self.expr(store_mask))
-                lines.append(f"                if {mask_expr}:")
-                lines.append(f"                    {out_buffer}[{out_index}] = {value_expr}")
-            else:
-                lines.append(f"                {out_buffer}[{out_index}] = {value_expr}")
+            mask_expr = (
+                self.aliases.get(store_mask, self.expr(store_mask))
+                if store_mask is not None
+                else mask_alias_by_expr.get(f"(i < {extent})", f"(i < {extent})")
+            )
+            lines.append(f"                if {mask_expr}:")
+            lines.append(f"                    {out_buffer}[{out_index}] = {value_expr}")
         return "\n".join(lines) + "\n"
 
     def expr(self, value: str) -> str:
@@ -420,7 +489,7 @@ class _TIRXTemplateBuilder:
         if op.name == "arith.constant":
             ty = op.result_types[0] if op.result_types else TTIRType("i64", "int64")
             dtype = ty.dtype
-            if ty.is_tensor and (dtype.startswith("int") or dtype.startswith("uint")):
+            if dtype.startswith("int") or dtype.startswith("uint"):
                 dtype = "int64"
             return _tir_const(op.attrs.get("value", 0), dtype)
         if op.name == "tt.get_program_id":
@@ -431,7 +500,15 @@ class _TIRXTemplateBuilder:
             return self.target_policy.lane_expr(start)
         if op.name == "tt.splat":
             return self.expr(op.operands[0])
-        if op.name in ("arith.extf", "arith.extsi", "arith.extui", "arith.truncf"):
+        if op.name in (
+            "arith.extf",
+            "arith.extsi",
+            "arith.extui",
+            "arith.fptosi",
+            "arith.fptoui",
+            "arith.sitofp",
+            "arith.truncf",
+        ):
             source = self.expr(op.operands[0])
             dtype = op.result_types[0].dtype if op.result_types else "int64"
             if source == "i":
@@ -483,6 +560,7 @@ class _TIRXTemplateBuilder:
             source = self.expr(op.operands[0])
             symbol = _unquote_attr(op.attrs.get("symbol", ""))
             mapping = {
+                "__nv_erff": "erf",
                 "__nv_expf": "exp",
                 "__nv_tanhf": "tanh",
                 "__nv_rsqrtf": "rsqrt",
@@ -493,6 +571,9 @@ class _TIRXTemplateBuilder:
                 )
             return f"T.{mapping[symbol]}({source})"
         if op.name == "tt.load":
+            if len(op.operands) == 1:
+                buffer_name, index = self.pointer_ref(op.operands[0])
+                return f"{buffer_name}[{index}]"
             if len(op.operands) < 3:
                 result = op.results[0] if op.results else value
                 if result not in self.safe_no_other_loads:
@@ -591,8 +672,35 @@ class _TIRXTemplateBuilder:
         return stores
 
     def _find_extent_info(self) -> _ExtentInfo:
+        candidates = self._extent_candidates_from_masks(self._collect_store_mask_values())
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            raise UnsupportedTTIROpError(
+                "ambiguous extent candidates from store mask pattern: "
+                + ", ".join(candidate.expr for candidate in candidates)
+            )
+
+        candidates = self._extent_candidates_from_masks(self._collect_mask_values())
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            raise UnsupportedTTIROpError(
+                "ambiguous extent candidates from mask/index pattern: "
+                + ", ".join(candidate.expr for candidate in candidates)
+            )
+
+        fallback = self._fallback_extent_info()
+        if fallback is not None:
+            return fallback
+        raise UnsupportedTTIROpError(
+            "pointwise contracts require a unique extent from "
+            "the mask/index pattern"
+        )
+
+    def _extent_candidates_from_masks(self, masks: list[str]) -> list[_ExtentInfo]:
         candidates: list[_ExtentInfo] = []
-        for mask in self._collect_mask_values():
+        for mask in masks:
             op = self.defs.get(mask)
             if op is None or op.name != "arith.cmpi" or len(op.operands) != 2:
                 continue
@@ -605,18 +713,26 @@ class _TIRXTemplateBuilder:
                 candidate = self._extent_bound(lhs)
             if candidate is not None and candidate not in candidates:
                 candidates.append(candidate)
+        return candidates
 
-        if len(candidates) == 1:
-            return candidates[0]
-        if not candidates:
-            raise UnsupportedTTIROpError(
-                "pointwise contracts require a unique extent from "
-                "the mask/index pattern"
-            )
-        raise UnsupportedTTIROpError(
-            "ambiguous extent candidates from mask/index pattern: "
-            + ", ".join(candidate.expr for candidate in candidates)
-        )
+    def _fallback_extent_info(self) -> _ExtentInfo | None:
+        scalar_int_params = [
+            param
+            for param in self.scalar_params
+            if param.type.dtype.startswith(("int", "uint"))
+        ]
+        numel_params = [
+            param
+            for param in scalar_int_params
+            if "numel" in param.name or param.name in ("n", "N")
+        ]
+        candidates = numel_params or scalar_int_params
+        if len(candidates) != 1:
+            return None
+        param = candidates[0]
+        name = self.names[param.name]
+        expr = name if param.type.dtype == "int64" else f'T.Cast("int64", {name})'
+        return _ExtentInfo(kind="runtime_param", expr=expr, param_name=param.name)
 
     def _extent_bound(self, value: str) -> _ExtentInfo | None:
         param = self._scalar_splat_param(value)
@@ -648,86 +764,46 @@ class _TIRXTemplateBuilder:
             index_info = self._index_info(op.operands[1])
             previous = inferred.get(base)
             if previous is not None and previous != index_info.extent_expr:
-                raise UnsupportedTTIROpError(
-                    f"ambiguous buffer extent for pointer %{base}: "
-                    f"{previous} vs {index_info.extent_expr}"
-                )
+                merged = f"({previous} + {index_info.extent_expr})"
+                inferred[base] = merged
+                extents[base] = merged
+                continue
             inferred[base] = index_info.extent_expr
             extents[base] = index_info.extent_expr
         return extents
 
-    def _index_info(self, value: str) -> _IndexInfo:
-        if self._is_lane_index_value(value):
-            return _IndexInfo(
-                kind="flat",
-                expr="i",
-                extent_expr=self.extent_info.expr,
-            )
-        op = self.defs.get(value)
-        if op is not None and op.name in ("arith.extsi", "arith.extui") and len(op.operands) == 1:
-            return self._index_info(op.operands[0])
+    def _index_info(self, value: str) -> TTIRIndexInfo:
         if not self._allows_indexed_pointwise_capability():
-            raise UnsupportedTTIROpError("non-contiguous pointer pattern is not supported yet")
-        if op is None or len(op.operands) != 2:
-            raise UnsupportedTTIROpError(
-                "unsupported composed indexing pattern for pointwise_flat"
-            )
-
-        lhs, rhs = op.operands
-        if op.name == "arith.muli":
-            lhs_const = self._positive_constant(lhs)
-            rhs_const = self._positive_constant(rhs)
-            if lhs_const is not None and self._is_lane_index_value(rhs):
-                return self._scaled_index_info(lhs_const)
-            if rhs_const is not None and self._is_lane_index_value(lhs):
-                return self._scaled_index_info(rhs_const)
-        if op.name in ("arith.divsi", "arith.remsi"):
-            constant = self._positive_constant(rhs)
-            if constant is not None and self._is_lane_index_value(lhs):
-                if op.name == "arith.divsi":
-                    return _IndexInfo(
-                        kind="div",
-                        expr=f"(i // T.int64({constant}))",
-                        extent_expr=f"T.ceildiv({self.extent_info.expr}, T.int64({constant}))",
-                        factor=constant,
-                    )
-                return _IndexInfo(
-                    kind="rem",
-                    expr=f"(i % T.int64({constant}))",
-                    extent_expr=f"T.int64({constant})",
-                    factor=constant,
+            if self._is_lane_index_value(value):
+                return TTIRIndexInfo(
+                    kind="flat",
+                    expr="i",
+                    extent_expr=self.extent_info.expr,
+                    summary_expr="i",
                 )
-        raise UnsupportedTTIROpError("unsupported composed indexing pattern for pointwise_flat")
-
-    def _scaled_index_info(self, factor: int) -> _IndexInfo:
-        return _IndexInfo(
-            kind="mul",
-            expr=f"(i * T.int64({factor}))",
-            extent_expr=f"({self.extent_info.expr} * T.int64({factor}))",
-            factor=factor,
-        )
+            raise UnsupportedTTIROpError("non-contiguous pointer pattern is not supported yet")
+        return self.index_classifier.classify(value)
 
     def _prove_safe_masked_loads_without_other(self) -> set[str]:
         loads = [
             op
             for op in self.graph.ops
-            if op.name == "tt.load" and len(op.operands) < 3 and op.results
+            if op.name == "tt.load" and len(op.operands) == 2 and op.results
         ]
         if not loads:
             return set()
         if not self._allows_indexed_pointwise_capability():
             return set()
 
-        masks = self._collect_mask_values()
-        if len(masks) != 1:
+        store_masks = set(self._collect_store_mask_values())
+        if not store_masks:
             raise UnsupportedTTIROpError(
-                "masked tt.load without other requires a single shared memory mask"
+                "masked tt.load without other escapes the guarded store value"
             )
-        shared_mask = masks[0]
         for load in loads:
-            if len(load.operands) < 2 or load.operands[1] != shared_mask:
+            if len(load.operands) < 2 or load.operands[1] not in store_masks:
                 raise UnsupportedTTIROpError(
-                    "masked tt.load without other must use the shared memory mask"
+                    "masked tt.load without other must use a store-dominating mask"
                 )
 
         uses: dict[str, list[tuple[TTIROp, int]]] = {}
@@ -738,6 +814,7 @@ class _TIRXTemplateBuilder:
         safe: set[str] = set()
         for load in loads:
             root = load.results[0]
+            load_mask = load.operands[1]
             seen: set[str] = set()
             stack = [root]
             while stack:
@@ -750,7 +827,7 @@ class _TIRXTemplateBuilder:
                         if (
                             operand_index == 1
                             and len(use_op.operands) >= 3
-                            and use_op.operands[2] == shared_mask
+                            and use_op.operands[2] == load_mask
                         ):
                             continue
                         raise UnsupportedTTIROpError(
@@ -776,12 +853,20 @@ class _TIRXTemplateBuilder:
         return safe
 
     def _validate_flat_mask_policy(self) -> None:
-        masks = self._collect_mask_values()
-        if len(masks) > 1:
-            raise UnsupportedTTIROpError(
-                "pointwise contracts require load/store masks to use the same "
-                "flat extent predicate"
-            )
+        masked_no_other_loads = [
+            op for op in self.graph.ops if op.name == "tt.load" and len(op.operands) == 2
+        ]
+        if not masked_no_other_loads:
+            return
+        store_masks = set(self._collect_store_mask_values())
+        if not store_masks:
+            return
+        for load in masked_no_other_loads:
+            if load.operands[1] not in store_masks:
+                raise UnsupportedTTIROpError(
+                    "masked tt.load without other requires load/store masks to use "
+                    "the same flat extent predicate"
+                )
 
     def _find_lane_index_ssa(self) -> str | None:
         for op in self.graph.ops:
@@ -935,6 +1020,15 @@ class _TIRXTemplateBuilder:
                 masks.append(mask)
         return masks
 
+    def _collect_store_mask_values(self) -> list[str]:
+        masks: list[str] = []
+        for op in self.graph.ops:
+            if op.name == "tt.store" and len(op.operands) >= 3:
+                mask = op.operands[2]
+                if mask not in masks:
+                    masks.append(mask)
+        return masks
+
 
 class _TIRXReductionBuilder:
     def __init__(
@@ -958,6 +1052,7 @@ class _TIRXReductionBuilder:
         self._validate_reductions()
         self._validate_memory_masks()
         self.extent_info = self._find_extent_info()
+        self.reduction_extent_info = self.extent_info
         self.buffer_extents = self._infer_buffer_extents()
         self.reduction_aliases: dict[str, str] = {}
 
@@ -1043,7 +1138,7 @@ class _TIRXReductionBuilder:
         if op.name == "arith.constant":
             ty = op.result_types[0] if op.result_types else TTIRType("i64", "int64")
             dtype = ty.dtype
-            if ty.is_tensor and (dtype.startswith("int") or dtype.startswith("uint")):
+            if dtype.startswith("int") or dtype.startswith("uint"):
                 dtype = "int64"
             return _tir_const(op.attrs.get("value", 0), dtype)
         if op.name == "tt.get_program_id":
@@ -1436,6 +1531,489 @@ class _TIRXReductionBuilder:
         raise UnsupportedTTIROpError(f"Cannot infer dtype for %{value}")
 
 
+class _TIRXRank2RowBuilder:
+    def __init__(
+        self,
+        graph: NormalizedTTIROpGraph,
+        target_policy: _PointwiseTargetPolicy,
+        contract: str,
+    ):
+        self.graph = graph
+        self.target_policy = target_policy
+        self.contract = contract
+        self.defs = graph.op_by_result()
+        self.params = graph.param_by_name()
+        self.names = {param.name: _sanitize_identifier(param.name) for param in graph.params}
+        self.ptr_params = [param for param in graph.params if param.type.is_pointer]
+        self.scalar_params = [param for param in graph.params if not param.type.is_pointer]
+        self.x_range, self.r_range = self._find_axis_ranges()
+        self.block_size = self._range_extent(self.x_range)
+        self.r_block_size = self._range_extent(self.r_range)
+        self.reductions = self._find_reductions()
+        self._validate_reductions()
+        self.stores = self._find_stores()
+        self.extent_info = self._find_x_extent_info()
+        self.r_extent_info = self._find_r_extent_info()
+        self.reduction_extent_info = self.r_extent_info
+        self.buffer_extents = self._infer_buffer_extents()
+        self.reduction_aliases: dict[str, str] = {}
+
+    def build_source(self) -> str:
+        extent = self.extent_info.expr
+        red_index = 'T.Cast("int64", tx)'
+        lines: list[str] = [
+            "# from tvm.script import ir as I",
+            "# from tvm.script import tirx as T",
+            "",
+            "@I.ir_module",
+            "class Module:",
+            "    @T.prim_func",
+            f"    def {_sanitize_identifier(self.graph.function_name)}({self._param_signature()}):",
+            "        T.func_attr({"
+            f'"global_symbol": "{self.graph.function_name}", '
+            '"tirx.noalias": True, '
+            f'"target": T.target({self.target_policy.target_attrs!r})'
+            "})",
+        ]
+        for param in self.ptr_params:
+            name = self.names[param.name]
+            buffer_extent = self.buffer_extents.get(param.name, self._default_buffer_extent())
+            lines.append(
+                "        "
+                f'{name} = T.match_buffer({name}_handle, ({buffer_extent},), '
+                f'"{param.type.dtype}")'
+            )
+        for i, reduce_op in enumerate(self.reductions):
+            dtype = self._value_dtype(reduce_op.results[0])
+            lines.append(
+                f'        red_{i} = T.alloc_buffer(({self.block_size},), "{dtype}", scope="local")'
+            )
+
+        lines.extend(
+            [
+                "        "
+                f"for {self.target_policy.block_var} in T.thread_binding("
+                f"0, T.ceildiv({extent}, T.int64({self.block_size})), "
+                f'thread="{self.target_policy.block_thread_tag}"):',
+                "            "
+                f"for {self.target_policy.lane_var} in T.thread_binding(0, {self.block_size}, "
+                f'thread="{self.target_policy.lane_thread_tag}"):',
+                "                txi = T.Cast(\"int64\", "
+                f"{self.target_policy.lane_var})",
+                "                row_i = "
+                f"T.Cast(\"int64\", {self.target_policy.block_var}) * "
+                f"T.int64({self.block_size}) + txi",
+                f"                if row_i < {extent}:",
+            ]
+        )
+
+        for i, reduce_op in enumerate(self.reductions):
+            acc = f"red_{i}"
+            kind = self._reduction_kind(reduce_op)
+            dtype = self._value_dtype(reduce_op.results[0])
+            identity = self._reduction_identity(kind, dtype)
+            lines.append(f"                    {acc}[{red_index}] = {identity}")
+            lines.append(f"                    for rk in T.serial(0, {self.r_block_size}):")
+            lines.append('                        r = T.Cast("int64", rk)')
+            value_expr = self.expr(reduce_op.operands[0], r_var="r")
+            update = self._reduction_update(kind, f"{acc}[{red_index}]", value_expr)
+            lines.append(f"                        {acc}[{red_index}] = {update}")
+            self.reduction_aliases[reduce_op.results[0]] = f"{acc}[{red_index}]"
+
+        for store in self.stores:
+            store_r_extent = self._store_r_loop_extent(store)
+            store_ptr = store.operands[0]
+            store_value = store.operands[1]
+            store_mask = store.operands[2] if len(store.operands) >= 3 else None
+            if store_r_extent > 1:
+                lines.append(f"                    for sk in T.serial(0, {store_r_extent}):")
+                lines.append('                        r = T.Cast("int64", sk)')
+                out_buffer, out_index = self.pointer_ref(store_ptr, r_var="r")
+                value_expr = self.expr(store_value, r_var="r")
+                mask_expr = self.expr(store_mask, r_var="r") if store_mask is not None else "True"
+                lines.append(f"                        if {mask_expr}:")
+                lines.append(f"                            {out_buffer}[{out_index}] = {value_expr}")
+            else:
+                lines.append("                    r = T.int64(0)")
+                out_buffer, out_index = self.pointer_ref(store_ptr, r_var="r")
+                value_expr = self.expr(store_value, r_var="r")
+                mask_expr = self.expr(store_mask, r_var="r") if store_mask is not None else "True"
+                lines.append(f"                    if {mask_expr}:")
+                lines.append(f"                        {out_buffer}[{out_index}] = {value_expr}")
+        return "\n".join(lines) + "\n"
+
+    def expr(self, value: str, *, r_var: str) -> str:
+        if value in self.reduction_aliases:
+            return self.reduction_aliases[value]
+        if value in self.params and not self.params[value].type.is_pointer:
+            dtype = self.params[value].type.dtype
+            name = self.names[value]
+            if dtype.startswith(("int", "uint")) and dtype != "int64":
+                return f'T.Cast("int64", {name})'
+            return name
+        if value not in self.defs:
+            raise UnsupportedTTIROpError(f"Cannot resolve TTIR value %{value}")
+
+        op = self.defs[value]
+        if op.name == "arith.constant":
+            ty = op.result_types[0] if op.result_types else TTIRType("i64", "int64")
+            dtype = ty.dtype
+            if dtype.startswith("int") or dtype.startswith("uint"):
+                dtype = "int64"
+            return _tir_const(op.attrs.get("value", 0), dtype)
+        if op.name == "tt.get_program_id":
+            if op.attrs.get("axis") != "x":
+                raise UnsupportedTTIROpError(f"{self.contract} only supports program_id axis x")
+            return f'T.Cast("int64", {self.target_policy.block_var})'
+        if op.name == "tt.make_range":
+            if value == self.r_range and self.x_range != self.r_range:
+                return r_var
+            return 'T.Cast("int64", tx)'
+        if op.name == "tt.expand_dims":
+            axis = op.attrs.get("axis")
+            source = op.operands[0]
+            if self._is_make_range_value(source):
+                if axis == 0:
+                    return r_var
+                if axis == 1:
+                    return 'T.Cast("int64", tx)'
+            return self.expr(source, r_var=r_var)
+        if op.name in ("tt.broadcast", "tt.splat"):
+            return self.expr(op.operands[0], r_var=r_var)
+        if op.name in (
+            "arith.extf",
+            "arith.extsi",
+            "arith.extui",
+            "arith.fptosi",
+            "arith.fptoui",
+            "arith.sitofp",
+            "arith.truncf",
+        ):
+            source = self.expr(op.operands[0], r_var=r_var)
+            dtype = op.result_types[0].dtype if op.result_types else "int64"
+            return f'T.Cast("{dtype}", {source})'
+        if op.name in _BINARY_OP_SYMBOLS:
+            lhs = self.expr(op.operands[0], r_var=r_var)
+            rhs = self.expr(op.operands[1], r_var=r_var)
+            symbol = _BINARY_OP_SYMBOLS[op.name]
+            return f"({lhs} {symbol} {rhs})"
+        if op.name == "arith.cmpi":
+            lhs = self.expr(op.operands[0], r_var=r_var)
+            rhs = self.expr(op.operands[1], r_var=r_var)
+            symbol = _cmp_symbol(op.attrs.get("predicate", ""))
+            return f"({lhs} {symbol} {rhs})"
+        if op.name == "arith.cmpf":
+            lhs = self.expr(op.operands[0], r_var=r_var)
+            rhs = self.expr(op.operands[1], r_var=r_var)
+            symbol = _cmpf_symbol(op.attrs.get("predicate", ""))
+            return f"({lhs} {symbol} {rhs})"
+        if op.name == "arith.select":
+            cond = self.expr(op.operands[0], r_var=r_var)
+            true_value = self.expr(op.operands[1], r_var=r_var)
+            false_value = self.expr(op.operands[2], r_var=r_var)
+            return f"T.Select({cond}, {true_value}, {false_value})"
+        if op.name in ("math.exp", "math.rsqrt"):
+            source = self.expr(op.operands[0], r_var=r_var)
+            tir_op = {"math.exp": "exp", "math.rsqrt": "rsqrt"}[op.name]
+            return f"T.{tir_op}({source})"
+        if op.name == "tt.extern_elementwise":
+            source = self.expr(op.operands[0], r_var=r_var)
+            symbol = _unquote_attr(op.attrs.get("symbol", ""))
+            mapping = {
+                "__nv_expf": "exp",
+                "__nv_rsqrtf": "rsqrt",
+                "__nv_erff": "erf",
+            }
+            if symbol not in mapping:
+                raise UnsupportedTTIROpError(
+                    f"tt.extern_elementwise symbol {symbol!r} is not supported by {self.contract}"
+                )
+            return f"T.{mapping[symbol]}({source})"
+        if op.name == "tt.load":
+            buffer_name, index = self.pointer_ref(op.operands[0], r_var=r_var)
+            if len(op.operands) < 3:
+                return f"{buffer_name}[{index}]"
+            mask = self.expr(op.operands[1], r_var=r_var)
+            other = self.expr(op.operands[2], r_var=r_var)
+            return f"T.if_then_else({mask}, {buffer_name}[{index}], {other})"
+        if op.name == "tt.reduce":
+            if value not in self.reduction_aliases:
+                raise UnsupportedTTIROpError(
+                    "tt.reduce result is used before its accumulator is emitted"
+                )
+            return self.reduction_aliases[value]
+
+        raise UnsupportedTTIROpError(f"{op.name} is not supported by {self.contract}")
+
+    def pointer_ref(self, value: str, *, r_var: str) -> tuple[str, str]:
+        if value in self.params and self.params[value].type.is_pointer:
+            return self.names[value], "T.int64(0)"
+        if value not in self.defs:
+            raise UnsupportedTTIROpError(f"Cannot resolve TTIR pointer %{value}")
+        op = self.defs[value]
+        if op.name in ("tt.splat", "tt.broadcast", "tt.expand_dims"):
+            return self.pointer_ref(op.operands[0], r_var=r_var)
+        if op.name == "tt.addptr":
+            base, base_index = self.pointer_ref(op.operands[0], r_var=r_var)
+            offset = self.expr(op.operands[1], r_var=r_var)
+            if base_index == "T.int64(0)":
+                return base, offset
+            return base, f"({base_index} + {offset})"
+        raise UnsupportedTTIROpError(f"{op.name} cannot be used as a rank-2 pointer")
+
+    def _param_signature(self) -> str:
+        items: list[str] = []
+        for param in self.graph.params:
+            name = self.names[param.name]
+            if param.type.is_pointer:
+                items.append(f"{name}_handle: T.handle")
+            else:
+                items.append(f"{name}: T.{param.type.dtype}")
+        return ", ".join(items)
+
+    def _find_axis_ranges(self) -> tuple[str, str]:
+        ranges = [op for op in self.graph.ops if op.name == "tt.make_range" and op.results]
+        if not ranges:
+            raise UnsupportedTTIROpError(f"{self.contract} requires tt.make_range")
+        x_candidates: list[str] = []
+        r_candidates: list[str] = []
+        for range_op in ranges:
+            value = range_op.results[0]
+            for user in self.graph.ops:
+                if user.name != "tt.expand_dims" or not user.operands or user.operands[0] != value:
+                    continue
+                if user.attrs.get("axis") == 1:
+                    x_candidates.append(value)
+                elif user.attrs.get("axis") == 0:
+                    r_candidates.append(value)
+            if value.startswith("x"):
+                x_candidates.append(value)
+            if value.startswith(("r", "r0")):
+                r_candidates.append(value)
+        x_range = x_candidates[0] if x_candidates else ""
+        r_range = r_candidates[0] if r_candidates else (ranges[-1].results[0])
+        return x_range, r_range
+
+    def _range_extent(self, value: str) -> int:
+        if not value:
+            return 1
+        op = self.defs.get(value)
+        if op is None or op.name != "tt.make_range":
+            raise UnsupportedTTIROpError(f"Cannot resolve rank-2 range %{value}")
+        start = int(op.attrs.get("start", 0))
+        end = int(op.attrs.get("end", 0))
+        if end <= start:
+            raise UnsupportedTTIROpError("tt.make_range must have positive extent")
+        if start != 0:
+            raise UnsupportedTTIROpError(f"{self.contract} requires zero-based ranges")
+        return end - start
+
+    def _find_reductions(self) -> list[TTIROp]:
+        reductions = [op for op in self.graph.ops if op.name == "tt.reduce"]
+        if not reductions:
+            raise UnsupportedTTIROpError(f"{self.contract} requires at least one tt.reduce")
+        return reductions
+
+    def _find_stores(self) -> list[TTIROp]:
+        stores = [op for op in self.graph.ops if op.name == "tt.store"]
+        if not stores:
+            raise UnsupportedTTIROpError(f"{self.contract} requires at least one tt.store")
+        for store in stores:
+            if len(store.operands) < 2:
+                raise UnsupportedTTIROpError("tt.store requires pointer and value operands")
+        return stores
+
+    def _validate_reductions(self) -> None:
+        for op in self.reductions:
+            if op.attrs.get("axis") != 1:
+                raise UnsupportedTTIROpError(f"{self.contract} only supports tt.reduce axis=1")
+            if len(op.operands) != 1 or len(op.results) != 1:
+                raise UnsupportedTTIROpError(f"{self.contract} only supports single-input tt.reduce")
+            if len(op.regions) != 1:
+                raise UnsupportedTTIROpError(f"{self.contract} requires one tt.reduce region")
+            self._reduction_kind(op)
+
+    def _reduction_kind(self, op: TTIROp) -> str:
+        region = op.regions[0]
+        combine_ops = [region_op for region_op in region if region_op.name != "tt.reduce.return"]
+        returns = [region_op for region_op in region if region_op.name == "tt.reduce.return"]
+        if len(returns) != 1:
+            raise UnsupportedTTIROpError(f"{self.contract} requires one tt.reduce.return")
+        if len(combine_ops) == 1 and combine_ops[0].name in ("arith.addf", "arith.addi"):
+            combine = combine_ops[0]
+            if combine.results and returns[0].operands == combine.results[:1]:
+                return "sum"
+        if any(region_op.name == "arith.select" for region_op in combine_ops) and any(
+            region_op.name == "arith.cmpf" for region_op in combine_ops
+        ):
+            return "max"
+        raise UnsupportedTTIROpError(f"{self.contract} only supports sum and max reductions")
+
+    def _reduction_identity(self, kind: str, dtype: str) -> str:
+        if kind == "sum":
+            return _tir_const(0, dtype)
+        if kind == "max":
+            return f'T.min_value("{dtype}")'
+        raise UnsupportedTTIROpError(f"unsupported reduction kind {kind!r}")
+
+    def _reduction_update(self, kind: str, acc: str, value: str) -> str:
+        if kind == "sum":
+            return f"({acc} + {value})"
+        if kind == "max":
+            return f"T.max({acc}, {value})"
+        raise UnsupportedTTIROpError(f"unsupported reduction kind {kind!r}")
+
+    def _find_x_extent_info(self) -> _ExtentInfo:
+        for op in self.graph.ops:
+            if op.name != "arith.cmpi" or len(op.operands) != 2:
+                continue
+            shape = self._value_shape(op.results[0]) if op.results else ()
+            if not self._is_x_mask_shape(shape):
+                continue
+            lhs, rhs = op.operands
+            predicate = op.attrs.get("predicate", "")
+            if predicate in ("slt", "ult", "sle", "ule"):
+                candidate = self._extent_bound(rhs)
+            elif predicate in ("sgt", "ugt", "sge", "uge"):
+                candidate = self._extent_bound(lhs)
+            else:
+                candidate = None
+            if candidate is not None:
+                return candidate
+        return _ExtentInfo(kind="constant", expr=f"T.int64({self.block_size})", value=self.block_size)
+
+    def _find_r_extent_info(self) -> _ExtentInfo:
+        for op in self.graph.ops:
+            if op.name != "arith.cmpi" or len(op.operands) != 2:
+                continue
+            shape = self._value_shape(op.results[0]) if op.results else ()
+            if not self._is_r_mask_shape(shape):
+                continue
+            lhs, rhs = op.operands
+            predicate = op.attrs.get("predicate", "")
+            if predicate in ("slt", "ult", "sle", "ule"):
+                candidate = self._extent_bound(rhs)
+            elif predicate in ("sgt", "ugt", "sge", "uge"):
+                candidate = self._extent_bound(lhs)
+            else:
+                candidate = None
+            if candidate is not None:
+                return candidate
+        return _ExtentInfo(
+            kind="constant",
+            expr=f"T.int64({self.r_block_size})",
+            value=self.r_block_size,
+        )
+
+    def _extent_bound(self, value: str) -> _ExtentInfo | None:
+        param = self._scalar_splat_param(value)
+        if param is not None:
+            dtype = self.params[param].type.dtype
+            name = self.names[param]
+            expr = name if dtype == "int64" else f'T.Cast("int64", {name})'
+            return _ExtentInfo(kind="runtime_param", expr=expr, param_name=param)
+        constant = self._constant_int_value(value)
+        if constant is not None:
+            if constant <= 0:
+                raise UnsupportedTTIROpError("rank-2 row extent constant must be positive")
+            return _ExtentInfo(kind="constant", expr=f"T.int64({constant})", value=constant)
+        return None
+
+    def _infer_buffer_extents(self) -> dict[str, str]:
+        default = self._default_buffer_extent()
+        extents = {param.name: default for param in self.ptr_params}
+        for store in self.stores:
+            base = self._base_pointer_param(store.operands[0])
+            if base is None:
+                continue
+            shape = self._value_shape(store.operands[0])
+            if len(shape) >= 2 and shape[1] == 1:
+                extents[base] = self.extent_info.expr
+        return extents
+
+    def _default_buffer_extent(self) -> str:
+        return f"({self.extent_info.expr} * {self._physical_r_extent_expr()})"
+
+    def _physical_r_extent_expr(self) -> str:
+        if self.r_extent_info.kind == "constant" and self.r_extent_info.value is not None:
+            return f"T.int64({max(self.r_extent_info.value, self.r_block_size)})"
+        return self.r_extent_info.expr
+
+    def _store_r_loop_extent(self, store: TTIROp) -> int:
+        shape = self._value_shape(store.operands[0])
+        if len(shape) >= 2:
+            return max(1, int(shape[1]))
+        return 1
+
+    def _value_shape(self, value: str) -> tuple[int, ...]:
+        if value in self.params:
+            return self.params[value].type.shape
+        op = self.defs.get(value)
+        if op is not None and op.result_types:
+            return op.result_types[0].shape
+        return ()
+
+    def _value_dtype(self, value: str) -> str:
+        if value in self.params:
+            return self.params[value].type.dtype
+        op = self.defs.get(value)
+        if op is not None and op.result_types:
+            return op.result_types[0].dtype
+        raise UnsupportedTTIROpError(f"Cannot infer dtype for %{value}")
+
+    def _is_x_mask_shape(self, shape: tuple[int, ...]) -> bool:
+        if not shape:
+            return True
+        if len(shape) == 1:
+            return shape[0] == self.block_size
+        return len(shape) == 2 and shape[0] == self.block_size and shape[1] == 1
+
+    def _is_r_mask_shape(self, shape: tuple[int, ...]) -> bool:
+        return len(shape) == 2 and shape[0] == 1 and shape[1] == self.r_block_size
+
+    def _scalar_splat_param(self, value: str) -> str | None:
+        if value in self.params and not self.params[value].type.is_pointer:
+            return value
+        op = self.defs.get(value)
+        if op is None or op.name != "tt.splat" or len(op.operands) != 1:
+            return None
+        source = op.operands[0]
+        if source in self.params and not self.params[source].type.is_pointer:
+            return source
+        return None
+
+    def _constant_int_value(self, value: str) -> int | None:
+        op = self.defs.get(value)
+        if op is None:
+            return None
+        if op.name in ("tt.splat", "tt.broadcast", "tt.expand_dims") and len(op.operands) == 1:
+            return self._constant_int_value(op.operands[0])
+        if op.name != "arith.constant":
+            return None
+        constant = op.attrs.get("value")
+        if isinstance(constant, bool):
+            return None
+        if isinstance(constant, int):
+            return constant
+        if isinstance(constant, float) and constant.is_integer():
+            return int(constant)
+        return None
+
+    def _is_make_range_value(self, value: str) -> bool:
+        op = self.defs.get(value)
+        return op is not None and op.name == "tt.make_range"
+
+    def _base_pointer_param(self, value: str) -> str | None:
+        if value in self.params and self.params[value].type.is_pointer:
+            return value
+        op = self.defs.get(value)
+        if op is None or not op.operands:
+            return None
+        if op.name in ("tt.addptr", "tt.splat", "tt.broadcast", "tt.expand_dims"):
+            return self._base_pointer_param(op.operands[0])
+        return None
+
+
 def _validate_supported_subset(graph: NormalizedTTIROpGraph, contract: str) -> None:
     supported_ops = _SUPPORTED_OPS_BY_CONTRACT.get(contract)
     if supported_ops is None:
@@ -1449,6 +2027,8 @@ def _validate_supported_subset(graph: NormalizedTTIROpGraph, contract: str) -> N
             raise UnsupportedTTIROpError(f"{op.name} is not supported by contract {contract!r}")
         if op.name == "tt.load" and len(op.operands) < 3:
             if contract in ("reduction_minimal", "norm_single_row") and len(op.operands) == 1:
+                continue
+            if contract in _M8_ROW_CONTRACTS and len(op.operands) in (1, 2):
                 continue
             if contract != "pointwise_flat":
                 raise UnsupportedTTIROpError(
@@ -1561,6 +2141,10 @@ def _pointwise_target_policy(target) -> _PointwiseTargetPolicy:
                     "pointwise_flat",
                     "reduction_minimal",
                     "norm_single_row",
+                    "row_reduction",
+                    "norm_row",
+                    "softmax_row",
+                    "masked_softmax_row",
                 }
             ),
             block_var="bx",
@@ -1604,6 +2188,12 @@ def _tir_const(value: Any, dtype: str) -> str:
     if dtype == "bool":
         return "True" if bool(value) else "False"
     if dtype.startswith("float") or dtype == "bfloat16":
+        if isinstance(value, int) and dtype == "float32":
+            value = struct.unpack("!f", int(value).to_bytes(4, "big", signed=False))[0]
+        if value == float("-inf"):
+            return f'T.min_value("{dtype}")'
+        if value == float("inf"):
+            return f'T.max_value("{dtype}")'
         return f"T.{dtype}({float(value)!r})"
     if dtype.startswith("int") or dtype.startswith("uint"):
         return f"T.{dtype}({int(value)})"

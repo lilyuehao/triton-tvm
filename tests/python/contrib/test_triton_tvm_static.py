@@ -30,6 +30,7 @@ from tvm.contrib.triton_tvm import (
     UnsupportedTTIROpError,
     UnsupportedTargetPolicyError,
     ValidateTritonKernelTIR,
+    get_triton_tvm_contract,
     translate_ttir,
     validate_cuda_minimal_contract,
     validate_cuda_pointwise_flat_contract,
@@ -38,6 +39,7 @@ from tvm.contrib.triton_tvm import (
     validate_reduction_minimal_contract,
     validate_triton_tvm_contract,
 )
+from tvm.contrib.triton_tvm.indexing import summarize_ttir_indexing
 from tvm.contrib.triton_tvm.ttir import TTIRReader
 
 
@@ -201,6 +203,69 @@ module {
     %out_i8 = tt.bitcast %out_ptr : tensor<64x!tt.ptr<i1>> -> tensor<64x!tt.ptr<i8>>
     %mask_i8 = arith.extui %mask : tensor<64xi1> to tensor<64xi8>
     tt.store %out_i8, %mask_i8, %mask : tensor<64x!tt.ptr<i8>>
+    tt.return
+  }
+}
+"""
+
+
+_STATIC_M7_COMPOSED_INDEX_TTIR = """
+module {
+  tt.func @_m7_composed_index(%x:!tt.ptr<f32>,%y:!tt.ptr<f32>,%out:!tt.ptr<f32>,%n:i64) {
+    %zero = arith.constant dense<0.000000e+00> : tensor<64xf32>
+    %c16 = arith.constant dense<16> : tensor<64xi32>
+    %c32 = arith.constant dense<32> : tensor<64xi32>
+    %c64_i32 = arith.constant 64 : i32
+    %pid = tt.get_program_id x : i32
+    %offsets = arith.muli %pid, %c64_i32 : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+    %s_offsets = tt.splat %offsets : i32 -> tensor<64xi32>
+    %idx = arith.addi %s_offsets, %range : tensor<64xi32>
+    %idx64 = arith.extsi %idx : tensor<64xi32> to tensor<64xi64>
+    %n_splat = tt.splat %n : i64 -> tensor<64xi64>
+    %mask = arith.cmpi slt, %idx64, %n_splat : tensor<64xi64>
+    %row = arith.divsi %idx, %c16 : tensor<64xi32>
+    %col = arith.remsi %idx, %c16 : tensor<64xi32>
+    %row_stride = arith.muli %row, %c32 : tensor<64xi32>
+    %yidx = arith.addi %row_stride, %col : tensor<64xi32>
+    %x_splat = tt.splat %x : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %x_ptr = tt.addptr %x_splat, %idx : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    %vx = tt.load %x_ptr, %mask, %zero : tensor<64x!tt.ptr<f32>>
+    %y_splat = tt.splat %y : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %y_ptr = tt.addptr %y_splat, %yidx : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    %vy = tt.load %y_ptr, %mask, %zero : tensor<64x!tt.ptr<f32>>
+    %sum = arith.addf %vx, %vy : tensor<64xf32>
+    %out_splat = tt.splat %out : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %out_ptr = tt.addptr %out_splat, %idx : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    tt.store %out_ptr, %sum, %mask : tensor<64x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
+
+_STATIC_M7_CAST_ERF_TTIR = """
+module {
+  tt.func @_m7_cast_erf(%x:!tt.ptr<f32>,%out:!tt.ptr<f32>,%n:i64) {
+    %zero = arith.constant dense<0.000000e+00> : tensor<64xf32>
+    %c64_i32 = arith.constant 64 : i32
+    %pid = tt.get_program_id x : i32
+    %offsets = arith.muli %pid, %c64_i32 : i32
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+    %s_offsets = tt.splat %offsets : i32 -> tensor<64xi32>
+    %idx = arith.addi %s_offsets, %range : tensor<64xi32>
+    %idx64 = arith.extsi %idx : tensor<64xi32> to tensor<64xi64>
+    %n_splat = tt.splat %n : i64 -> tensor<64xi64>
+    %mask = arith.cmpi slt, %idx64, %n_splat : tensor<64xi64>
+    %idxf = arith.sitofp %idx : tensor<64xi32> to tensor<64xf32>
+    %idxi = arith.fptosi %idxf : tensor<64xf32> to tensor<64xi32>
+    %x_splat = tt.splat %x : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %x_ptr = tt.addptr %x_splat, %idxi : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    %vx = tt.load %x_ptr, %mask, %zero : tensor<64x!tt.ptr<f32>>
+    %erf = tt.extern_elementwise %vx {libname = "", libpath = "", pure = true, symbol = "__nv_erff"} : (tensor<64xf32>) -> tensor<64xf32>
+    %out_splat = tt.splat %out : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %out_ptr = tt.addptr %out_splat, %idx : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    tt.store %out_ptr, %erf, %mask : tensor<64x!tt.ptr<f32>>
     tt.return
   }
 }
@@ -383,10 +448,14 @@ def test_static_pre_m5_public_api_freeze():
         "lower_to_ttir",
         "normalize_triton_tvm_contract",
         "translate_ttir",
+        "validate_masked_softmax_row_contract",
         "validate_norm_single_row_contract",
+        "validate_norm_row_contract",
         "validate_pointwise_flat_contract",
         "validate_pointwise_minimal_contract",
         "validate_reduction_minimal_contract",
+        "validate_row_reduction_contract",
+        "validate_softmax_row_contract",
         "validate_triton_tvm_contract",
     }
     assert "TTIRReader" not in triton_tvm_pkg.__all__
@@ -471,6 +540,12 @@ def test_static_m4_reduction_minimal_contract_without_cuda_runtime():
     assert meta.contract == "reduction_minimal"
     assert meta.contract_version == "reduction_minimal_v1"
     assert meta.indexing_kind == "block_reduction"
+    assert meta.execution_kind == "serial_m4_single_lane"
+    assert meta.accumulator_dtype_policy == "preserve_ttir_reduction_dtype"
+    assert meta.epsilon_policy == "not_applicable"
+    assert meta.mask_policy == "masked_reduction_loads_require_zero_other"
+    assert meta.axis_policy == "axis_0_only"
+    assert meta.layout_policy == "row_major_only"
     assert meta.extent_param == "n"
     assert meta.block_size == 64
     assert meta.buffer_extents == {
@@ -495,9 +570,29 @@ def test_static_pre_m5_norm_single_row_contract_without_cuda_runtime():
     assert meta.contract == "norm_single_row"
     assert meta.contract_version == "norm_single_row_v1"
     assert meta.indexing_kind == "single_row_norm"
+    assert meta.execution_kind == "serial_m4_single_lane"
+    assert meta.epsilon_policy == "runtime_and_constexpr_eps_supported"
+    assert meta.layout_policy == "single_row_row_major"
 
     with pytest.raises(UnsupportedTTIROpError, match="requires at least one tt.reduce"):
         translate_ttir(_STATIC_DUAL_STORE_TTIR, grid=(1,), contract="norm_single_row")
+
+
+def test_static_pre_m8_reduction_and_norm_contract_policy_metadata():
+    reduction = get_triton_tvm_contract("reduction_minimal")
+    norm = get_triton_tvm_contract("norm_single_row")
+
+    assert reduction.execution_kind == "serial_m4_single_lane"
+    assert reduction.accumulator_dtype_policy == "preserve_ttir_reduction_dtype"
+    assert reduction.mask_policy == "masked_reduction_loads_require_zero_other"
+    assert reduction.axis_policy == "axis_0_only"
+    assert reduction.layout_policy == "row_major_only"
+
+    assert norm.execution_kind == "serial_m4_single_lane"
+    assert norm.accumulator_dtype_policy == "preserve_ttir_reduction_dtype"
+    assert norm.epsilon_policy == "runtime_and_constexpr_eps_supported"
+    assert norm.axis_policy == "axis_0_only"
+    assert norm.layout_policy == "single_row_row_major"
 
 
 def test_static_m25_tirscript_golden_shape():
@@ -671,6 +766,42 @@ def test_static_pre_m5_pointwise_flat_accepts_indexed_capability_surface():
     assert bool_meta.abi[0] == {"name": "out", "kind": "pointer", "dtype": "bool"}
 
 
+def test_static_m7_composed_index_classifier_without_cuda_runtime():
+    graph = TTIRReader().read(_STATIC_M7_COMPOSED_INDEX_TTIR)
+    summary = summarize_ttir_indexing(graph)
+    assert summary["classifier_version"] == 1
+    assert summary["unsupported_index_count"] == 0
+    assert "affine" in " ".join(summary["index_kinds"])
+
+    irmod, meta = translate_ttir(
+        graph,
+        grid=(1,),
+        contract="pointwise_flat",
+    )
+    validate_pointwise_flat_contract(irmod)
+    script = irmod.script()
+    assert meta.buffer_extents["y"].startswith("((T.ceildiv(n, T.int64(16))")
+    assert "i // T.int64(16)" in script
+    assert "i % T.int64(16)" in script
+
+
+def test_static_m7_dtype_cast_and_erf_activation_without_cuda_runtime():
+    graph = TTIRReader().read(_STATIC_M7_CAST_ERF_TTIR)
+    assert "arith.sitofp" in [op.name for op in graph.ops]
+    assert "arith.fptosi" in [op.name for op in graph.ops]
+
+    irmod, meta = translate_ttir(
+        graph,
+        grid=(1,),
+        contract="pointwise_flat",
+    )
+    validate_pointwise_flat_contract(irmod)
+    script = irmod.script()
+    assert meta.contract == "pointwise_flat"
+    assert "T.erf" in script
+    assert 'T.Cast("int32"' in script
+
+
 def test_static_pre_m5_pointwise_flat_validator_rejects_shape_only_matches():
     irmod, _ = translate_ttir(
         _STATIC_M35_INDEXED_TTIR,
@@ -695,8 +826,8 @@ def test_static_pre_m5_pointwise_flat_validator_rejects_shape_only_matches():
     with pytest.raises(TritonTVMContractError, match="BufferLoad"):
         validate_pointwise_flat_contract(_tirx_from_source(leaked_load))
 
-    unsupported_index = script.replace("y[i % T.int64(16)]", "y[i + T.int64(1)]", 1)
-    with pytest.raises(TritonTVMContractError, match="buffer indices"):
+    unsupported_index = script.replace("y[i % T.int64(16)]", "y[i * T.int64(-1)]", 1)
+    with pytest.raises(TritonTVMContractError, match="classified M7"):
         validate_pointwise_flat_contract(_tirx_from_source(unsupported_index))
 
     different_guard = script.replace(
@@ -729,6 +860,50 @@ def test_static_pre_m5_unsafe_masked_load_without_other_rejected():
     )
     with pytest.raises(UnsupportedTTIROpError, match="unsupported tt.bitcast"):
         translate_ttir(bitcast_load, grid=(1,), contract="pointwise_flat")
+
+
+def test_static_m75_no_other_load_cannot_escape_through_masks_or_return():
+    returned_load = _STATIC_M35_INDEXED_TTIR.replace(
+        "tt.return",
+        "tt.return %vx : tensor<64xf32>",
+        1,
+    )
+    with pytest.raises(UnsupportedTTIROpError, match="cannot escape through tt.return"):
+        translate_ttir(returned_load, grid=(1,), contract="pointwise_flat")
+
+    load_derived_store_mask = _STATIC_M35_INDEXED_TTIR.replace(
+        "%sum = arith.addf %relu, %vy : tensor<64xf32>\n"
+        "    %out_splat = tt.splat %out : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>",
+        "%sum = arith.addf %relu, %vy : tensor<64xf32>\n"
+        "    %load_mask = arith.cmpf ogt, %vx, %cst : tensor<64xf32>\n"
+        "    %out_splat = tt.splat %out : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>",
+        1,
+    ).replace(
+        "tt.store %out_ptr, %sum, %mask :",
+        "tt.store %out_ptr, %sum, %load_mask :",
+        1,
+    )
+    with pytest.raises(UnsupportedTTIROpError, match="same flat extent predicate"):
+        translate_ttir(load_derived_store_mask, grid=(1,), contract="pointwise_flat")
+
+
+def test_static_m75_stride_misclassification_negative_cases():
+    negative_stride = _STATIC_M7_COMPOSED_INDEX_TTIR.replace(
+        "%yidx = arith.addi %row_stride, %col : tensor<64xi32>",
+        "%neg = arith.constant dense<-2> : tensor<64xi32>\n"
+        "    %yidx = arith.muli %idx, %neg : tensor<64xi32>",
+        1,
+    )
+    with pytest.raises(UnsupportedTTIROpError, match="negative stride"):
+        translate_ttir(negative_stride, grid=(1,), contract="pointwise_flat")
+
+    data_dependent_stride = _STATIC_M7_COMPOSED_INDEX_TTIR.replace(
+        "%yidx = arith.addi %row_stride, %col : tensor<64xi32>",
+        "%yidx = arith.muli %idx, %idx : tensor<64xi32>",
+        1,
+    )
+    with pytest.raises(UnsupportedTTIROpError, match="unsupported composed indexing"):
+        translate_ttir(data_dependent_stride, grid=(1,), contract="pointwise_flat")
 
 
 def test_static_m25_target_policy_dispatch_without_cuda_runtime():
@@ -906,8 +1081,8 @@ def test_static_m25_rejects_inconsistent_memory_masks_without_cuda_runtime():
         "    tt.store %o1_ptr, %diff, %mask_2 :",
         1,
     )
-    with pytest.raises(UnsupportedTTIROpError, match="same flat extent predicate"):
-        translate_ttir(different_store_mask, grid=(1,), contract="pointwise_flat")
+    irmod, _ = translate_ttir(different_store_mask, grid=(1,), contract="pointwise_flat")
+    validate_pointwise_flat_contract(irmod)
 
     different_extent = _STATIC_DUAL_STORE_TTIR.replace(
         "%n:i64) {",
@@ -922,7 +1097,7 @@ def test_static_m25_rejects_inconsistent_memory_masks_without_cuda_runtime():
         "    tt.store %o1_ptr, %diff, %mask_m :",
         1,
     )
-    with pytest.raises(UnsupportedTTIROpError, match="same flat extent predicate"):
+    with pytest.raises(UnsupportedTTIROpError, match="ambiguous extent candidates"):
         translate_ttir(different_extent, grid=(1,), contract="pointwise_flat")
 
 
@@ -951,13 +1126,14 @@ def test_static_m25_negative_translate_without_cuda_runtime():
     with pytest.raises(UnsupportedTTIROpError, match="unsupported composed indexing pattern"):
         translate_ttir(non_contiguous_ttir, grid=(1,), contract="pointwise_flat")
 
-    unguarded_store_ttir = _STATIC_DUAL_STORE_TTIR.replace(
+    maskless_store_ttir = _STATIC_DUAL_STORE_TTIR.replace(
         "tt.store %o1_ptr, %diff, %mask :",
         "tt.store %o1_ptr, %diff :",
         1,
     )
-    with pytest.raises(TritonTVMContractError, match="guard every BufferStore"):
-        translate_ttir(unguarded_store_ttir, grid=(1,), contract="pointwise_flat")
+    irmod, _ = translate_ttir(maskless_store_ttir, grid=(1,), contract="pointwise_flat")
+    script = irmod.script()
+    assert "if mask:" in script
 
 
 def _op_snapshot(graph):

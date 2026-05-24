@@ -37,6 +37,7 @@ from .inductor import (
     InductorTritonSource,
     audit_inductor_kernel,
     extract_inductor_triton_sources,
+    extract_inductor_wrapper_extern_calls,
     is_inductor_pointwise_kernel,
     load_inductor_kernel,
 )
@@ -50,6 +51,8 @@ from .reporting import (
 MODEL_CORPUS = "m6_model_corpus"
 PRE_M7_TAXONOMY_VERSION = 1
 PRE_M7_BUILDER_DECISION = "keep_tvmscript_source_builder_for_m7_entry"
+PRE_M8_TAXONOMY_VERSION = 1
+PRE_M9_TAXONOMY_VERSION = 1
 _PRE_M7_READER_CLASSES = (
     "pointwise",
     "broadcast_view_index",
@@ -59,12 +62,23 @@ _PRE_M7_READER_CLASSES = (
     "attention_adjacent",
 )
 _PRE_M7_EXCLUDED_M7_BLOCKER_CLASSES = {
+    "attention_adjacent",
     "atomic",
     "grid",
     "matmul_dot",
     "reduction",
     "zero_triton_kernels",
 }
+_PRE_M8_IN_SCOPE_FAMILIES = {
+    "norm_layernorm",
+    "norm_rmsnorm",
+    "pooling_reduction",
+    "row_reduction",
+    "softmax_like",
+    "masked_attention_adjacent",
+}
+_PRE_M9_ENTRY_EXTERN_FAMILIES = {"extern_gemm", "extern_addmm_bias"}
+_PRE_M9_DEFERRED_EXTERN_FAMILIES = {"deferred_convolution", "deferred_attention"}
 
 
 @dataclass(frozen=True)
@@ -171,6 +185,7 @@ def build_model_corpus_report(
     """Build the JSON-serializable M6/M6.5 model corpus report."""
     normalized_models = [_normalize_model_record(record) for record in model_records]
     normalized_kernels = [_normalize_model_kernel_record(record) for record in kernel_records]
+    extern_records = _extern_records_from_models(normalized_models)
     report = build_capability_report(
         normalized_kernels,
         purpose="m6/m6.5 external model corpus audit",
@@ -187,6 +202,13 @@ def build_model_corpus_report(
         report["blockers"],
         errors or [],
     )
+    report["pre_m8"] = _pre_m8_report_section(normalized_kernels, report["blockers"])
+    report["pre_m9"] = _pre_m9_report_section(
+        normalized_kernels,
+        normalized_models,
+        extern_records,
+    )
+    report["extern_ops"] = extern_records
     report["full_tvm_runnable"] = (
         bool(normalized_models)
         and all(model.get("full_tvm_runnable", False) for model in normalized_models)
@@ -296,6 +318,14 @@ def _run_one_model_case(
         wrapper_path = wrapper_dir / f"{_safe_name(case.case_name)}_{wrapper_index}.py"
         wrapper_path.write_text(wrapper_source, encoding="utf-8")
         model_record["wrapper_paths"].append(str(wrapper_path))
+        model_record["extern_calls"].extend(
+            _extern_call_to_record(call, case)
+            for call in extract_inductor_wrapper_extern_calls(
+                wrapper_source,
+                case_name=case.case_name,
+                wrapper_path=str(wrapper_path),
+            )
+        )
         sources.extend(
             extract_inductor_triton_sources(
                 wrapper_source,
@@ -385,7 +415,8 @@ def _audit_one_model_kernel(
     kernel: InductorKernel | None = None
     try:
         kernel = load_inductor_kernel(source)
-        record = audit_inductor_kernel(kernel, ttir_dir=ttir_dir, contract=contract)
+        selected_contract = _select_model_kernel_contract(kernel, contract)
+        record = audit_inductor_kernel(kernel, ttir_dir=ttir_dir, contract=selected_contract)
     except Exception as err:  # pylint: disable=broad-except
         record = {
             "corpus": MODEL_CORPUS,
@@ -420,15 +451,15 @@ def _audit_one_model_kernel(
     record["kernel_source_path"] = str(kernel_path)
     if kernel is not None:
         _attach_inductor_metadata(record, kernel)
-        if not is_inductor_pointwise_kernel(kernel):
+        if not _is_model_kernel_replaceable(kernel, str(record.get("contract", contract))):
             record["candidate_translate_status"] = dict(record["translate_status"])
             record["translate_status"] = make_report_status(
                 ok=False,
                 bucket="contract_error",
                 fallback_reason="unsupported_inductor_kernel",
                 message=(
-                    "M6 model audit only marks Grid1D non-atomic pointwise "
-                    "Inductor kernels as TVM-replaceable"
+                    "M8 model audit only marks Grid1D non-atomic pointwise and "
+                    "approved reduction-family Inductor kernels as TVM-replaceable"
                 ),
             )
     else:
@@ -437,7 +468,38 @@ def _audit_one_model_kernel(
         record.setdefault("atomic_add_found", False)
         record.setdefault("size_hints", {})
     record["blocker_class"] = _blocker_class(record)
+    record["pre_m8_family"] = _pre_m8_family(record)
     return record
+
+
+def _select_model_kernel_contract(kernel: InductorKernel, contract: str) -> str:
+    if contract != "auto_m8":
+        return contract
+    meta = kernel.inductor_meta
+    if int(meta.get("num_reduction", 0) or 0) <= 0:
+        return "pointwise_flat"
+    text = f"{kernel.kernel_name} {kernel.source}".lower()
+    if "softmax" in text:
+        return "masked_softmax_row"
+    if any(token in text for token in ("layer_norm", "layernorm", "native_layer_norm")):
+        return "norm_row"
+    if any(token in text for token in ("rms", "rsqrt", "embedding_mean_mul_pow_rsqrt")):
+        return "norm_row"
+    if "max_pool" in text or "pool" in text:
+        return "row_reduction"
+    return "row_reduction"
+
+
+def _is_model_kernel_replaceable(kernel: InductorKernel, contract: str) -> bool:
+    meta = kernel.inductor_meta
+    if meta.get("grid_type") != "Grid1D" or bool(meta.get("atomic_add_found", False)):
+        return False
+    num_reduction = int(meta.get("num_reduction", 0) or 0)
+    if contract == "pointwise_flat":
+        return is_inductor_pointwise_kernel(kernel)
+    if contract in {"row_reduction", "norm_row", "softmax_row", "masked_softmax_row"}:
+        return num_reduction > 0
+    return False
 
 
 def _attach_inductor_metadata(record: dict[str, Any], kernel: InductorKernel) -> None:
@@ -478,10 +540,14 @@ def _finalize_model_record(model_record: dict[str, Any], records: list[dict[str,
             "blocker_classes": dict(sorted(blockers.items())),
         }
     )
-    model_record["full_tvm_runnable"] = (
+    triton_kernel_runnable = (
         model_record["kernel_count"] > 0
         and model_record["native_fallback_kernels"] == 0
         and model_record["translated_kernels"] == model_record["kernel_count"]
+    )
+    model_record["triton_kernel_runnable"] = triton_kernel_runnable
+    model_record["full_tvm_runnable"] = (
+        triton_kernel_runnable and not model_record.get("extern_calls")
     )
 
 
@@ -496,6 +562,8 @@ def _base_model_record(case: TritonTVMModelAuditCase) -> dict[str, Any]:
         "status_buckets": {},
         "blocker_classes": {},
         "wrapper_paths": [],
+        "extern_calls": [],
+        "triton_kernel_runnable": False,
         "full_tvm_runnable": False,
     }
 
@@ -511,7 +579,22 @@ def _normalize_model_record(record: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("status_buckets", {})
     normalized.setdefault("blocker_classes", {})
     normalized.setdefault("wrapper_paths", [])
+    normalized.setdefault("extern_calls", [])
+    normalized["extern_calls"] = [
+        _normalize_extern_call_record(call, normalized) for call in normalized["extern_calls"]
+    ]
+    normalized["extern_call_count"] = len(normalized["extern_calls"])
+    normalized.setdefault(
+        "triton_kernel_runnable",
+        bool(
+            normalized.get("kernel_count", 0)
+            and normalized.get("native_fallback_kernels", 0) == 0
+            and normalized.get("translated_kernels", 0) == normalized.get("kernel_count", 0)
+        ),
+    )
     normalized.setdefault("full_tvm_runnable", False)
+    if normalized["extern_calls"] and normalized.get("full_tvm_runnable"):
+        normalized["full_tvm_runnable"] = False
     return normalized
 
 
@@ -525,7 +608,66 @@ def _normalize_model_kernel_record(record: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("atomic_add_found", False)
     normalized.setdefault("size_hints", {})
     normalized.setdefault("blocker_class", _blocker_class(normalized))
+    normalized.setdefault("pre_m8_family", _pre_m8_family(normalized))
     return normalized
+
+
+def _extern_call_to_record(call, case: TritonTVMModelAuditCase) -> dict[str, Any]:
+    return {
+        "model_family": case.model_family,
+        "model_case": case.case_name,
+        "case_name": case.case_name,
+        "op_name": call.op_name,
+        "op_family": call.op_family,
+        "line_no": call.line_no,
+        "wrapper_path": call.wrapper_path,
+        "source": call.source,
+    }
+
+
+def _normalize_extern_call_record(
+    record: dict[str, Any],
+    model_record: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    model_record = model_record or {}
+    normalized = dict(record)
+    normalized.setdefault("model_family", model_record.get("model_family", ""))
+    normalized.setdefault("model_case", model_record.get("model_case", ""))
+    normalized.setdefault("case_name", normalized.get("model_case", ""))
+    normalized.setdefault("op_name", "")
+    normalized.setdefault("op_family", _extern_family_from_op_name(str(normalized["op_name"])))
+    normalized.setdefault("line_no", 0)
+    normalized.setdefault("wrapper_path", "")
+    normalized.setdefault("source", "")
+    return normalized
+
+
+def _extern_family_from_op_name(op_name: str) -> str:
+    if op_name in {"extern_kernels.mm", "extern_kernels.bmm"}:
+        return "extern_gemm"
+    if op_name == "extern_kernels.addmm":
+        return "extern_addmm_bias"
+    if op_name == "extern_kernels.convolution":
+        return "deferred_convolution"
+    if op_name == "torch.ops.aten._scaled_dot_product_efficient_attention.default":
+        return "deferred_attention"
+    return "extern_other"
+
+
+def _extern_records_from_models(model_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for model in model_records:
+        for call in model.get("extern_calls", []) or []:
+            records.append(_normalize_extern_call_record(call, model))
+    return sorted(
+        records,
+        key=lambda item: (
+            str(item.get("model_case", "")),
+            str(item.get("wrapper_path", "")),
+            int(item.get("line_no", 0) or 0),
+            str(item.get("op_name", "")),
+        ),
+    )
 
 
 def _model_summary(
@@ -534,8 +676,16 @@ def _model_summary(
 ) -> dict[str, Any]:
     families = Counter(record["model_family"] for record in model_records)
     model_status = Counter(record["status"] for record in model_records)
+    extern_records = _extern_records_from_models(model_records)
+    extern_families = Counter(record.get("op_family", "unknown") for record in extern_records)
+    extern_ops = Counter(record.get("op_name", "unknown") for record in extern_records)
     blocker_classes = Counter(
         record.get("blocker_class", "unknown")
+        for record in kernel_records
+        if not record.get("translate_status", {}).get("ok", False)
+    )
+    pre_m8_families = Counter(
+        record.get("pre_m8_family", "unknown")
         for record in kernel_records
         if not record.get("translate_status", {}).get("ok", False)
     )
@@ -555,6 +705,10 @@ def _model_summary(
         "full_tvm_runnable_models": sum(
             1 for record in model_records if record.get("full_tvm_runnable")
         ),
+        "triton_kernel_runnable_models": sum(
+            1 for record in model_records if record.get("triton_kernel_runnable")
+        ),
+        "extern_op_count": len(extern_records),
         "total_kernels": len(kernel_records),
         "translated_kernels": sum(
             1 for record in kernel_records if record.get("translate_status", {}).get("ok")
@@ -564,7 +718,10 @@ def _model_summary(
         ),
         "families": dict(sorted(families.items())),
         "model_status": dict(sorted(model_status.items())),
+        "extern_op_families": dict(sorted(extern_families.items())),
+        "extern_ops": dict(sorted(extern_ops.items())),
         "blocker_classes": dict(sorted(blocker_classes.items())),
+        "pre_m8_families": dict(sorted(pre_m8_families.items())),
     }
 
 
@@ -615,6 +772,255 @@ def _pre_m7_unsupported_taxonomy() -> dict[str, Any]:
             "matmul_dot": "classify through blocker_class without adding a top-level bucket",
             "reduction": "classify through blocker_class without adding a top-level bucket",
         },
+    }
+
+
+def _pre_m8_report_section(
+    kernel_records: list[dict[str, Any]],
+    blockers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    family_classes = _pre_m8_family_classes(kernel_records)
+    return {
+        "taxonomy_version": PRE_M8_TAXONOMY_VERSION,
+        "unsupported_taxonomy": {
+            "top_level_bucket_policy": "preserve_existing_buckets",
+            "detail_fields": ["fallback_reason", "blocker_class", "pre_m8_family"],
+            "stable_top_level_buckets": _pre_m7_unsupported_taxonomy()[
+                "stable_top_level_buckets"
+            ],
+            "family_policy": {
+                "norm_layernorm": "M8 norm-family candidate",
+                "norm_rmsnorm": "M8 norm-family candidate",
+                "pooling_reduction": "separate reduction-family detail class",
+                "row_reduction": "M8 reduction-family candidate",
+                "softmax_like": "M8 softmax-family candidate",
+                "masked_attention_adjacent": (
+                    "masked softmax or causal-mask policy input; attention runtime "
+                    "remains out of scope"
+                ),
+                "deferred_grid": "deferred outside Pre-M8/M8 reduction-family scope",
+            },
+        },
+        "contract_policy": {
+            "execution_kind": "serial_m4_single_lane for current reduction/norm contracts",
+            "future_parallel_metadata": (
+                "future parallel reductions must use a distinct execution_kind"
+            ),
+            "accumulator_dtype_policy": "preserve_ttir_reduction_dtype",
+            "epsilon_policy": "runtime_and_constexpr_eps_supported for norm_single_row",
+            "mask_policy": "masked reduction loads require explicit zero other",
+            "axis_policy": "axis_0_only",
+            "layout_policy": "row_major_only or single_row_row_major",
+        },
+        "family_classes": family_classes,
+        "m8_entry_debt": [
+            _pre_m8_entry_from_family(name, entry)
+            for name, entry in family_classes.items()
+            if name in _PRE_M8_IN_SCOPE_FAMILIES
+        ],
+        "deferred_debt": [
+            _pre_m8_entry_from_family(name, entry)
+            for name, entry in family_classes.items()
+            if name.startswith("deferred_")
+        ],
+        "blocker_count": len(blockers),
+    }
+
+
+def _pre_m8_family_classes(
+    kernel_records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    classes: dict[str, dict[str, Any]] = {}
+
+    def get_entry(name: str) -> dict[str, Any]:
+        if name not in classes:
+            classes[name] = {
+                "kernel_count": 0,
+                "buckets": Counter(),
+                "blocker_classes": Counter(),
+                "example_kernel": "",
+                "example_message": "",
+            }
+        return classes[name]
+
+    for record in kernel_records:
+        if record.get("translate_status", {}).get("ok", False):
+            continue
+        family = str(record.get("pre_m8_family", "")) or _pre_m8_family(record)
+        entry = get_entry(family)
+        status = record.get("translate_status", {})
+        entry["kernel_count"] += 1
+        entry["buckets"][str(status.get("bucket", "unknown"))] += 1
+        entry["blocker_classes"][str(record.get("blocker_class", "unknown"))] += 1
+        if not entry["example_kernel"]:
+            entry["example_kernel"] = str(record.get("kernel_name", ""))
+            entry["example_message"] = str(status.get("message", ""))
+
+    normalized = {}
+    for name, entry in sorted(classes.items()):
+        normalized[name] = {
+            "kernel_count": int(entry["kernel_count"]),
+            "buckets": dict(sorted(entry["buckets"].items())),
+            "blocker_classes": dict(sorted(entry["blocker_classes"].items())),
+            "example_kernel": entry["example_kernel"],
+            "example_message": entry["example_message"],
+        }
+    return normalized
+
+
+def _pre_m8_entry_from_family(name: str, entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "pre_m8_family": name,
+        "kernel_count": int(entry.get("kernel_count", 0)),
+        "buckets": dict(entry.get("buckets", {})),
+        "blocker_classes": dict(entry.get("blocker_classes", {})),
+        "example_kernel": entry.get("example_kernel", ""),
+        "example_message": entry.get("example_message", ""),
+    }
+
+
+def _pre_m9_report_section(
+    kernel_records: list[dict[str, Any]],
+    model_records: list[dict[str, Any]],
+    extern_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    extern_family_classes = _pre_m9_extern_family_classes(extern_records)
+    ttir_dot_records = [
+        record for record in kernel_records if "tt.dot" in set(record.get("unique_ops", []))
+    ]
+    grid_records = [
+        record
+        for record in kernel_records
+        if not record.get("translate_status", {}).get("ok", False)
+        and record.get("blocker_class") == "grid"
+    ]
+    return {
+        "taxonomy_version": PRE_M9_TAXONOMY_VERSION,
+        "report_policy": {
+            "extern_visibility": (
+                "Wrapper-level extern calls are explicit Pre-M9 observations and "
+                "are not counted as translated Triton kernels."
+            ),
+            "full_tvm_runnable": (
+                "A model is full_tvm_runnable only when all captured Triton kernels "
+                "translate and no wrapper-level extern calls remain."
+            ),
+            "grid_boundary": (
+                "M7.5/M8.5 deferred grid debt remains separate from M9 matmul "
+                "acceptance unless a later ADR changes the milestone scope."
+            ),
+        },
+        "detail_fields": [
+            "fallback_reason",
+            "blocker_class",
+            "pre_m8_family",
+            "op_family",
+        ],
+        "contract_policy": {
+            "plain_gemm": (
+                "M9 entry admits explicit GEMM policy before lowering; initial "
+                "runtime path may be a TVM artifact extern call."
+            ),
+            "batched_gemm": "classified during M9 but lower after plain GEMM policy is stable",
+            "gemm_epilogue": (
+                "bias/add/activation epilogues are classified separately from the "
+                "core GEMM path"
+            ),
+            "qkv_projection": (
+                "QKV projections are GEMM candidates; attention runtime remains "
+                "deferred to M10"
+            ),
+            "tensorcore_dtype_layout": (
+                "fp16/bf16 TensorCore dtype and layout policy must be documented "
+                "before native schedule expansion"
+            ),
+        },
+        "extern_policy": {
+            "extern_gemm": (
+                "Allowed only as an explicit TVM artifact extern call; it is not "
+                "native fallback."
+            ),
+            "extern_addmm_bias": (
+                "GEMM+bias candidate; bias/epilogue must be visible in reports."
+            ),
+            "deferred_convolution": "Deferred to the vision/conv stack unless M9 admits 1x1 conv-to-GEMM.",
+            "deferred_attention": "Deferred to the attention runtime milestone.",
+        },
+        "extern_family_classes": extern_family_classes,
+        "m9_entry_debt": [
+            _pre_m9_entry_from_extern_family(name, entry)
+            for name, entry in extern_family_classes.items()
+            if name in _PRE_M9_ENTRY_EXTERN_FAMILIES
+        ],
+        "deferred_debt": [
+            _pre_m9_entry_from_extern_family(name, entry)
+            for name, entry in extern_family_classes.items()
+            if name in _PRE_M9_DEFERRED_EXTERN_FAMILIES
+        ],
+        "observed_ttir_dot_kernels": len(ttir_dot_records),
+        "observed_grid_fallback_kernels": len(grid_records),
+        "model_full_tvm_runnable_after_extern_gate": sum(
+            1 for record in model_records if record.get("full_tvm_runnable")
+        ),
+    }
+
+
+def _pre_m9_extern_family_classes(
+    extern_records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    classes: dict[str, dict[str, Any]] = {}
+
+    def get_entry(name: str) -> dict[str, Any]:
+        if name not in classes:
+            classes[name] = {
+                "call_count": 0,
+                "op_names": Counter(),
+                "models": set(),
+                "example_op": "",
+                "example_model": "",
+                "example_source": "",
+            }
+        return classes[name]
+
+    for record in extern_records:
+        family = str(record.get("op_family", "")) or _extern_family_from_op_name(
+            str(record.get("op_name", ""))
+        )
+        entry = get_entry(family)
+        entry["call_count"] += 1
+        entry["op_names"][str(record.get("op_name", "unknown"))] += 1
+        if record.get("model_case"):
+            entry["models"].add(str(record.get("model_case", "")))
+        if not entry["example_op"]:
+            entry["example_op"] = str(record.get("op_name", ""))
+            entry["example_model"] = str(record.get("model_case", ""))
+            entry["example_source"] = str(record.get("source", ""))
+
+    normalized = {}
+    for name, entry in sorted(classes.items()):
+        models = sorted(entry["models"])
+        normalized[name] = {
+            "call_count": int(entry["call_count"]),
+            "op_names": dict(sorted(entry["op_names"].items())),
+            "models_impacted": len(models),
+            "models": models,
+            "example_op": entry["example_op"],
+            "example_model": entry["example_model"],
+            "example_source": entry["example_source"],
+        }
+    return normalized
+
+
+def _pre_m9_entry_from_extern_family(name: str, entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "op_family": name,
+        "call_count": int(entry.get("call_count", 0)),
+        "op_names": dict(entry.get("op_names", {})),
+        "models_impacted": int(entry.get("models_impacted", 0)),
+        "models": list(entry.get("models", [])),
+        "example_op": entry.get("example_op", ""),
+        "example_model": entry.get("example_model", ""),
+        "example_source": entry.get("example_source", ""),
     }
 
 
@@ -722,7 +1128,15 @@ def _is_pre_m7_entry_blocker(blocker: dict[str, Any]) -> bool:
         return False
     if blocker_class in _PRE_M7_EXCLUDED_M7_BLOCKER_CLASSES:
         return False
-    text = " ".join([bucket, reason, blocker_class, str(blocker.get("example_message", ""))])
+    text = " ".join(
+        [
+            bucket,
+            reason,
+            blocker_class,
+            str(blocker.get("example_kernel", "")),
+            str(blocker.get("example_message", "")),
+        ]
+    )
     text = text.lower()
     example_ops = set(blocker.get("example_ops", []))
     if example_ops & {"tt.trans", "tt.expand_dims"}:
@@ -752,6 +1166,7 @@ def _rank_blockers(
                 "kernel_count": 0,
                 "model_error_count": 0,
                 "models": set(),
+                "pre_m8_families": Counter(),
                 "example_kernel": "",
                 "example_message": "",
                 "example_ops": [],
@@ -768,6 +1183,8 @@ def _rank_blockers(
         entry = get_entry(bucket, reason, blocker_class)
         entry["kernel_count"] += 1
         entry["models"].add(record.get("model_case", ""))
+        pre_m8_family = str(record.get("pre_m8_family", "")) or _pre_m8_family(record)
+        entry["pre_m8_families"][pre_m8_family] += 1
         if not entry["example_kernel"]:
             entry["example_kernel"] = record.get("kernel_name", "")
             entry["example_message"] = str(status.get("message", ""))
@@ -788,12 +1205,15 @@ def _rank_blockers(
         entry = get_entry(bucket, reason, blocker_class)
         entry["model_error_count"] += 1
         entry["models"].add(model_case)
+        entry["pre_m8_families"]["collection_error"] += 1
         if not entry["example_message"]:
             entry["example_message"] = str(error.get("message", ""))
 
     ranked = []
     for entry in buckets.values():
         models = sorted(model for model in entry.pop("models") if model)
+        families = entry.pop("pre_m8_families")
+        entry["pre_m8_families"] = dict(sorted(families.items()))
         entry["models"] = models
         entry["models_impacted"] = len(models)
         ranked.append(entry)
@@ -822,9 +1242,67 @@ def _blocker_class(record: dict[str, Any]) -> str:
         return "matmul_dot"
     if record.get("grid_type") and record.get("grid_type") != "Grid1D":
         return "grid"
+    if _pre_m7_attention_adjacent(record):
+        return "attention_adjacent"
     reason = str(status.get("fallback_reason", "")) or str(status.get("bucket", "unknown"))
     if reason == "unsupported_inductor_kernel":
         return "unsupported_inductor_kernel"
+    message = str(status.get("message", "")).lower()
+    if "__nv_erff" in message:
+        return "activation_erf"
+    if "sitofp" in message or "fptosi" in message:
+        return "dtype_cast"
+    if any(
+        token in message
+        for token in (
+            "composed indexing",
+            "unique extent",
+            "flat extent predicate",
+            "indexing",
+            "broadcast",
+            "view",
+        )
+    ):
+        return "broadcast_view_index"
+    return reason
+
+
+def _pre_m8_family(record: dict[str, Any]) -> str:
+    status = record.get("translate_status", {})
+    if status.get("ok", False):
+        return "translated"
+
+    blocker_class = str(record.get("blocker_class", ""))
+    text = _pre_m7_record_text(record)
+    kernel_name = str(record.get("kernel_name", "")).lower()
+
+    if blocker_class == "grid":
+        return "deferred_grid"
+    if blocker_class == "atomic":
+        return "deferred_atomic"
+    if blocker_class == "matmul_dot":
+        return "deferred_matmul_dot"
+    if blocker_class == "attention_adjacent":
+        return "masked_attention_adjacent"
+    if "masked tt.load without other" in text and any(
+        token in text for token in ("attention", "softmax", "causal")
+    ):
+        return "masked_attention_adjacent"
+
+    if blocker_class == "reduction":
+        if "softmax" in text:
+            return "softmax_like"
+        if any(token in text for token in ("layer_norm", "layernorm", "native_layer_norm")):
+            return "norm_layernorm"
+        if any(token in text for token in ("rms", "rsqrt", "embedding_mean_mul_pow_rsqrt")):
+            return "norm_rmsnorm"
+        if "max_pool" in text or "pool" in kernel_name:
+            return "pooling_reduction"
+        return "row_reduction"
+
+    if blocker_class in {"unsupported_inductor_kernel", "broadcast_view_index"}:
+        return "deferred_pointwise_or_grid"
+    reason = str(status.get("fallback_reason", "")) or str(status.get("bucket", "unknown"))
     return reason
 
 

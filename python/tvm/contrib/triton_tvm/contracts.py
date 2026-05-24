@@ -47,6 +47,10 @@ _CONTRACT_ALIASES = {
     "pointwise_flat": "pointwise_flat",
     "reduction_minimal": "reduction_minimal",
     "norm_single_row": "norm_single_row",
+    "row_reduction": "row_reduction",
+    "norm_row": "norm_row",
+    "softmax_row": "softmax_row",
+    "masked_softmax_row": "masked_softmax_row",
     "cuda_minimal": "pointwise_minimal",
     "cuda_pointwise_flat": "pointwise_flat",
 }
@@ -67,6 +71,12 @@ class TritonTVMContract:
     requires_extent_param: bool
     supports_multiple_outputs: bool
     version: str
+    execution_kind: str = "thread_parallel_pointwise"
+    accumulator_dtype_policy: str = "not_applicable"
+    epsilon_policy: str = "not_applicable"
+    mask_policy: str = "flat_extent_guard"
+    axis_policy: str = "flat_1d"
+    layout_policy: str = "flat_contiguous"
 
 
 _CONTRACTS = {
@@ -93,6 +103,12 @@ _CONTRACTS = {
         requires_extent_param=True,
         supports_multiple_outputs=False,
         version="reduction_minimal_v1",
+        execution_kind="serial_m4_single_lane",
+        accumulator_dtype_policy="preserve_ttir_reduction_dtype",
+        epsilon_policy="not_applicable",
+        mask_policy="masked_reduction_loads_require_zero_other",
+        axis_policy="axis_0_only",
+        layout_policy="row_major_only",
     ),
     "norm_single_row": TritonTVMContract(
         name="norm_single_row",
@@ -101,6 +117,68 @@ _CONTRACTS = {
         requires_extent_param=True,
         supports_multiple_outputs=False,
         version="norm_single_row_v1",
+        execution_kind="serial_m4_single_lane",
+        accumulator_dtype_policy="preserve_ttir_reduction_dtype",
+        epsilon_policy="runtime_and_constexpr_eps_supported",
+        mask_policy="masked_reduction_loads_require_zero_other",
+        axis_policy="axis_0_only",
+        layout_policy="single_row_row_major",
+    ),
+    "row_reduction": TritonTVMContract(
+        name="row_reduction",
+        indexing_kind="rank2_row_reduction",
+        memory_model="flat_buffer",
+        requires_extent_param=True,
+        supports_multiple_outputs=False,
+        version="row_reduction_m8_v1",
+        execution_kind="serial_m8_rank2_lane",
+        accumulator_dtype_policy="preserve_ttir_reduction_dtype",
+        epsilon_policy="not_applicable",
+        mask_policy="rank2_masks_explicit_or_dominated",
+        axis_policy="axis_1_only",
+        layout_policy="rank2_row_major",
+    ),
+    "norm_row": TritonTVMContract(
+        name="norm_row",
+        indexing_kind="rank2_row_norm",
+        memory_model="flat_buffer",
+        requires_extent_param=True,
+        supports_multiple_outputs=False,
+        version="norm_row_m8_v1",
+        execution_kind="serial_m8_rank2_lane",
+        accumulator_dtype_policy="preserve_ttir_reduction_dtype",
+        epsilon_policy="runtime_and_constexpr_eps_supported",
+        mask_policy="rank2_masks_explicit_or_dominated",
+        axis_policy="axis_1_only",
+        layout_policy="rank2_row_major",
+    ),
+    "softmax_row": TritonTVMContract(
+        name="softmax_row",
+        indexing_kind="rank2_row_softmax",
+        memory_model="flat_buffer",
+        requires_extent_param=True,
+        supports_multiple_outputs=False,
+        version="softmax_row_m8_v1",
+        execution_kind="serial_m8_rank2_lane",
+        accumulator_dtype_policy="preserve_ttir_reduction_dtype",
+        epsilon_policy="not_applicable",
+        mask_policy="rank2_masks_explicit_or_dominated",
+        axis_policy="axis_1_only",
+        layout_policy="rank2_row_major",
+    ),
+    "masked_softmax_row": TritonTVMContract(
+        name="masked_softmax_row",
+        indexing_kind="rank2_masked_row_softmax",
+        memory_model="flat_buffer",
+        requires_extent_param=True,
+        supports_multiple_outputs=False,
+        version="masked_softmax_row_m8_v1",
+        execution_kind="serial_m8_rank2_lane",
+        accumulator_dtype_policy="preserve_ttir_reduction_dtype",
+        epsilon_policy="not_applicable",
+        mask_policy="rank2_masks_explicit_or_dominated",
+        axis_policy="axis_1_only",
+        layout_policy="rank2_row_major_or_causal",
     ),
 }
 
@@ -158,6 +236,34 @@ def validate_norm_single_row_contract(irmod: tvm.IRModule) -> None:
         _validate_reduction_minimal_body(gvar.name_hint, func)
 
 
+def validate_row_reduction_contract(irmod: tvm.IRModule) -> None:
+    """Validate the M8 rank-2 row reduction contract."""
+    _validate_pointwise_common(irmod, "row_reduction")
+    for gvar, func in irmod.functions.items():
+        _validate_serial_row_contract_body(gvar.name_hint, func, "row_reduction")
+
+
+def validate_norm_row_contract(irmod: tvm.IRModule) -> None:
+    """Validate the M8 rank-2 row norm contract."""
+    _validate_pointwise_common(irmod, "norm_row")
+    for gvar, func in irmod.functions.items():
+        _validate_serial_row_contract_body(gvar.name_hint, func, "norm_row")
+
+
+def validate_softmax_row_contract(irmod: tvm.IRModule) -> None:
+    """Validate the M8 rank-2 row softmax contract."""
+    _validate_pointwise_common(irmod, "softmax_row")
+    for gvar, func in irmod.functions.items():
+        _validate_serial_row_contract_body(gvar.name_hint, func, "softmax_row")
+
+
+def validate_masked_softmax_row_contract(irmod: tvm.IRModule) -> None:
+    """Validate the M8 rank-2 masked row softmax contract."""
+    _validate_pointwise_common(irmod, "masked_softmax_row")
+    for gvar, func in irmod.functions.items():
+        _validate_serial_row_contract_body(gvar.name_hint, func, "masked_softmax_row")
+
+
 def validate_cuda_minimal_contract(irmod: tvm.IRModule) -> None:
     """Validate the legacy CUDA single-store alias."""
     _warn_legacy_contract("cuda_minimal", "pointwise_minimal")
@@ -181,6 +287,14 @@ def validate_triton_tvm_contract(irmod: tvm.IRModule, contract: str) -> None:
         validate_reduction_minimal_contract(irmod)
     elif contract == "norm_single_row":
         validate_norm_single_row_contract(irmod)
+    elif contract == "row_reduction":
+        validate_row_reduction_contract(irmod)
+    elif contract == "norm_row":
+        validate_norm_row_contract(irmod)
+    elif contract == "softmax_row":
+        validate_softmax_row_contract(irmod)
+    elif contract == "masked_softmax_row":
+        validate_masked_softmax_row_contract(irmod)
     else:
         raise UnsupportedContractError(
             f"Contract {contract!r} does not have a validator in this prototype"
@@ -321,12 +435,18 @@ def _validate_pointwise_capability_body(name: str, func: tvm.tirx.PrimFunc) -> N
 
 
 def _validate_reduction_minimal_body(name: str, func: tvm.tirx.PrimFunc) -> None:
+    _validate_serial_row_contract_body(name, func, "reduction_minimal")
+
+
+def _validate_serial_row_contract_body(
+    name: str, func: tvm.tirx.PrimFunc, contract: str
+) -> None:
     from tvm import tirx  # pylint: disable=import-outside-toplevel
 
     stores = [stmt for stmt in _walk_stmt(func.body) if isinstance(stmt, tirx.BufferStore)]
     if not stores:
         raise TritonTVMContractError(
-            f"{name} reduction_minimal contract requires at least one BufferStore"
+            f"{name} {contract} contract requires at least one BufferStore"
         )
 
     serial_loops = [
@@ -336,7 +456,7 @@ def _validate_reduction_minimal_body(name: str, func: tvm.tirx.PrimFunc) -> None
     ]
     if not serial_loops:
         raise TritonTVMContractError(
-            f"{name} reduction_minimal contract requires a serial reduction loop"
+            f"{name} {contract} contract requires a serial reduction loop"
         )
 
 
@@ -424,7 +544,7 @@ def _validate_supported_pointwise_index(name: str, expr) -> None:
     if _is_supported_pointwise_index(expr):
         return
     raise TritonTVMContractError(
-        f"{name} pointwise_flat only supports buffer indices i, i % C, i // C, and i * C"
+        f"{name} pointwise_flat only supports classified M7 pointwise index expressions"
     )
 
 
@@ -433,13 +553,23 @@ def _is_supported_pointwise_index(expr) -> bool:
 
     if _is_lane_index_expr(expr):
         return True
+    if isinstance(expr, tirx.IntImm):
+        return int(expr.value) >= 0
+    if isinstance(expr, tirx.Cast):
+        return _is_supported_pointwise_index(expr.value)
+    if isinstance(expr, (tirx.Add, tirx.Sub)):
+        return _is_supported_pointwise_index(expr.a) and _is_supported_pointwise_index(expr.b)
     if isinstance(expr, (tirx.FloorMod, tirx.FloorDiv)):
-        return _is_lane_index_expr(expr.a) and _positive_int_imm(expr.b) is not None
+        return _is_supported_pointwise_index(expr.a) and _positive_int_imm(expr.b) is not None
     if isinstance(expr, tirx.Mul):
-        return (
-            (_is_lane_index_expr(expr.a) and _positive_int_imm(expr.b) is not None)
-            or (_is_lane_index_expr(expr.b) and _positive_int_imm(expr.a) is not None)
-        )
+        if _positive_int_imm(expr.a) is not None:
+            return _is_supported_pointwise_index(expr.b)
+        if _positive_int_imm(expr.b) is not None:
+            return _is_supported_pointwise_index(expr.a)
+        if _positive_float_imm(expr.a) is not None:
+            return _is_supported_pointwise_index(expr.b)
+        if _positive_float_imm(expr.b) is not None:
+            return _is_supported_pointwise_index(expr.a)
     return False
 
 
@@ -464,5 +594,16 @@ def _positive_int_imm(expr) -> int | None:
         return None
     value = int(expr.value)
     if value <= 0:
+        return None
+    return value
+
+
+def _positive_float_imm(expr) -> float | None:
+    from tvm import tirx  # pylint: disable=import-outside-toplevel
+
+    if not isinstance(expr, tirx.FloatImm):
+        return None
+    value = float(expr.value)
+    if value <= 0.0:
         return None
     return value

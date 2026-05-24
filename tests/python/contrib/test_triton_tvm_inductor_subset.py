@@ -227,6 +227,8 @@ _M35_CUDA_PROMOTED_CASES = [
     "add",
     "tuple_two_outputs",
     "relu_add",
+    "gelu",
+    "silu",
     "where_cmp",
     "sigmoid_mul",
     "sin_cos",

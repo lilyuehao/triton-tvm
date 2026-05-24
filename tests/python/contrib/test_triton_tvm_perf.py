@@ -56,6 +56,9 @@ _TRITON_WARMUP = int(os.environ.get("TRITON_TVM_PERF_TRITON_WARMUP", "25"))
 _TRITON_REP = int(os.environ.get("TRITON_TVM_PERF_TRITON_REP", "100"))
 _REGRESSION_TOLERANCE = float(os.environ.get("TRITON_TVM_PERF_TOLERANCE", "0.35"))
 _BROADCAST_FEATURE = int(os.environ.get("TRITON_TVM_PERF_BROADCAST_FEATURE", "1024"))
+_TVM_TO_TRITON_GBPS_FLOOR = float(
+    os.environ.get("TRITON_TVM_PERF_TVM_TO_TRITON_GBPS_FLOOR", "0.10")
+)
 
 
 @triton.jit
@@ -260,6 +263,7 @@ def test_pointwise_perf_baseline_regression_guard():
     baseline_path = os.environ.get("TRITON_TVM_PERF_BASELINE_JSON")
     if baseline_path:
         _assert_no_perf_regression(results, Path(baseline_path))
+    _assert_perf_smoke_no_order_of_magnitude_drop(results)
 
 
 def _run_perf_baseline() -> dict[str, Any]:
@@ -277,6 +281,7 @@ def _run_perf_baseline() -> dict[str, Any]:
         "triton_warmup": _TRITON_WARMUP,
         "triton_rep": _TRITON_REP,
         "broadcast_feature": _BROADCAST_FEATURE,
+        "tvm_to_triton_gbps_floor": _TVM_TO_TRITON_GBPS_FLOOR,
         "device": torch.cuda.get_device_name(0),
         "tvm_version": tvm.__version__,
         "triton_version": triton.__version__,
@@ -417,6 +422,20 @@ def _assert_no_perf_regression(current: dict[str, Any], baseline_path: Path) -> 
             )
 
     assert not regressions, "Triton TVM perf regression detected:\n" + "\n".join(regressions)
+
+
+def _assert_perf_smoke_no_order_of_magnitude_drop(current: dict[str, Any]) -> None:
+    regressions = []
+    for current_case in current["cases"]:
+        ratio = current_case.get("tvm_to_triton_gbps")
+        if ratio is None:
+            continue
+        if float(ratio) < _TVM_TO_TRITON_GBPS_FLOOR:
+            regressions.append(
+                f"{current_case['case']}: TVM/Triton throughput ratio "
+                f"{float(ratio):.3f} below smoke floor {_TVM_TO_TRITON_GBPS_FLOOR:.3f}"
+            )
+    assert not regressions, "Triton TVM perf smoke guard failed:\n" + "\n".join(regressions)
 
 
 if __name__ == "__main__":

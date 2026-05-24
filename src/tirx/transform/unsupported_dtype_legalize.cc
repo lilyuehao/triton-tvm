@@ -525,22 +525,6 @@ class StorageLegalizer : public StmtExprMutator {
 
   Stmt VisitStmt_(const AllocBufferNode* op) final {
     Buffer buf = GetRemappedBuffer(op->buffer);
-    // in a rare case the buffer didn't get remapped
-    // because the original var is not bfloat*
-    // force remap here
-    if (MatchDType(buf->dtype)) {
-      DataType new_dtype = GetStorageUIntDType(buf->dtype);
-      ffi::String storage_scope = "global";
-      if (auto* ptr_type = buf->data->type_annotation.as<PointerTypeNode>()) {
-        storage_scope = ptr_type->storage_scope;
-      }
-      Var new_data = Var(buf->data->name_hint, PointerType(PrimType(new_dtype), storage_scope));
-      var_remap_[buf->data] = new_data;
-      buf = Buffer(new_data, new_dtype, buf->shape, buf->strides, buf->elem_offset, buf->name,
-                   buf->data_alignment, buf->offset_factor, buf->buffer_type, buf->axis_separators,
-                   buf->span);
-      buffer_remap_[op->buffer] = buf;
-    }
     if (buf.same_as(op->buffer)) {
       return ffi::GetRef<Stmt>(op);
     } else {
@@ -552,15 +536,6 @@ class StorageLegalizer : public StmtExprMutator {
 
   Stmt VisitStmt_(const DeclBufferNode* op) final {
     Buffer buf = GetRemappedBuffer(op->buffer);
-    // in a rare case the buffer didn't get remapped
-    // because the original var is not bfloat*
-    // force remap here
-    if (MatchDType(buf->dtype)) {
-      buf = Buffer(buf->data, GetStorageUIntDType(buf->dtype), buf->shape, buf->strides,
-                   buf->elem_offset, buf->name, buf->data_alignment, buf->offset_factor,
-                   buf->buffer_type, buf->axis_separators, buf->span);
-      buffer_remap_[op->buffer] = buf;
-    }
     if (buf.same_as(op->buffer)) {
       return ffi::GetRef<Stmt>(op);
     } else {
@@ -705,6 +680,18 @@ class StorageLegalizer : public StmtExprMutator {
       DataType dtype = MatchDType(buf->dtype) ? GetStorageUIntDType(buf->dtype) : buf->dtype;
       new_buf = Buffer(var_it->second, dtype, buf->shape, buf->strides, buf->elem_offset, buf->name,
                        buf->data_alignment, buf->offset_factor, buf->buffer_type,
+                       buf->axis_separators, buf->span);
+    } else if (MatchDType(buf->dtype)) {
+      DataType storage_dtype = GetStorageUIntDType(buf->dtype);
+      ffi::String storage_scope = "global";
+      if (auto* ptr_type = buf->data->type_annotation.as<PointerTypeNode>()) {
+        storage_scope = ptr_type->storage_scope;
+      }
+      Var new_data =
+          Var(buf->data->name_hint, PointerType(PrimType(storage_dtype), storage_scope));
+      var_remap_[buf->data] = new_data;
+      new_buf = Buffer(new_data, storage_dtype, buf->shape, buf->strides, buf->elem_offset,
+                       buf->name, buf->data_alignment, buf->offset_factor, buf->buffer_type,
                        buf->axis_separators, buf->span);
     } else {
       TVM_FFI_ICHECK(!MatchDType(buf->dtype)) << "Cannot find var remap for " << buf;

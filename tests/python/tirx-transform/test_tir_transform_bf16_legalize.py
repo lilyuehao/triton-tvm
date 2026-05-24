@@ -43,6 +43,35 @@ def f32tobf16(v):
     return T.reinterpret("bfloat16", f32tou16(v))
 
 
+def test_bf16_storage_alloc_buffer_without_prior_var_remap():
+    def get_before():
+        @tvm.script.ir_module
+        class Before:
+            @T.prim_func
+            def main():
+                T.func_attr({"target": T.target("llvm")})
+                with T.attr(0, "compute_scope", "main_compute_"):
+                    red = T.alloc_buffer((2,), "bfloat16", scope="local")
+                    T.evaluate(red.data)
+
+        return Before
+
+    def get_expected():
+        @tvm.script.ir_module
+        class Expected:
+            @T.prim_func
+            def main():
+                T.func_attr({"target": T.target("llvm")})
+                with T.attr(0, "compute_scope", "main_compute_"):
+                    red = T.alloc_buffer((2,), "uint16", scope="local")
+                    T.evaluate(red.data)
+
+        return Expected
+
+    after = tvm.tirx.transform.BF16StorageLegalize()(get_before())
+    tvm.ir.assert_structural_equal(after, get_expected())
+
+
 def test_bf16_simple_store_will_legalize():
     def get_before():
         @tvm.script.ir_module

@@ -207,6 +207,10 @@ class TTIRReader:
             match = re.search(r"axis\s*=\s*(-?\d+)\s*:\s*i\d+", rest)
             if match:
                 attrs["axis"] = int(match.group(1))
+        elif name == "tt.expand_dims":
+            match = re.search(r"axis\s*=\s*(-?\d+)\s*:\s*i\d+", rest)
+            if match:
+                attrs["axis"] = int(match.group(1))
         if name in ("tt.load", "tt.store"):
             raw_attrs = _extract_first_attr_dict(rest)
             if not raw_attrs:
@@ -219,11 +223,19 @@ class TTIRReader:
     def _parse_result_types(self, name: str, rest: str) -> list[TTIRType]:
         if name in ("tt.return", "tt.store"):
             return []
-        if name == "tt.splat" and "->" in rest:
+        if name in ("tt.splat", "tt.expand_dims", "tt.broadcast") and "->" in rest:
             return [parse_ttir_type(rest.rsplit("->", 1)[1].strip())]
         if (
             name
-            in ("arith.extf", "arith.extsi", "arith.extui", "arith.sitofp", "arith.truncf")
+            in (
+                "arith.extf",
+                "arith.extsi",
+                "arith.extui",
+                "arith.fptosi",
+                "arith.fptoui",
+                "arith.sitofp",
+                "arith.truncf",
+            )
             and " to " in rest
         ):
             return [parse_ttir_type(rest.rsplit(" to ", 1)[1].strip())]
