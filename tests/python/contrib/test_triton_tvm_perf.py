@@ -37,6 +37,7 @@ import pytest
 import tvm
 import tvm.testing
 from tvm.contrib.triton_tvm import build_triton_tvm, lower_to_ttir, translate_ttir
+from tvm.contrib.triton_tvm.matmul import NATIVE_TIR_MATMUL_SCHEDULE_ID
 
 try:
     import torch
@@ -47,6 +48,7 @@ except ImportError:
 
 
 _RUN_PERF = os.environ.get("TRITON_TVM_RUN_PERF_BASELINE") == "1"
+_RUN_M9_MATMUL_PERF = os.environ.get("TRITON_TVM_RUN_M9_MATMUL_PERF_GUARD") == "1"
 _DEFAULT_N = int(os.environ.get("TRITON_TVM_PERF_N", str(2**22)))
 _DEFAULT_BLOCK = int(os.environ.get("TRITON_TVM_PERF_BLOCK", "256"))
 _TVM_NUMBER = int(os.environ.get("TRITON_TVM_PERF_TVM_NUMBER", "20"))
@@ -58,6 +60,11 @@ _REGRESSION_TOLERANCE = float(os.environ.get("TRITON_TVM_PERF_TOLERANCE", "0.35"
 _BROADCAST_FEATURE = int(os.environ.get("TRITON_TVM_PERF_BROADCAST_FEATURE", "1024"))
 _TVM_TO_TRITON_GBPS_FLOOR = float(
     os.environ.get("TRITON_TVM_PERF_TVM_TO_TRITON_GBPS_FLOOR", "0.10")
+)
+_M9_MATMUL_NUMBER = int(os.environ.get("TRITON_TVM_M9_MATMUL_PERF_NUMBER", "20"))
+_M9_MATMUL_REPEAT = int(os.environ.get("TRITON_TVM_M9_MATMUL_PERF_REPEAT", "7"))
+_M9_MATMUL_MIN_REPEAT_MS = int(
+    os.environ.get("TRITON_TVM_M9_MATMUL_PERF_MIN_REPEAT_MS", "50")
 )
 
 
@@ -266,6 +273,24 @@ def test_pointwise_perf_baseline_regression_guard():
     _assert_perf_smoke_no_order_of_magnitude_drop(results)
 
 
+@pytest.mark.skipif(
+    not _RUN_M9_MATMUL_PERF,
+    reason="Set TRITON_TVM_RUN_M9_MATMUL_PERF_GUARD=1 to run the M9 matmul perf scaffold",
+)
+@tvm.testing.requires_cuda
+def test_m9_matmul_perf_guard_scaffold():
+    results = _run_m9_matmul_perf_scaffold()
+    print("TRITON_TVM_M9_MATMUL_PERF_RESULT " + json.dumps(results, indent=2, sort_keys=True))
+
+    write_path = os.environ.get("TRITON_TVM_M9_MATMUL_PERF_WRITE_JSON")
+    if write_path:
+        Path(write_path).write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
+
+    assert results["implementation_kind"] == "native_tir_schedule"
+    assert results["schedule_id"] == NATIVE_TIR_MATMUL_SCHEDULE_ID
+    assert results["tvm_us"] > 0.0
+
+
 def _run_perf_baseline() -> dict[str, Any]:
     dev = tvm.cuda(0)
     rng = np.random.default_rng(0)
@@ -292,6 +317,77 @@ def _run_perf_baseline() -> dict[str, Any]:
         payload["cases"].append(_benchmark_case(case, dev, rng))
 
     return payload
+
+
+def _run_m9_matmul_perf_scaffold() -> dict[str, Any]:
+    dev = tvm.cuda(0)
+    rng = np.random.default_rng(0)
+    m, n, k = 8, 4, 16
+    a_np = rng.random((m, k), dtype=np.float32).astype("float16")
+    b_np = rng.random((k, n), dtype=np.float32).astype("float16")
+
+    irmod, meta = translate_ttir(
+        _m9_perf_dot_ttir(),
+        grid=(1,),
+        target="cuda",
+        contract="matmul_minimal",
+    )
+    built = build_triton_tvm(irmod, meta)
+    args = [
+        tvm.runtime.tensor(a_np, dev),
+        tvm.runtime.tensor(b_np, dev),
+        tvm.runtime.empty((m, n), "float32", dev),
+    ]
+    built.run(args)
+    timer = built.executable.mod.time_evaluator(
+        meta.kernel_name,
+        dev,
+        number=_M9_MATMUL_NUMBER,
+        repeat=_M9_MATMUL_REPEAT,
+        min_repeat_ms=_M9_MATMUL_MIN_REPEAT_MS,
+    )
+    tvm_seconds = statistics.median(timer(*args).results)
+    return {
+        "schema_version": 1,
+        "purpose": "m9 matmul minimal perf scaffold",
+        "m": m,
+        "n": n,
+        "k": k,
+        "dtype": "float16",
+        "contract": meta.contract,
+        "implementation_kind": meta.implementation_kind,
+        "schedule_id": meta.schedule_id,
+        "tvm_number": _M9_MATMUL_NUMBER,
+        "tvm_repeat": _M9_MATMUL_REPEAT,
+        "tvm_min_repeat_ms": _M9_MATMUL_MIN_REPEAT_MS,
+        "tvm_us": tvm_seconds * 1e6,
+        "device": torch.cuda.get_device_name(0),
+        "tvm_version": tvm.__version__,
+        "triton_version": triton.__version__,
+    }
+
+
+def _m9_perf_dot_ttir() -> str:
+    return """
+module {
+  tt.func @_m9_perf_dot(%a:!tt.ptr<f16>,%b:!tt.ptr<f16>,%out:!tt.ptr<f32>) {
+    %a_zero = arith.constant dense<0> : tensor<8x16xi32>
+    %b_zero = arith.constant dense<0> : tensor<16x4xi32>
+    %c_zero = arith.constant dense<0> : tensor<8x4xi32>
+    %a_splat = tt.splat %a : !tt.ptr<f16> -> tensor<8x16x!tt.ptr<f16>>
+    %a_ptr = tt.addptr %a_splat, %a_zero : tensor<8x16x!tt.ptr<f16>>, tensor<8x16xi32>
+    %va = tt.load %a_ptr : tensor<8x16x!tt.ptr<f16>>
+    %b_splat = tt.splat %b : !tt.ptr<f16> -> tensor<16x4x!tt.ptr<f16>>
+    %b_ptr = tt.addptr %b_splat, %b_zero : tensor<16x4x!tt.ptr<f16>>, tensor<16x4xi32>
+    %vb = tt.load %b_ptr : tensor<16x4x!tt.ptr<f16>>
+    %dot = tt.dot %va, %vb {inputPrecision = tf32} : tensor<8x16xf16>, tensor<16x4xf16> -> tensor<8x4xf32>
+    %out_splat = tt.splat %out : !tt.ptr<f32> -> tensor<8x4x!tt.ptr<f32>>
+    %out_ptr = tt.addptr %out_splat, %c_zero : tensor<8x4x!tt.ptr<f32>>, tensor<8x4xi32>
+    tt.store %out_ptr, %dot : tensor<8x4x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
 
 
 def _benchmark_case(case: _PerfCase, dev, rng: np.random.Generator) -> dict[str, Any]:

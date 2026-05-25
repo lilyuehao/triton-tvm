@@ -26,6 +26,25 @@ Current implementation boundary:
 - Pre-M9 wrapper-level extern visibility is active: GEMM/GEMM+bias extern
   calls are M9 entry debt, while convolution and attention wrapper calls remain
   deferred.
+- M9 entry is MatmulSemantics-first: `tt.dot`, wrapper-level extern GEMM, and
+  future graph matmul sources should converge on `MatmulContract` before
+  target policy chooses native schedule, explicit TVM artifact extern GEMM, or
+  unsupported fallback.
+- M9.1-M9.8 implement `matmul_minimal` for synthetic/static exact unmasked
+  rank-2 `tt.dot`: first validating an unresolved semantic
+  `T.sblock("matmul")`, then selecting a correctness-first
+  `native_tir_schedule` with fp16/bf16 to fp32 CUDA runtime coverage. M9.7
+  adds gated `cuda_block_tile_8x8_serial_k_v1` for eligible M/N-multiple-of-8
+  shapes while non-eligible accepted shapes keep
+  `cuda_block_per_output_serial_k_v1`. Wrapper `extern_kernels.mm`
+  materializes as an explicit `tvm.contrib.triton_tvm.extern_gemm` packed-call
+  artifact. M9.6 adds an opt-in correctness-only
+  `python_torch_host_staged` provider proof; the default remains artifact-only,
+  and the provider makes no performance, TVM-only backend, or full-model
+  runnable claim. M9.8 adds a separate TinyMNISTMLP staged diagnostic baseline:
+  two runtime-resolved host-staged extern GEMMs plus one TVM pointwise ReLU on
+  the full MNIST test split. This diagnostic report does not change captured
+  corpus metrics or make a native performance claim.
 
 Read these workbench files when starting a new milestone:
 

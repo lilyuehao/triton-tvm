@@ -22,6 +22,7 @@ from .contracts import (
     normalize_triton_tvm_contract,
     validate_cuda_minimal_contract,
     validate_cuda_pointwise_flat_contract,
+    validate_matmul_minimal_contract,
     validate_masked_softmax_row_contract,
     validate_norm_single_row_contract,
     validate_norm_row_contract,
@@ -41,12 +42,21 @@ from .errors import (
     UnsupportedTargetPolicyError,
 )
 from .frontend import TTIRArtifact, lower_to_ttir
+from .matmul import (
+    MatmulSemantics,
+    TargetMatmulDecision,
+    TargetMatmulPolicy,
+    register_python_torch_extern_gemm,
+)
 from .passes import ValidateTritonKernelTIR
 from .runtime import TritonTVMArtifact, build_triton_tvm
 from .translator import TritonTVMMeta, translate_ttir
 
 __all__ = [
     "TTIRArtifact",
+    "MatmulSemantics",
+    "TargetMatmulDecision",
+    "TargetMatmulPolicy",
     "TritonTVMArtifact",
     "TritonTVMContract",
     "TritonTVMContractError",
@@ -61,7 +71,9 @@ __all__ = [
     "get_triton_tvm_contract",
     "lower_to_ttir",
     "normalize_triton_tvm_contract",
+    "register_python_torch_extern_gemm",
     "translate_ttir",
+    "validate_matmul_minimal_contract",
     "validate_masked_softmax_row_contract",
     "validate_norm_single_row_contract",
     "validate_norm_row_contract",

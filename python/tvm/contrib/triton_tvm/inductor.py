@@ -50,6 +50,17 @@ from .errors import (
 )
 from .frontend import TTIRArtifact, lower_to_ttir
 from .indexing import summarize_ttir_indexing
+from .matmul import (
+    EXTERN_GEMM_PACKED_FUNC,
+    EXTERN_GEMM_PROVIDER_NONE,
+    EXTERN_GEMM_RUNTIME_KIND,
+    EXTERN_GEMM_RUNTIME_REPLACEMENT,
+    EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON,
+    EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY,
+    EXTERN_GEMM_SYMBOL,
+    TargetMatmulPolicy,
+    extract_matmul_semantics_from_wrapper_extern,
+)
 from .op_graph import NormalizedTTIROpGraph
 from .reporting import (
     build_capability_report,
@@ -88,6 +99,38 @@ class InductorWrapperExternCall:
     line_no: int
     wrapper_path: str = ""
     source: str = ""
+    matmul_source_kind: str = ""
+    matmul_m: int | None = None
+    matmul_n: int | None = None
+    matmul_k: int | None = None
+    matmul_contract: str = ""
+    matmul_contract_ok: bool = False
+    matmul_a_dtype: str = ""
+    matmul_b_dtype: str = ""
+    matmul_accumulator_dtype: str = ""
+    matmul_output_dtype: str = ""
+    matmul_epilogue_kind: str = ""
+    implementation_kind: str = ""
+    schedule_id: str = ""
+    extern_symbol: str = ""
+    extern_packed_func: str = ""
+    extern_runtime_kind: str = ""
+    extern_runtime_replacement: str = ""
+    extern_runtime_replacement_available: bool = False
+    extern_runtime_replacement_reason: str = ""
+    extern_gemm_runtime_status: str = ""
+    extern_gemm_provider_kind: str = ""
+    extern_gemm_provider_abi_version: int = 0
+    extern_gemm_runtime_claim: str = ""
+    extern_gemm_performance_claim: bool = False
+    extern_gemm_uses_host_staging: bool = False
+    unsupported_matmul_reason: str = ""
+    matmul_a_layout: str = ""
+    matmul_b_layout: str = ""
+    matmul_c_layout: str = ""
+    matmul_a_stride: tuple[int, int] | None = None
+    matmul_b_stride: tuple[int, int] | None = None
+    matmul_c_stride: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -333,6 +376,7 @@ class TritonTVMInductorSession:
                 "native_fallback_count": 0,
             }
         )
+        record.update(_matmul_meta_fields(built.meta))
         self._attach_record_to_graph(record, translated=True, cache_hit=cache_hit)
         self.records.append(record)
         self.counters["translated"] += 1
@@ -633,6 +677,7 @@ def extract_inductor_wrapper_extern_calls(
     *,
     case_name: str = "",
     wrapper_path: str = "",
+    extern_gemm_runtime_provider: str = EXTERN_GEMM_PROVIDER_NONE,
 ) -> list[InductorWrapperExternCall]:
     """Extract wrapper-level extern/ATen calls that are not Triton kernels."""
     tree = ast.parse(wrapper_source)
@@ -655,9 +700,145 @@ def extract_inductor_wrapper_extern_calls(
                 line_no=line_no,
                 wrapper_path=wrapper_path,
                 source=source_line,
+                **_wrapper_extern_matmul_fields(
+                    op_name,
+                    op_family,
+                    source_line,
+                    case_name=case_name,
+                    extern_gemm_runtime_provider=extern_gemm_runtime_provider,
+                ),
             )
         )
     return sorted(calls, key=lambda call: (call.line_no, call.op_name))
+
+
+def _wrapper_extern_matmul_fields(
+    op_name: str,
+    op_family: str,
+    source_line: str,
+    *,
+    case_name: str,
+    extern_gemm_runtime_provider: str = EXTERN_GEMM_PROVIDER_NONE,
+) -> dict[str, Any]:
+    empty = {
+        "matmul_source_kind": "",
+        "matmul_m": None,
+        "matmul_n": None,
+        "matmul_k": None,
+        "matmul_contract": "",
+        "matmul_contract_ok": False,
+        "matmul_a_dtype": "",
+        "matmul_b_dtype": "",
+        "matmul_accumulator_dtype": "",
+        "matmul_output_dtype": "",
+        "matmul_epilogue_kind": "",
+        "implementation_kind": "",
+        "schedule_id": "",
+        "extern_symbol": "",
+        "extern_packed_func": "",
+        "extern_runtime_kind": "",
+        "extern_runtime_replacement": "",
+        "extern_runtime_replacement_available": False,
+        "extern_runtime_replacement_reason": "",
+        "extern_gemm_runtime_status": "",
+        "extern_gemm_provider_kind": "",
+        "extern_gemm_provider_abi_version": 0,
+        "extern_gemm_runtime_claim": "",
+        "extern_gemm_performance_claim": False,
+        "extern_gemm_uses_host_staging": False,
+        "unsupported_matmul_reason": "",
+        "matmul_a_layout": "",
+        "matmul_b_layout": "",
+        "matmul_c_layout": "",
+        "matmul_a_stride": None,
+        "matmul_b_stride": None,
+        "matmul_c_stride": None,
+    }
+    if op_family == "extern_addmm_bias":
+        return {
+            **empty,
+            "matmul_source_kind": "wrapper_extern_addmm_bias",
+            "matmul_contract": "matmul_minimal",
+            "matmul_epilogue_kind": "bias_add",
+            "implementation_kind": "unsupported",
+            "unsupported_matmul_reason": "extern_addmm_bias_epilogue_not_supported",
+        }
+    if op_name != EXTERN_GEMM_SYMBOL or op_family != "extern_gemm":
+        return empty
+
+    try:
+        semantics = extract_matmul_semantics_from_wrapper_extern(
+            {
+                "op_name": op_name,
+                "source": source_line,
+                "case_name": case_name,
+                "kernel_name": case_name or "wrapper_extern_gemm",
+            }
+        )
+        decision = TargetMatmulPolicy(
+            target_kind="cuda",
+            extern_gemm_runtime_provider=extern_gemm_runtime_provider,
+        ).decide(
+            semantics,
+            matmul_contract_ok=True,
+        )
+    except UnsupportedTTIROpError as err:
+        return {
+            **empty,
+            "matmul_source_kind": "wrapper_extern_gemm",
+            "matmul_contract": "matmul_minimal",
+            "implementation_kind": "unsupported",
+            "unsupported_matmul_reason": str(err),
+        }
+
+    return {
+        **empty,
+        "matmul_source_kind": semantics.source_kind,
+        "matmul_m": semantics.m,
+        "matmul_n": semantics.n,
+        "matmul_k": semantics.k,
+        "matmul_contract": "matmul_minimal",
+        "matmul_contract_ok": decision.matmul_contract_ok
+        and decision.implementation_kind == "extern_gemm",
+        "matmul_a_dtype": semantics.a_dtype,
+        "matmul_b_dtype": semantics.b_dtype,
+        "matmul_accumulator_dtype": semantics.accumulator_dtype,
+        "matmul_output_dtype": semantics.output_dtype,
+        "matmul_epilogue_kind": semantics.epilogue_kind,
+        "implementation_kind": decision.implementation_kind,
+        "schedule_id": decision.schedule_id,
+        "extern_symbol": decision.extern_symbol,
+        "extern_packed_func": decision.extern_packed_func or EXTERN_GEMM_PACKED_FUNC,
+        "extern_runtime_kind": decision.extern_runtime_kind or EXTERN_GEMM_RUNTIME_KIND,
+        "extern_runtime_replacement": (
+            decision.extern_runtime_replacement or EXTERN_GEMM_RUNTIME_REPLACEMENT
+        ),
+        "extern_runtime_replacement_available": (
+            decision.extern_runtime_replacement_available
+        ),
+        "extern_runtime_replacement_reason": (
+            decision.extern_runtime_replacement_reason
+            or EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON
+        ),
+        "extern_gemm_runtime_status": (
+            decision.extern_gemm_runtime_status
+            or EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+        ),
+        "extern_gemm_provider_kind": (
+            decision.extern_gemm_provider_kind or EXTERN_GEMM_PROVIDER_NONE
+        ),
+        "extern_gemm_provider_abi_version": decision.extern_gemm_provider_abi_version,
+        "extern_gemm_runtime_claim": decision.extern_gemm_runtime_claim,
+        "extern_gemm_performance_claim": decision.extern_gemm_performance_claim,
+        "extern_gemm_uses_host_staging": decision.extern_gemm_uses_host_staging,
+        "unsupported_matmul_reason": decision.unsupported_matmul_reason,
+        "matmul_a_layout": semantics.a_layout,
+        "matmul_b_layout": semantics.b_layout,
+        "matmul_c_layout": semantics.c_layout,
+        "matmul_a_stride": semantics.a_stride,
+        "matmul_b_stride": semantics.b_stride,
+        "matmul_c_stride": semantics.c_stride,
+    }
 
 
 def _attribute_chain(node: ast.AST) -> str:
@@ -1052,8 +1233,20 @@ def audit_inductor_ttir(
 
     record.update(_graph_coverage(graph))
     try:
-        translate_ttir(ttir, grid=(1,), contract=contract)
-        record["translate_status"] = make_report_status(ok=True, bucket="translated")
+        _, meta = translate_ttir(ttir, grid=(1,), contract=contract)
+        record.update(_matmul_meta_fields(meta))
+        if (
+            meta.implementation_kind == "unsupported"
+            and meta.unsupported_matmul_reason
+        ):
+            record["translate_status"] = make_report_status(
+                ok=False,
+                bucket="target_policy_error",
+                fallback_reason="matmul_policy_unsupported",
+                message=meta.unsupported_matmul_reason,
+            )
+        else:
+            record["translate_status"] = make_report_status(ok=True, bucket="translated")
     except UnsupportedTTIROpError as err:
         record["translate_status"] = _error_status("unsupported_ttir_op", err)
     except (TritonTVMContractError, UnsupportedContractError) as err:
@@ -1706,6 +1899,38 @@ def _base_m5_record(
         "run_count": 0,
         "native_fallback_count": 0,
         "translate_status": status,
+    }
+
+
+def _matmul_meta_fields(meta: Any) -> dict[str, Any]:
+    if not getattr(meta, "matmul_source_kind", ""):
+        return {}
+    return {
+        "matmul_source_kind": getattr(meta, "matmul_source_kind", ""),
+        "matmul_m": getattr(meta, "matmul_m", None),
+        "matmul_n": getattr(meta, "matmul_n", None),
+        "matmul_k": getattr(meta, "matmul_k", None),
+        "matmul_contract_ok": bool(getattr(meta, "matmul_contract_ok", False)),
+        "matmul_a_dtype": getattr(meta, "matmul_a_dtype", ""),
+        "matmul_b_dtype": getattr(meta, "matmul_b_dtype", ""),
+        "matmul_accumulator_dtype": getattr(meta, "matmul_accumulator_dtype", ""),
+        "matmul_output_dtype": getattr(meta, "matmul_output_dtype", ""),
+        "matmul_epilogue_kind": getattr(meta, "matmul_epilogue_kind", ""),
+        "implementation_kind": getattr(meta, "implementation_kind", ""),
+        "schedule_id": getattr(meta, "schedule_id", ""),
+        "extern_symbol": getattr(meta, "extern_symbol", ""),
+        "extern_packed_func": getattr(meta, "extern_packed_func", ""),
+        "extern_runtime_kind": getattr(meta, "extern_runtime_kind", ""),
+        "extern_runtime_replacement": getattr(meta, "extern_runtime_replacement", ""),
+        "extern_runtime_replacement_available": bool(
+            getattr(meta, "extern_runtime_replacement_available", False)
+        ),
+        "extern_runtime_replacement_reason": getattr(
+            meta,
+            "extern_runtime_replacement_reason",
+            "",
+        ),
+        "unsupported_matmul_reason": getattr(meta, "unsupported_matmul_reason", ""),
     }
 
 

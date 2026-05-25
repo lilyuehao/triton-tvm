@@ -30,16 +30,42 @@ from tvm.contrib.triton_tvm import (
     UnsupportedTTIROpError,
     UnsupportedTargetPolicyError,
     ValidateTritonKernelTIR,
+    MatmulSemantics,
+    TargetMatmulDecision,
+    TargetMatmulPolicy,
     get_triton_tvm_contract,
     translate_ttir,
     validate_cuda_minimal_contract,
     validate_cuda_pointwise_flat_contract,
+    validate_matmul_minimal_contract,
     validate_norm_single_row_contract,
     validate_pointwise_flat_contract,
     validate_reduction_minimal_contract,
     validate_triton_tvm_contract,
 )
 from tvm.contrib.triton_tvm.indexing import summarize_ttir_indexing
+from tvm.contrib.triton_tvm.inductor import audit_inductor_ttir
+from tvm.contrib.triton_tvm.matmul import (
+    EXTERN_GEMM_PACKED_FUNC,
+    EXTERN_GEMM_PROVIDER_ABI_VERSION,
+    EXTERN_GEMM_PROVIDER_NONE,
+    EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    EXTERN_GEMM_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+    EXTERN_GEMM_RUNTIME_KIND,
+    EXTERN_GEMM_RUNTIME_PROVIDER_KIND,
+    EXTERN_GEMM_RUNTIME_PROVIDER_REASON,
+    EXTERN_GEMM_RUNTIME_REPLACEMENT,
+    EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON,
+    EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY,
+    EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED,
+    EXTERN_GEMM_SYMBOL,
+    NATIVE_TIR_MATMUL_SCHEDULE_ID,
+    TILED_TIR_MATMUL_SCHEDULE_ID,
+    build_extern_gemm_tirx_source,
+    extract_matmul_semantics_from_ttir,
+    extract_matmul_semantics_from_wrapper_extern,
+    register_python_torch_extern_gemm,
+)
 from tvm.contrib.triton_tvm.ttir import TTIRReader
 
 
@@ -320,6 +346,41 @@ module {
 """
 
 
+def _static_m9_dot_ttir(dtype: str = "f16") -> str:
+    return f"""
+module {{
+  tt.func @_m9_dot(%a:!tt.ptr<{dtype}>,%b:!tt.ptr<{dtype}>,%out:!tt.ptr<f32>) {{
+    %a_zero = arith.constant dense<0> : tensor<8x16xi32>
+    %b_zero = arith.constant dense<0> : tensor<16x4xi32>
+    %c_zero = arith.constant dense<0> : tensor<8x4xi32>
+    %a_splat = tt.splat %a : !tt.ptr<{dtype}> -> tensor<8x16x!tt.ptr<{dtype}>>
+    %a_ptr = tt.addptr %a_splat, %a_zero : tensor<8x16x!tt.ptr<{dtype}>>, tensor<8x16xi32>
+    %va = tt.load %a_ptr : tensor<8x16x!tt.ptr<{dtype}>>
+    %b_splat = tt.splat %b : !tt.ptr<{dtype}> -> tensor<16x4x!tt.ptr<{dtype}>>
+    %b_ptr = tt.addptr %b_splat, %b_zero : tensor<16x4x!tt.ptr<{dtype}>>, tensor<16x4xi32>
+    %vb = tt.load %b_ptr : tensor<16x4x!tt.ptr<{dtype}>>
+    %dot = tt.dot %va, %vb {{inputPrecision = tf32}} : tensor<8x16x{dtype}>, tensor<16x4x{dtype}> -> tensor<8x4xf32>
+    %out_splat = tt.splat %out : !tt.ptr<f32> -> tensor<8x4x!tt.ptr<f32>>
+    %out_ptr = tt.addptr %out_splat, %c_zero : tensor<8x4x!tt.ptr<f32>>, tensor<8x4xi32>
+    tt.store %out_ptr, %dot : tensor<8x4x!tt.ptr<f32>>
+    tt.return
+  }}
+}}
+"""
+
+
+def _static_m97_tiled_dot_ttir(dtype: str = "f16") -> str:
+    return (
+        _static_m9_dot_ttir(dtype)
+        .replace("tensor<16x4xi32>", "tensor<16x8xi32>")
+        .replace("tensor<8x4xi32>", "tensor<8x8xi32>")
+        .replace("tensor<16x4x!tt.ptr", "tensor<16x8x!tt.ptr")
+        .replace("tensor<8x4x!tt.ptr", "tensor<8x8x!tt.ptr")
+        .replace("tensor<16x4x" + dtype + ">", "tensor<16x8x" + dtype + ">")
+        .replace("tensor<8x4xf32>", "tensor<8x8xf32>")
+    )
+
+
 _STATIC_PRE_M7_ATOMIC_GRID_TTIR = """
 module {
   tt.func @_pre_m7_atomic_grid(%x:!tt.ptr<f32>,%out:!tt.ptr<f32>) {
@@ -433,6 +494,9 @@ def test_static_pre_m5_public_pass_surface():
 def test_static_pre_m5_public_api_freeze():
     assert set(triton_tvm_pkg.__all__) == {
         "TTIRArtifact",
+        "MatmulSemantics",
+        "TargetMatmulDecision",
+        "TargetMatmulPolicy",
         "TritonTVMArtifact",
         "TritonTVMContract",
         "TritonTVMContractError",
@@ -447,7 +511,9 @@ def test_static_pre_m5_public_api_freeze():
         "get_triton_tvm_contract",
         "lower_to_ttir",
         "normalize_triton_tvm_contract",
+        "register_python_torch_extern_gemm",
         "translate_ttir",
+        "validate_matmul_minimal_contract",
         "validate_masked_softmax_row_contract",
         "validate_norm_single_row_contract",
         "validate_norm_row_contract",
@@ -525,6 +591,475 @@ def test_static_pre_m7_reader_snapshot_classes_without_translation():
     assert {"tt.trans", "tt.softmax"} <= {
         op.name for op in snapshots["attention_adjacent"].ops
     }
+
+
+def test_static_m9_reader_extracts_rank2_dot_semantics():
+    graph = TTIRReader().read(_static_m9_dot_ttir("f16"))
+    dot = graph.op_by_result()["dot"]
+
+    assert dot.attrs["inputPrecision"] == "tf32"
+    assert [(ty.raw, ty.dtype, ty.shape) for ty in dot.result_types] == [
+        ("tensor<8x4xf32>", "float32", (8, 4))
+    ]
+
+    semantics = extract_matmul_semantics_from_ttir(graph)
+    assert isinstance(semantics, MatmulSemantics)
+    assert semantics.source_kind == "tt_dot"
+    assert semantics.kernel_name == "_m9_dot"
+    assert (semantics.m, semantics.n, semantics.k) == (8, 4, 16)
+    assert (semantics.a_param, semantics.b_param, semantics.c_param) == ("a", "b", "out")
+    assert semantics.a_dtype == "float16"
+    assert semantics.b_dtype == "float16"
+    assert semantics.accumulator_dtype == "float32"
+    assert semantics.output_dtype == "float32"
+    assert semantics.a_stride == (16, 1)
+    assert semantics.b_stride == (4, 1)
+    assert semantics.c_stride == (4, 1)
+    assert semantics.mask_kind == "none"
+    assert semantics.epilogue_kind == "none"
+    assert semantics.implementation_kind == "unresolved"
+
+    bf16_semantics = extract_matmul_semantics_from_ttir(
+        TTIRReader().read(_static_m9_dot_ttir("bf16"))
+    )
+    assert bf16_semantics.a_dtype == "bfloat16"
+    assert bf16_semantics.b_dtype == "bfloat16"
+    assert bf16_semantics.output_dtype == "float32"
+
+
+def test_static_m9_target_matmul_policy_selects_native_schedule():
+    semantics = extract_matmul_semantics_from_ttir(
+        TTIRReader().read(_static_m9_dot_ttir("f16"))
+    )
+    decision = TargetMatmulPolicy().decide(
+        semantics,
+        matmul_contract_ok=True,
+    )
+
+    assert isinstance(decision, TargetMatmulDecision)
+    assert decision.matmul_contract_ok is True
+    assert decision.implementation_kind == "native_tir_schedule"
+    assert decision.schedule_id == NATIVE_TIR_MATMUL_SCHEDULE_ID
+    assert decision.extern_symbol == ""
+    assert decision.unsupported_matmul_reason == ""
+    assert decision.cache_payload()["implementation_kind"] == "native_tir_schedule"
+
+
+def test_static_m9_wrapper_extern_gemm_semantics_from_real_source_lines():
+    transposed_weight_source = (
+        "extern_kernels.mm(reinterpret_tensor(buf1, (16, 64), (64, 1), 0), "
+        "reinterpret_tensor(arg4_1, (64, 64), (1, 64), 0), out=buf2)"
+    )
+    semantics = extract_matmul_semantics_from_wrapper_extern(
+        transposed_weight_source,
+        case_name="llama_tiny",
+    )
+
+    assert semantics.source_kind == "wrapper_extern_gemm"
+    assert semantics.source_name == EXTERN_GEMM_SYMBOL
+    assert semantics.kernel_name == "llama_tiny"
+    assert (semantics.m, semantics.n, semantics.k) == (16, 64, 64)
+    assert (semantics.a_param, semantics.b_param, semantics.c_param) == (
+        "buf1",
+        "arg4_1",
+        "buf2",
+    )
+    assert semantics.a_dtype == "float32"
+    assert semantics.b_dtype == "float32"
+    assert semantics.accumulator_dtype == "float32"
+    assert semantics.output_dtype == "float32"
+    assert semantics.a_stride == (64, 1)
+    assert semantics.b_stride == (1, 64)
+    assert semantics.c_stride == (64, 1)
+    assert semantics.a_layout == "row_major"
+    assert semantics.b_layout == "transposed_weight_view"
+    assert semantics.c_layout == "row_major"
+    assert semantics.epilogue_kind == "none"
+
+    row_major_source = (
+        "extern_kernels.mm(reinterpret_tensor(buf15, (16, 64), (64, 1), 0), "
+        "reinterpret_tensor(arg9_1, (64, 128), (128, 1), 0), out=buf16)"
+    )
+    row_major = extract_matmul_semantics_from_wrapper_extern(
+        row_major_source,
+        case_name="vit_tiny",
+    )
+    assert (row_major.m, row_major.n, row_major.k) == (16, 128, 64)
+    assert row_major.b_stride == (128, 1)
+    assert row_major.b_layout == "row_major"
+
+
+def test_static_m9_wrapper_extern_gemm_policy_and_artifact_without_runtime():
+    semantics = extract_matmul_semantics_from_wrapper_extern(
+        "extern_kernels.mm(reinterpret_tensor(buf1, (16, 64), (64, 1), 0), "
+        "reinterpret_tensor(arg4_1, (64, 64), (1, 64), 0), out=buf2)",
+        case_name="llama_tiny",
+    )
+    decision = TargetMatmulPolicy().decide(
+        semantics,
+        matmul_contract_ok=True,
+    )
+
+    assert decision.matmul_contract_ok is True
+    assert decision.implementation_kind == "extern_gemm"
+    assert decision.schedule_id == ""
+    assert decision.extern_symbol == EXTERN_GEMM_SYMBOL
+    assert decision.extern_packed_func == EXTERN_GEMM_PACKED_FUNC
+    assert decision.extern_runtime_kind == EXTERN_GEMM_RUNTIME_KIND
+    assert decision.extern_runtime_replacement == EXTERN_GEMM_RUNTIME_REPLACEMENT
+    assert decision.extern_runtime_replacement_available is False
+    assert (
+        decision.extern_runtime_replacement_reason
+        == EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON
+    )
+    assert decision.unsupported_matmul_reason == ""
+
+    source = build_extern_gemm_tirx_source(semantics, decision)
+    irmod = tvm.script.from_source(source)
+    validate_matmul_minimal_contract(irmod)
+    attrs = next(iter(irmod.functions.values())).attrs
+    script = irmod.script()
+
+    assert str(attrs["triton_tvm.contract"]) == "matmul_minimal"
+    assert str(attrs["triton_tvm.matmul_source_kind"]) == "wrapper_extern_gemm"
+    assert str(attrs["triton_tvm.implementation_kind"]) == "extern_gemm"
+    assert str(attrs["triton_tvm.extern_symbol"]) == EXTERN_GEMM_SYMBOL
+    assert str(attrs["triton_tvm.extern_packed_func"]) == EXTERN_GEMM_PACKED_FUNC
+    assert str(attrs["triton_tvm.extern_runtime_kind"]) == EXTERN_GEMM_RUNTIME_KIND
+    assert (
+        str(attrs["triton_tvm.extern_runtime_replacement"])
+        == EXTERN_GEMM_RUNTIME_REPLACEMENT
+    )
+    assert (
+        str(attrs["triton_tvm.extern_runtime_replacement_reason"])
+        == EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON
+    )
+    assert str(attrs["triton_tvm.a_dtype"]) == "float32"
+    assert str(attrs["triton_tvm.b_dtype"]) == "float32"
+    assert str(attrs["triton_tvm.output_dtype"]) == "float32"
+    assert str(attrs["triton_tvm.accumulator_dtype"]) == "float32"
+    assert str(attrs["triton_tvm.input_precision"]) == "extern_fp32"
+    assert str(attrs["triton_tvm.bounds_policy"]) == "exact"
+    assert str(attrs["triton_tvm.mask_kind"]) == "none"
+    assert str(attrs["triton_tvm.epilogue_kind"]) == "none"
+    assert int(attrs["triton_tvm.matmul_m"]) == 16
+    assert int(attrs["triton_tvm.matmul_n"]) == 64
+    assert int(attrs["triton_tvm.matmul_k"]) == 64
+    assert str(attrs["triton_tvm.b_layout"]) == "transposed_weight_view"
+    assert EXTERN_GEMM_PACKED_FUNC in script
+    assert "call_packed" in script
+    assert "call_extern" not in script
+    assert 'with T.sblock("matmul")' not in script
+    assert 'thread="blockIdx.x"' not in script
+    assert 'thread="threadIdx.x"' not in script
+
+
+def test_static_m96_wrapper_extern_gemm_runtime_provider_metadata():
+    semantics = extract_matmul_semantics_from_wrapper_extern(
+        "extern_kernels.mm(reinterpret_tensor(buf1, (16, 64), (64, 1), 0), "
+        "reinterpret_tensor(arg4_1, (64, 64), (1, 64), 0), out=buf2)",
+        case_name="llama_tiny",
+    )
+    decision = TargetMatmulPolicy(
+        extern_gemm_runtime_provider=EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED
+    ).decide(
+        semantics,
+        matmul_contract_ok=True,
+    )
+
+    assert decision.extern_runtime_kind == EXTERN_GEMM_RUNTIME_PROVIDER_KIND
+    assert decision.extern_runtime_replacement == EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED
+    assert decision.extern_runtime_replacement_available is True
+    assert decision.extern_runtime_replacement_reason == EXTERN_GEMM_RUNTIME_PROVIDER_REASON
+    assert decision.extern_gemm_runtime_status == EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED
+    assert decision.extern_gemm_provider_kind == EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED
+    assert decision.extern_gemm_provider_abi_version == EXTERN_GEMM_PROVIDER_ABI_VERSION
+    assert decision.extern_gemm_runtime_claim == EXTERN_GEMM_RUNTIME_CLAIM_CORRECTNESS_ONLY
+    assert decision.extern_gemm_performance_claim is False
+    assert decision.extern_gemm_uses_host_staging is True
+
+    source = build_extern_gemm_tirx_source(semantics, decision)
+    irmod = tvm.script.from_source(source)
+    validate_matmul_minimal_contract(irmod)
+    attrs = next(iter(irmod.functions.values())).attrs
+    script = irmod.script()
+
+    assert str(attrs["triton_tvm.extern_gemm_runtime_status"]) == (
+        EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED
+    )
+    assert str(attrs["triton_tvm.extern_gemm_provider_kind"]) == (
+        EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED
+    )
+    assert int(attrs["triton_tvm.extern_gemm_provider_abi_version"]) == 1
+    assert str(attrs["triton_tvm.extern_gemm_runtime_claim"]) == "correctness_only"
+    assert bool(attrs["triton_tvm.extern_gemm_performance_claim"]) is False
+    assert bool(attrs["triton_tvm.extern_gemm_uses_host_staging"]) is True
+    assert bool(attrs["triton_tvm.transposed_b"]) is True
+    assert str(attrs["triton_tvm.b_stride"]) == "1, 64"
+    assert str(attrs["triton_tvm.b_storage_shape"]) == "64, 64"
+    assert str(attrs["triton_tvm.b_storage_stride"]) == "64, 1"
+    assert "T.bool(True)" in script
+
+
+def test_static_m96_extern_gemm_rejects_transposed_storage_mismatch():
+    semantics = extract_matmul_semantics_from_wrapper_extern(
+        "extern_kernels.mm(reinterpret_tensor(buf1, (16, 64), (64, 1), 0), "
+        "reinterpret_tensor(arg4_1, (64, 128), (1, 64), 0), out=buf2)",
+        case_name="llama_tiny",
+    )
+    decision = TargetMatmulPolicy().decide(
+        semantics,
+        matmul_contract_ok=True,
+    )
+    source = build_extern_gemm_tirx_source(semantics, decision)
+    validate_matmul_minimal_contract(tvm.script.from_source(source))
+
+    bad_storage_shape = source.replace(
+        '"triton_tvm.b_storage_shape": "128, 64"',
+        '"triton_tvm.b_storage_shape": "64, 128"',
+    )
+    with pytest.raises(TritonTVMContractError, match="b_storage_shape"):
+        validate_matmul_minimal_contract(tvm.script.from_source(bad_storage_shape))
+
+    bad_transposed_flag = source.replace(
+        '"triton_tvm.transposed_b": True',
+        '"triton_tvm.transposed_b": False',
+    )
+    with pytest.raises(TritonTVMContractError, match="transposed_b"):
+        validate_matmul_minimal_contract(tvm.script.from_source(bad_transposed_flag))
+
+
+def test_static_m95_matmul_contract_rejects_erased_semantic_surface():
+    irmod, _ = translate_ttir(
+        _static_m9_dot_ttir("f16"),
+        grid=(1,),
+        contract="matmul_minimal",
+    )
+    source = irmod.script()
+
+    bad_func_dim = source.replace(
+        '"triton_tvm.matmul_k": 16',
+        '"triton_tvm.matmul_k": 15',
+        1,
+    )
+    with pytest.raises(TritonTVMContractError, match="dims must match"):
+        validate_matmul_minimal_contract(tvm.script.from_source(bad_func_dim))
+
+    bad_axis_extent = source.replace(
+        "vk = T.axis.reduce(16, k)",
+        "vk = T.axis.reduce(15, k)",
+    )
+    with pytest.raises(TritonTVMContractError, match="k axis extent"):
+        validate_matmul_minimal_contract(tvm.script.from_source(bad_axis_extent))
+
+    bad_output_shape = source.replace(
+        "out: T.Buffer((8, 4), \"float32\")",
+        "out: T.Buffer((8, 5), \"float32\")",
+    )
+    with pytest.raises(TritonTVMContractError, match="C write buffer shape"):
+        validate_matmul_minimal_contract(tvm.script.from_source(bad_output_shape))
+
+
+def test_static_m95_extern_gemm_artifact_requires_runtime_gate_metadata():
+    semantics = extract_matmul_semantics_from_wrapper_extern(
+        "extern_kernels.mm(reinterpret_tensor(buf1, (16, 64), (64, 1), 0), "
+        "reinterpret_tensor(arg4_1, (64, 64), (1, 64), 0), out=buf2)",
+        case_name="llama_tiny",
+    )
+    decision = TargetMatmulPolicy().decide(
+        semantics,
+        matmul_contract_ok=True,
+    )
+    source = build_extern_gemm_tirx_source(semantics, decision)
+
+    missing_packed_func = source.replace(
+        f'"triton_tvm.extern_packed_func": "{EXTERN_GEMM_PACKED_FUNC}", ',
+        "",
+    )
+    with pytest.raises(TritonTVMContractError, match="extern_packed_func"):
+        validate_matmul_minimal_contract(tvm.script.from_source(missing_packed_func))
+
+    claims_runtime_replacement = source.replace(
+        f'"triton_tvm.extern_runtime_replacement": "{EXTERN_GEMM_RUNTIME_REPLACEMENT}"',
+        '"triton_tvm.extern_runtime_replacement": "available"',
+    )
+    with pytest.raises(TritonTVMContractError, match="extern_runtime_replacement"):
+        validate_matmul_minimal_contract(
+            tvm.script.from_source(claims_runtime_replacement)
+        )
+
+    claims_replacement_available = source.replace(
+        '"triton_tvm.extern_runtime_replacement_available": False',
+        '"triton_tvm.extern_runtime_replacement_available": True',
+    )
+    with pytest.raises(TritonTVMContractError, match="runtime replacement unavailable"):
+        validate_matmul_minimal_contract(
+            tvm.script.from_source(claims_replacement_available)
+        )
+
+
+def test_static_m9_wrapper_extern_addmm_stays_deferred():
+    with pytest.raises(UnsupportedTTIROpError, match="extern_addmm_bias_epilogue"):
+        extract_matmul_semantics_from_wrapper_extern(
+            {
+                "op_name": "extern_kernels.addmm",
+                "source": (
+                    "extern_kernels.addmm(arg0, reinterpret_tensor(arg1, (16, 64), "
+                    "(64, 1), 0), reinterpret_tensor(arg2, (64, 64), (1, 64), 0), "
+                    "alpha=1, beta=1, out=buf0)"
+                ),
+            }
+        )
+
+    base = extract_matmul_semantics_from_wrapper_extern(
+        "extern_kernels.mm(reinterpret_tensor(buf1, (16, 64), (64, 1), 0), "
+        "reinterpret_tensor(arg4_1, (64, 64), (1, 64), 0), out=buf2)",
+        case_name="llama_tiny",
+    ).cache_payload()
+    base["source_kind"] = "wrapper_extern_addmm_bias"
+    base["epilogue_kind"] = "bias_add"
+    decision = TargetMatmulPolicy().decide(
+        MatmulSemantics(**base),
+        matmul_contract_ok=True,
+    )
+    assert decision.implementation_kind == "unsupported"
+    assert decision.unsupported_matmul_reason == "extern_addmm_bias_epilogue_not_supported"
+
+
+def test_static_m9_matmul_minimal_semantics_negative_boundaries():
+    mismatch = _static_m9_dot_ttir("f16").replace(
+        "tensor<16x4x!tt.ptr<f16>>",
+        "tensor<15x4x!tt.ptr<f16>>",
+    ).replace("tensor<16x4xf16>", "tensor<15x4xf16>")
+    with pytest.raises(UnsupportedTTIROpError, match="K mismatch"):
+        extract_matmul_semantics_from_ttir(TTIRReader().read(mismatch))
+
+    masked = _static_m9_dot_ttir("f16").replace(
+        "    %b_zero = arith.constant dense<0> : tensor<16x4xi32>",
+        "    %b_zero = arith.constant dense<0> : tensor<16x4xi32>\n"
+        "    %mask = arith.constant dense<true> : tensor<8x16xi1>",
+    ).replace(
+        "    %va = tt.load %a_ptr : tensor<8x16x!tt.ptr<f16>>",
+        "    %va = tt.load %a_ptr, %mask : tensor<8x16x!tt.ptr<f16>>",
+    )
+    with pytest.raises(UnsupportedTTIROpError, match="unmasked tt.load"):
+        extract_matmul_semantics_from_ttir(TTIRReader().read(masked))
+
+    with pytest.raises(UnsupportedTTIROpError, match="result type|rank-2"):
+        translate_ttir(_STATIC_PRE_M7_DOT_TTIR, grid=(1,), contract="matmul_minimal")
+
+
+def test_static_m9_matmul_minimal_contract_without_cuda_runtime():
+    irmod, meta = translate_ttir(
+        _static_m9_dot_ttir("f16"),
+        grid=(1,),
+        contract="matmul_minimal",
+    )
+    validate_matmul_minimal_contract(irmod)
+    ValidateTritonKernelTIR(contract="matmul_minimal")(irmod)
+
+    func = next(iter(irmod.functions.values()))
+    sch = tvm.s_tir.Schedule(func)
+    block = sch.get_sblock("matmul")
+    block_node = sch.get(block)
+    attrs = block_node.annotations
+    script = irmod.script()
+
+    assert len(sch.get_loops(block)) == 3
+    assert [int(iter_var.iter_type) for iter_var in block_node.iter_vars] == [0, 0, 2]
+    assert block_node.init is not None
+    assert len(block_node.reads) == 2
+    assert len(block_node.writes) == 1
+    assert str(attrs["triton_tvm.contract"]) == "matmul_minimal"
+    assert str(attrs["triton_tvm.matmul_source_kind"]) == "tt_dot"
+    assert str(attrs["triton_tvm.implementation_kind"]) == "native_tir_schedule"
+    assert str(attrs["triton_tvm.schedule_id"]) == NATIVE_TIR_MATMUL_SCHEDULE_ID
+
+    assert meta.contract == "matmul_minimal"
+    assert meta.contract_version == "matmul_minimal_m9_v1"
+    assert meta.indexing_kind == "rank2_matmul"
+    assert meta.execution_kind == "semantic_then_native_m9_matmul_sblock"
+    assert meta.accumulator_dtype_policy == "fp32_accumulate"
+    assert meta.mask_policy == "exact_unmasked"
+    assert meta.axis_policy == "spatial_mn_reduce_k"
+    assert meta.layout_policy == "rank2_row_major"
+    assert meta.matmul_source_kind == "tt_dot"
+    assert (meta.matmul_m, meta.matmul_n, meta.matmul_k) == (8, 4, 16)
+    assert meta.matmul_contract_ok is True
+    assert meta.implementation_kind == "native_tir_schedule"
+    assert meta.schedule_id == NATIVE_TIR_MATMUL_SCHEDULE_ID
+    assert meta.extern_symbol == ""
+    assert meta.unsupported_matmul_reason == ""
+    assert meta.buffer_extents == {
+        "a": "T.int64(128)",
+        "b": "T.int64(64)",
+        "out": "T.int64(32)",
+    }
+    assert len(meta.cache_key) == 64
+
+    assert 'with T.sblock("matmul")' in script
+    assert "with T.init()" in script
+    assert "call_extern" not in script
+    assert 'thread="blockIdx.x"' in script
+    assert 'thread="threadIdx.x"' in script
+
+
+def test_static_m97_tiled_matmul_schedule_candidate_without_cuda_runtime():
+    irmod, meta = translate_ttir(
+        _static_m97_tiled_dot_ttir("f16"),
+        grid=(1,),
+        contract="matmul_minimal",
+    )
+    validate_matmul_minimal_contract(irmod)
+    func = next(iter(irmod.functions.values()))
+    sch = tvm.s_tir.Schedule(func)
+    block = sch.get_sblock("matmul")
+    loops = sch.get_loops(block)
+    block_node = sch.get(block)
+    attrs = block_node.annotations
+
+    assert meta.schedule_id == TILED_TIR_MATMUL_SCHEDULE_ID
+    assert str(attrs["triton_tvm.schedule_id"]) == TILED_TIR_MATMUL_SCHEDULE_ID
+    assert int(attrs["triton_tvm.tile_m"]) == 8
+    assert int(attrs["triton_tvm.tile_n"]) == 8
+    assert [int(sch.get(loop).extent) for loop in loops] == [1, 64, 16]
+
+    bad_tile_attr = irmod.script().replace(
+        '"triton_tvm.tile_n": 8',
+        '"triton_tvm.tile_n": 4',
+    )
+    with pytest.raises(TritonTVMContractError, match="8x8 tile"):
+        validate_matmul_minimal_contract(tvm.script.from_source(bad_tile_attr))
+
+    unknown_schedule = irmod.script().replace(
+        TILED_TIR_MATMUL_SCHEDULE_ID,
+        "cuda_unknown_matmul_schedule",
+    )
+    with pytest.raises(TritonTVMContractError, match="unknown"):
+        validate_matmul_minimal_contract(tvm.script.from_source(unknown_schedule))
+
+
+def test_static_m9_audit_record_reports_native_matmul_details():
+    record = audit_inductor_ttir(
+        _static_m9_dot_ttir("f16"),
+        case_name="m9_static",
+        kernel_name="_m9_dot",
+        contract="matmul_minimal",
+    )
+
+    assert record["translate_status"]["ok"] is True
+    assert record["translate_status"]["bucket"] == "translated"
+    assert record["matmul_source_kind"] == "tt_dot"
+    assert (record["matmul_m"], record["matmul_n"], record["matmul_k"]) == (
+        8,
+        4,
+        16,
+    )
+    assert record["matmul_contract_ok"] is True
+    assert record["implementation_kind"] == "native_tir_schedule"
+    assert record["schedule_id"] == NATIVE_TIR_MATMUL_SCHEDULE_ID
+    assert record["extern_symbol"] == ""
+    assert record["unsupported_matmul_reason"] == ""
 
 
 def test_static_m4_reduction_minimal_contract_without_cuda_runtime():

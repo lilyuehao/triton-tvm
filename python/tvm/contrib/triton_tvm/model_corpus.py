@@ -41,6 +41,12 @@ from .inductor import (
     is_inductor_pointwise_kernel,
     load_inductor_kernel,
 )
+from .matmul import (
+    EXTERN_GEMM_PROVIDER_NONE,
+    EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY,
+    EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED,
+)
 from .reporting import (
     build_capability_report,
     make_report_status,
@@ -89,6 +95,7 @@ class TritonTVMModelAuditConfig:
     contract: str = "pointwise_flat"
     target: str = "cuda"
     min_models: int = 1
+    extern_gemm_runtime_provider: str = EXTERN_GEMM_PROVIDER_NONE
 
 
 @dataclass(frozen=True)
@@ -254,6 +261,24 @@ def diff_capability_reports(before: dict[str, Any], after: dict[str, Any]) -> di
         - int(before.get("translated_kernels", 0)),
         "total_kernel_delta": int(after.get("total_kernels", 0))
         - int(before.get("total_kernels", 0)),
+        "extern_family_delta": _counter_delta(
+            Counter((before.get("model_summary") or {}).get("extern_op_families", {})),
+            Counter((after.get("model_summary") or {}).get("extern_op_families", {})),
+        ),
+        "full_tvm_runnable_delta": int(
+            (after.get("model_summary") or {}).get("full_tvm_runnable_models", 0)
+        )
+        - int((before.get("model_summary") or {}).get("full_tvm_runnable_models", 0)),
+        "triton_kernel_runnable_delta": int(
+            (after.get("model_summary") or {}).get("triton_kernel_runnable_models", 0)
+        )
+        - int(
+            (before.get("model_summary") or {}).get("triton_kernel_runnable_models", 0)
+        ),
+        "m9_materialized_artifact_candidate_delta": len(
+            (after.get("pre_m9") or {}).get("m9_materialized_artifact_candidates", [])
+        )
+        - len((before.get("pre_m9") or {}).get("m9_materialized_artifact_candidates", [])),
     }
 
 
@@ -265,6 +290,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--contract", default="pointwise_flat")
     parser.add_argument("--min-models", type=int, default=1)
+    parser.add_argument(
+        "--extern-gemm-runtime-provider",
+        choices=[EXTERN_GEMM_PROVIDER_NONE, EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED],
+        default=EXTERN_GEMM_PROVIDER_NONE,
+    )
     args = parser.parse_args(argv)
 
     if not args.builtin_model_corpus:
@@ -276,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             contract=args.contract,
             min_models=args.min_models,
+            extern_gemm_runtime_provider=args.extern_gemm_runtime_provider,
         ),
     )
     print(
@@ -324,6 +355,7 @@ def _run_one_model_case(
                 wrapper_source,
                 case_name=case.case_name,
                 wrapper_path=str(wrapper_path),
+                extern_gemm_runtime_provider=cfg.extern_gemm_runtime_provider,
             )
         )
         sources.extend(
@@ -613,7 +645,7 @@ def _normalize_model_kernel_record(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def _extern_call_to_record(call, case: TritonTVMModelAuditCase) -> dict[str, Any]:
-    return {
+    record = {
         "model_family": case.model_family,
         "model_case": case.case_name,
         "case_name": case.case_name,
@@ -623,6 +655,9 @@ def _extern_call_to_record(call, case: TritonTVMModelAuditCase) -> dict[str, Any
         "wrapper_path": call.wrapper_path,
         "source": call.source,
     }
+    for field_name in _EXTERN_MATMUL_FIELDS:
+        record[field_name] = getattr(call, field_name, _extern_matmul_default(field_name))
+    return record
 
 
 def _normalize_extern_call_record(
@@ -639,7 +674,78 @@ def _normalize_extern_call_record(
     normalized.setdefault("line_no", 0)
     normalized.setdefault("wrapper_path", "")
     normalized.setdefault("source", "")
+    for field_name in _EXTERN_MATMUL_FIELDS:
+        normalized.setdefault(field_name, _extern_matmul_default(field_name))
+    if (
+        normalized.get("op_family") == "extern_gemm"
+        and normalized.get("implementation_kind") == "extern_gemm"
+    ):
+        normalized["extern_gemm_runtime_status"] = (
+            normalized.get("extern_gemm_runtime_status")
+            or EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+        )
+        normalized["extern_gemm_provider_kind"] = (
+            normalized.get("extern_gemm_provider_kind") or EXTERN_GEMM_PROVIDER_NONE
+        )
+        if normalized.get("extern_gemm_provider_abi_version") is None:
+            normalized["extern_gemm_provider_abi_version"] = 0
     return normalized
+
+
+_EXTERN_MATMUL_FIELDS = (
+    "matmul_source_kind",
+    "matmul_m",
+    "matmul_n",
+    "matmul_k",
+    "matmul_contract",
+    "matmul_contract_ok",
+    "matmul_a_dtype",
+    "matmul_b_dtype",
+    "matmul_accumulator_dtype",
+    "matmul_output_dtype",
+    "matmul_epilogue_kind",
+    "implementation_kind",
+    "schedule_id",
+    "extern_symbol",
+    "extern_packed_func",
+    "extern_runtime_kind",
+    "extern_runtime_replacement",
+    "extern_runtime_replacement_available",
+    "extern_runtime_replacement_reason",
+    "extern_gemm_runtime_status",
+    "extern_gemm_provider_kind",
+    "extern_gemm_provider_abi_version",
+    "extern_gemm_runtime_claim",
+    "extern_gemm_performance_claim",
+    "extern_gemm_uses_host_staging",
+    "unsupported_matmul_reason",
+    "matmul_a_layout",
+    "matmul_b_layout",
+    "matmul_c_layout",
+    "matmul_a_stride",
+    "matmul_b_stride",
+    "matmul_c_stride",
+)
+
+
+def _extern_matmul_default(field_name: str) -> Any:
+    if field_name in {
+        "matmul_m",
+        "matmul_n",
+        "matmul_k",
+        "extern_gemm_provider_abi_version",
+    }:
+        return None
+    if field_name in {
+        "matmul_contract_ok",
+        "extern_runtime_replacement_available",
+        "extern_gemm_performance_claim",
+        "extern_gemm_uses_host_staging",
+    }:
+        return False
+    if field_name.endswith("_stride"):
+        return None
+    return ""
 
 
 def _extern_family_from_op_name(op_name: str) -> str:
@@ -901,6 +1007,12 @@ def _pre_m9_report_section(
                 "Wrapper-level extern calls are explicit Pre-M9 observations and "
                 "are not counted as translated Triton kernels."
             ),
+            "extern_gemm_runtime_replacement_gate": (
+                "M9.5 keeps extern_gemm artifact-only by default. M9.6 may mark "
+                "wrapper GEMM runtime_resolved only under an explicit "
+                "correctness-only provider; provider resolution is reported "
+                "separately from captured Triton kernel translations."
+            ),
             "full_tvm_runnable": (
                 "A model is full_tvm_runnable only when all captured Triton kernels "
                 "translate and no wrapper-level extern calls remain."
@@ -915,6 +1027,14 @@ def _pre_m9_report_section(
             "blocker_class",
             "pre_m8_family",
             "op_family",
+            "matmul_source_kind",
+            "matmul_epilogue_kind",
+            "implementation_kind",
+            "extern_runtime_kind",
+            "extern_runtime_replacement",
+            "extern_gemm_runtime_status",
+            "extern_gemm_provider_kind",
+            "unsupported_matmul_reason",
         ],
         "contract_policy": {
             "plain_gemm": (
@@ -947,10 +1067,13 @@ def _pre_m9_report_section(
             "deferred_attention": "Deferred to the attention runtime milestone.",
         },
         "extern_family_classes": extern_family_classes,
+        "m96_extern_gemm_runtime": _m96_extern_gemm_runtime_section(extern_records),
+        "m9_materialized_artifact_candidates": _pre_m9_materialized_artifact_candidates(
+            extern_records
+        ),
         "m9_entry_debt": [
             _pre_m9_entry_from_extern_family(name, entry)
-            for name, entry in extern_family_classes.items()
-            if name in _PRE_M9_ENTRY_EXTERN_FAMILIES
+            for name, entry in _pre_m9_entry_debt_classes(extern_records).items()
         ],
         "deferred_debt": [
             _pre_m9_entry_from_extern_family(name, entry)
@@ -962,6 +1085,177 @@ def _pre_m9_report_section(
         "model_full_tvm_runnable_after_extern_gate": sum(
             1 for record in model_records if record.get("full_tvm_runnable")
         ),
+    }
+
+
+def _pre_m9_materialized_artifact_candidates(
+    extern_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    candidates = []
+    for record in extern_records:
+        if not _is_materialized_extern_gemm_record(record):
+            continue
+        candidates.append(
+            {
+                "op_family": record.get("op_family", ""),
+                "op_name": record.get("op_name", ""),
+                "model_case": record.get("model_case", ""),
+                "line_no": int(record.get("line_no", 0) or 0),
+                "matmul_contract": record.get("matmul_contract", ""),
+                "matmul_source_kind": record.get("matmul_source_kind", ""),
+                "matmul_m": record.get("matmul_m"),
+                "matmul_n": record.get("matmul_n"),
+                "matmul_k": record.get("matmul_k"),
+                "matmul_contract_ok": bool(record.get("matmul_contract_ok", False)),
+                "matmul_a_dtype": record.get("matmul_a_dtype", ""),
+                "matmul_b_dtype": record.get("matmul_b_dtype", ""),
+                "matmul_accumulator_dtype": record.get("matmul_accumulator_dtype", ""),
+                "matmul_output_dtype": record.get("matmul_output_dtype", ""),
+                "matmul_epilogue_kind": record.get("matmul_epilogue_kind", ""),
+                "implementation_kind": record.get("implementation_kind", ""),
+                "extern_symbol": record.get("extern_symbol", ""),
+                "extern_packed_func": record.get("extern_packed_func", ""),
+                "extern_runtime_kind": record.get("extern_runtime_kind", ""),
+                "extern_runtime_replacement": record.get(
+                    "extern_runtime_replacement",
+                    "",
+                ),
+                "extern_runtime_replacement_available": bool(
+                    record.get("extern_runtime_replacement_available", False)
+                ),
+                "extern_runtime_replacement_reason": record.get(
+                    "extern_runtime_replacement_reason",
+                    "",
+                ),
+                "extern_gemm_runtime_status": record.get(
+                    "extern_gemm_runtime_status",
+                    "",
+                ),
+                "extern_gemm_provider_kind": record.get("extern_gemm_provider_kind", ""),
+                "extern_gemm_provider_abi_version": record.get(
+                    "extern_gemm_provider_abi_version",
+                ),
+                "extern_gemm_runtime_claim": record.get("extern_gemm_runtime_claim", ""),
+                "extern_gemm_performance_claim": bool(
+                    record.get("extern_gemm_performance_claim", False)
+                ),
+                "extern_gemm_uses_host_staging": bool(
+                    record.get("extern_gemm_uses_host_staging", False)
+                ),
+                "unsupported_matmul_reason": record.get("unsupported_matmul_reason", ""),
+                "example_source": record.get("source", ""),
+            }
+        )
+    return sorted(
+        candidates,
+        key=lambda item: (
+            str(item.get("model_case", "")),
+            int(item.get("line_no", 0) or 0),
+            str(item.get("op_name", "")),
+        ),
+    )
+
+
+def _pre_m9_entry_debt_classes(
+    extern_records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    debt_records = [
+        record
+        for record in extern_records
+        if _is_pre_m9_entry_debt_record(record)
+    ]
+    return _pre_m9_extern_family_classes(debt_records)
+
+
+def _is_pre_m9_entry_debt_record(record: dict[str, Any]) -> bool:
+    family = str(record.get("op_family", "")) or _extern_family_from_op_name(
+        str(record.get("op_name", ""))
+    )
+    if family == "extern_addmm_bias":
+        return True
+    if family == "extern_gemm":
+        return not (
+            _is_materialized_extern_gemm_record(record)
+            or _is_runtime_resolved_extern_gemm_record(record)
+        )
+    return False
+
+
+def _is_materialized_extern_gemm_record(record: dict[str, Any]) -> bool:
+    return (
+        str(record.get("op_family", "")) == "extern_gemm"
+        and str(record.get("matmul_source_kind", "")) == "wrapper_extern_gemm"
+        and bool(record.get("matmul_contract_ok", False))
+        and str(record.get("implementation_kind", "")) == "extern_gemm"
+        and str(record.get("extern_symbol", "")) == "extern_kernels.mm"
+        and str(record.get("extern_runtime_kind", "") or "artifact_only") == "artifact_only"
+        and not bool(record.get("extern_runtime_replacement_available", False))
+        and str(
+            record.get("extern_gemm_runtime_status", "")
+            or EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+        )
+        == EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+    )
+
+
+def _is_runtime_resolved_extern_gemm_record(record: dict[str, Any]) -> bool:
+    return (
+        str(record.get("op_family", "")) == "extern_gemm"
+        and str(record.get("matmul_source_kind", "")) == "wrapper_extern_gemm"
+        and bool(record.get("matmul_contract_ok", False))
+        and str(record.get("implementation_kind", "")) == "extern_gemm"
+        and str(record.get("extern_symbol", "")) == "extern_kernels.mm"
+        and str(record.get("extern_gemm_runtime_status", ""))
+        == EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED
+        and str(record.get("extern_gemm_provider_kind", ""))
+        == EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED
+    )
+
+
+def _m96_extern_gemm_runtime_section(
+    extern_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    gemm_records = [
+        record for record in extern_records if str(record.get("op_family", "")) == "extern_gemm"
+    ]
+    runtime_resolved = [
+        record for record in gemm_records if _is_runtime_resolved_extern_gemm_record(record)
+    ]
+    status_counts = Counter(
+        str(record.get("extern_gemm_runtime_status", ""))
+        or EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+        for record in gemm_records
+    )
+    provider_counts = Counter(
+        str(record.get("extern_gemm_provider_kind", "")) or EXTERN_GEMM_PROVIDER_NONE
+        for record in gemm_records
+    )
+    return {
+        "provider_policy": "opt_in_correctness_only",
+        "performance_claim": False,
+        "runtime_resolved_count": len(runtime_resolved),
+        "extern_gemm_runtime_resolved_count": len(runtime_resolved),
+        "status_counts": dict(sorted(status_counts.items())),
+        "provider_counts": dict(sorted(provider_counts.items())),
+        "runtime_resolved_records": [
+            {
+                "model_case": record.get("model_case", ""),
+                "op_name": record.get("op_name", ""),
+                "line_no": int(record.get("line_no", 0) or 0),
+                "extern_gemm_provider_kind": record.get("extern_gemm_provider_kind", ""),
+                "extern_gemm_provider_abi_version": record.get(
+                    "extern_gemm_provider_abi_version",
+                ),
+                "extern_gemm_runtime_claim": record.get("extern_gemm_runtime_claim", ""),
+                "extern_gemm_performance_claim": bool(
+                    record.get("extern_gemm_performance_claim", False)
+                ),
+                "extern_gemm_uses_host_staging": bool(
+                    record.get("extern_gemm_uses_host_staging", False)
+                ),
+            }
+            for record in runtime_resolved
+        ],
     }
 
 

@@ -203,6 +203,11 @@ class TTIRReader:
             if raw_attrs:
                 attrs["raw_attrs"] = raw_attrs
                 attrs.update(self._parse_attr_dict(raw_attrs))
+        elif name == "tt.dot":
+            raw_attrs = _extract_first_attr_dict(rest)
+            if raw_attrs:
+                attrs["raw_attrs"] = raw_attrs
+                attrs.update(self._parse_attr_dict(raw_attrs))
         elif name == "tt.reduce":
             match = re.search(r"axis\s*=\s*(-?\d+)\s*:\s*i\d+", rest)
             if match:
@@ -239,7 +244,7 @@ class TTIRReader:
             and " to " in rest
         ):
             return [parse_ttir_type(rest.rsplit(" to ", 1)[1].strip())]
-        if name in ("tt.bitcast", "tt.extern_elementwise") and "->" in rest:
+        if name in ("tt.bitcast", "tt.extern_elementwise", "tt.dot") and "->" in rest:
             return [parse_ttir_type(rest.rsplit("->", 1)[1].strip())]
         if ":" not in rest:
             return []

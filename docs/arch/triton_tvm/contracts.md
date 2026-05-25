@@ -107,3 +107,101 @@ Pre-M9 adds `op_family` as wrapper-level detail metadata.
 wrapper-level extern calls remain. `triton_kernel_runnable` records the narrower
 condition where captured Triton kernels translate even if wrapper externs are
 still present.
+
+## M9 Matmul Semantics and Contract Policy
+
+M9 uses a unified `MatmulSemantics` / `MatmulContract` boundary before target
+implementation selection. Captured TTIR `tt.dot`, wrapper-level extern GEMM, and
+future graph-level matmul sources should enter the same semantic contract.
+
+M9.1-M9.4 implement `matmul_minimal` for synthetic/static exact unmasked rank-2
+`tt.dot`: A[M,K] x B[K,N] -> C[M,N], row-major, fp16/bf16 inputs, fp32
+accumulation/output. The translator first validates
+`implementation_kind="unresolved"` and then, when target policy allows it,
+returns `implementation_kind="native_tir_schedule"` with
+`schedule_id="cuda_block_per_output_serial_k_v1"`.
+
+M9.4 also admits wrapper `extern_kernels.mm` source records as
+`source_kind="wrapper_extern_gemm"` when lhs is static rank-2 row-major
+`reinterpret_tensor(A, (M,K), (K,1), 0)` and rhs is either row-major
+`reinterpret_tensor(B, (K,N), (N,1), 0)` or the observed transposed-weight view
+`reinterpret_tensor(B, (K,N), (1,K), 0)`. Target policy returns
+`implementation_kind="extern_gemm"` with `extern_symbol="extern_kernels.mm"`.
+
+Source boundaries:
+
+- `tt_dot`: TTIR source from `TTIRReader` and `NormalizedTTIROpGraph`.
+- `wrapper_extern_gemm`: Inductor wrapper extern source collected outside the
+  `AsyncCompile.triton` TTIR path.
+- `future_graph_matmul`: reserved for later ATen/Relax/graph matmul sources.
+
+The semantic validation output is a `matmul` `T.sblock`, not `call_extern`:
+
+- spatial axes `m`, `n`; reduction axis `k`
+- reads `A[m, k]`, `B[k, n]`
+- writes `C[m, n]`
+- init zeroes `C[m, n]`
+- update performs `C[m, n] += cast(A) * cast(B)`
+- function/block attrs preserve source kind, M/N/K, dtype, layout, precision,
+  epilogue, bounds, and implementation metadata
+
+`TargetMatmulPolicy` runs only after `MatmulContract` validation. M9.3 enables
+the first native decision, `native_tir_schedule`, using one CUDA block per
+output element and serial K accumulation. M9.4 enables the explicit extern GEMM
+artifact decision, represented by one packed call to
+`tvm.contrib.triton_tvm.extern_gemm`. Unsupported decisions still use a stable
+report bucket with non-empty matmul-specific detail. Extern GEMM must not be
+counted as native fallback or runtime replacement.
+
+M9.5 strengthens validation without changing the accepted semantic surface. The
+matmul block validator now checks function/block M/N/K attr consistency,
+positive axis extents, unresolved/native loop extents, read/write buffer
+shapes, one-element regions, and exactly one init store plus one update store
+to the declared output buffer. Extern GEMM artifacts must preserve dtype,
+layout, stride, bounds, mask, epilogue, packed-func, and runtime-gate attrs.
+
+The CUDA schedule id `cuda_block_per_output_serial_k_v1` is target-policy
+implementation metadata, not part of `MatmulContract`. The contract preserves
+semantic axes, read/write regions, init/update structure, dtype/layout fields,
+and implementation metadata. Future target policies may map the same semantic
+matmul shape to custom hardware cores, tiles, or backend intrinsics without
+renaming the contract.
+
+The M9.4/M9.5 extern GEMM artifact is also not a runtime replacement by
+default. It records an explicit packed call artifact under `matmul_minimal`
+with `extern_runtime_kind="artifact_only"`,
+`extern_runtime_replacement="not_available"`, and
+`extern_runtime_replacement_reason="extern_gemm_runtime_replacement_gate_closed"`.
+M9.6 may explicitly opt into `python_torch_host_staged`, which marks
+`extern_gemm_runtime_status="runtime_resolved"` and
+`extern_gemm_runtime_claim="correctness_only"`. That provider uses host staging
+and makes no performance, TVM-only backend, or full-model runnable claim.
+`full_tvm_runnable` remains false while wrapper extern calls and captured
+kernel fallbacks remain.
+
+M9 report details distinguish `matmul_source_kind`, `matmul_contract_ok`,
+`implementation_kind`, `extern_symbol`, `schedule_id`, dtype/layout/epilogue
+metadata, `extern_runtime_kind`, `extern_runtime_replacement`,
+`extern_gemm_runtime_status`, `extern_gemm_provider_kind`, and
+`unsupported_matmul_reason` while preserving schema-v1 top-level bucket
+stability unless a later ADR changes that policy.
+
+M9.7 adds `cuda_block_tile_8x8_serial_k_v1` as target-policy implementation
+metadata for native `tt_dot` schedules. It is selected only when the accepted
+semantic shape has M/N multiples of 8. It does not add boundary masks or tail
+semantics; unsupported or non-eligible accepted shapes continue to use
+`cuda_block_per_output_serial_k_v1`.
+
+M9.8 adds a separate TinyMNISTMLP diagnostic baseline without changing the
+`matmul_minimal` semantic contract. The staged graph uses two wrapper
+`extern_kernels.mm` records resolved by the correctness-only
+`python_torch_host_staged` provider plus one TVM pointwise ReLU artifact. The
+report is `diagnostic_host_staged_triton_tvm`, keeps
+`extern_gemm_performance_claim=false`, and does not change captured corpus
+accounting or full-model runnable status.
+
+M9.5 added corpus report diff coverage and an opt-in minimal perf scaffold only.
+Bias/add epilogue lowering, runtime cublas/cublaslt replacement,
+TensorCore/vendor scheduling, performance optimization, and model closure are
+not part of the M9.1-M9.8 semantic, policy, correctness, artifact, hardening,
+and diagnostic entry.

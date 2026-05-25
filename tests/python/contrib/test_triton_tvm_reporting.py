@@ -220,6 +220,55 @@ def test_m75_supported_kernel_report_tracks_shape_dtype_layout_and_guards():
     assert supported["ok"] is False
 
 
+def test_m9_report_preserves_matmul_policy_detail_fields():
+    record = _record(
+        "m9",
+        "dot",
+        "matmul_minimal",
+        make_report_status(
+            ok=False,
+            bucket="target_policy_error",
+            fallback_reason="matmul_policy_unsupported",
+            message="matmul_no_enabled_implementation",
+        ),
+        op_counts={"tt.load": 2, "tt.dot": 1, "tt.store": 1},
+    ) | {
+        "types": ["tensor<8x16xf16>", "tensor<16x4xf16>", "tensor<8x4xf32>"],
+        "matmul_source_kind": "tt_dot",
+        "matmul_m": 8,
+        "matmul_n": 4,
+        "matmul_k": 16,
+        "matmul_contract_ok": True,
+        "implementation_kind": "unsupported",
+        "schedule_id": "",
+        "extern_symbol": "",
+        "unsupported_matmul_reason": "matmul_no_enabled_implementation",
+    }
+
+    report = build_capability_report(
+        [record],
+        purpose="m9 matmul policy detail guard",
+        corpus="m9",
+        generated_at="2026-05-25T00:00:00+00:00",
+    )
+
+    kernel = report["kernels"][0]
+    assert report["summary"]["status_buckets"] == {"target_policy_error": 1}
+    assert report["supported_kernel_report"]["kernel_count"] == 0
+    assert kernel["translate_status"]["fallback_reason"] == "matmul_policy_unsupported"
+    assert kernel["matmul_source_kind"] == "tt_dot"
+    assert (kernel["matmul_m"], kernel["matmul_n"], kernel["matmul_k"]) == (
+        8,
+        4,
+        16,
+    )
+    assert kernel["matmul_contract_ok"] is True
+    assert kernel["implementation_kind"] == "unsupported"
+    assert kernel["schedule_id"] == ""
+    assert kernel["extern_symbol"] == ""
+    assert kernel["unsupported_matmul_reason"] == "matmul_no_enabled_implementation"
+
+
 def _record(corpus, case, contract, status, op_counts=None):
     op_counts = op_counts or {"tt.load": 2, "tt.store": 1}
     return {

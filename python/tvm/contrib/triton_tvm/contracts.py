@@ -27,6 +27,10 @@ Contract boundary:
   correctness-first reduction subset.
 - ``norm_single_row`` is the M4 single-row LN/RMS contract over the same
   correctness-first reduction lowering.
+- ``matmul_minimal`` is the M9 semantic matmul contract.  It validates the
+  unresolved semantic ``matmul`` block, the M9.3 correctness-first native
+  schedule selected after target policy, and the M9.4 explicit wrapper extern
+  GEMM packed-call artifact.
 - ``cuda_minimal`` and ``cuda_pointwise_flat`` are deprecated compatibility
   aliases.  They are accepted only at the public boundary and immediately
   canonicalized.
@@ -40,6 +44,25 @@ from dataclasses import dataclass
 import tvm
 
 from .errors import TritonTVMContractError, UnsupportedContractError
+from .matmul import (
+    EXTERN_GEMM_PACKED_FUNC,
+    EXTERN_GEMM_PROVIDER_ABI_VERSION,
+    EXTERN_GEMM_PROVIDER_NONE,
+    EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    EXTERN_GEMM_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+    EXTERN_GEMM_RUNTIME_KIND,
+    EXTERN_GEMM_RUNTIME_PROVIDER_KIND,
+    EXTERN_GEMM_RUNTIME_PROVIDER_REASON,
+    EXTERN_GEMM_RUNTIME_REPLACEMENT,
+    EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON,
+    EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY,
+    EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED,
+    EXTERN_GEMM_SYMBOL,
+    NATIVE_TIR_MATMUL_SCHEDULE_ID,
+    TILED_TIR_MATMUL_SCHEDULE_ID,
+    TILED_TIR_MATMUL_TILE_M,
+    TILED_TIR_MATMUL_TILE_N,
+)
 
 
 _CONTRACT_ALIASES = {
@@ -51,6 +74,7 @@ _CONTRACT_ALIASES = {
     "norm_row": "norm_row",
     "softmax_row": "softmax_row",
     "masked_softmax_row": "masked_softmax_row",
+    "matmul_minimal": "matmul_minimal",
     "cuda_minimal": "pointwise_minimal",
     "cuda_pointwise_flat": "pointwise_flat",
 }
@@ -180,6 +204,20 @@ _CONTRACTS = {
         axis_policy="axis_1_only",
         layout_policy="rank2_row_major_or_causal",
     ),
+    "matmul_minimal": TritonTVMContract(
+        name="matmul_minimal",
+        indexing_kind="rank2_matmul",
+        memory_model="rank2_row_major_buffers",
+        requires_extent_param=False,
+        supports_multiple_outputs=False,
+        version="matmul_minimal_m9_v1",
+        execution_kind="semantic_then_native_m9_matmul_sblock",
+        accumulator_dtype_policy="fp32_accumulate",
+        epsilon_policy="not_applicable",
+        mask_policy="exact_unmasked",
+        axis_policy="spatial_mn_reduce_k",
+        layout_policy="rank2_row_major",
+    ),
 }
 
 
@@ -264,6 +302,13 @@ def validate_masked_softmax_row_contract(irmod: tvm.IRModule) -> None:
         _validate_serial_row_contract_body(gvar.name_hint, func, "masked_softmax_row")
 
 
+def validate_matmul_minimal_contract(irmod: tvm.IRModule) -> None:
+    """Validate the M9 semantic/native/extern-artifact matmul contract."""
+    _validate_semantic_common(irmod, "matmul_minimal")
+    for gvar, func in irmod.functions.items():
+        _validate_matmul_minimal_body(gvar.name_hint, func)
+
+
 def validate_cuda_minimal_contract(irmod: tvm.IRModule) -> None:
     """Validate the legacy CUDA single-store alias."""
     _warn_legacy_contract("cuda_minimal", "pointwise_minimal")
@@ -295,6 +340,8 @@ def validate_triton_tvm_contract(irmod: tvm.IRModule, contract: str) -> None:
         validate_softmax_row_contract(irmod)
     elif contract == "masked_softmax_row":
         validate_masked_softmax_row_contract(irmod)
+    elif contract == "matmul_minimal":
+        validate_matmul_minimal_contract(irmod)
     else:
         raise UnsupportedContractError(
             f"Contract {contract!r} does not have a validator in this prototype"
@@ -310,6 +357,16 @@ def _warn_legacy_contract(alias: str, canonical: str) -> None:
 
 
 def _validate_pointwise_common(irmod: tvm.IRModule, contract: str) -> None:
+    _validate_common_func_attrs(irmod, contract)
+    for gvar, func in irmod.functions.items():
+        _validate_cuda_launch_body(gvar.name_hint, func)
+
+
+def _validate_semantic_common(irmod: tvm.IRModule, contract: str) -> None:
+    _validate_common_func_attrs(irmod, contract)
+
+
+def _validate_common_func_attrs(irmod: tvm.IRModule, contract: str) -> None:
     if irmod.attrs is not None and irmod.attrs.get("external_mods", None) is not None:
         raise TritonTVMContractError(f"{contract} contract must not use external_mods")
 
@@ -331,8 +388,6 @@ def _validate_pointwise_common(irmod: tvm.IRModule, contract: str) -> None:
             raise TritonTVMContractError(f"{gvar.name_hint} must set tirx.noalias")
         if attrs.get("global_symbol", None) is None:
             raise TritonTVMContractError(f"{gvar.name_hint} must set global_symbol")
-
-        _validate_cuda_launch_body(gvar.name_hint, func)
 
 
 def _validate_cuda_launch_body(name: str, func: tvm.tirx.PrimFunc) -> None:
@@ -458,6 +513,532 @@ def _validate_serial_row_contract_body(
         raise TritonTVMContractError(
             f"{name} {contract} contract requires a serial reduction loop"
         )
+
+
+def _validate_matmul_minimal_body(name: str, func: tvm.tirx.PrimFunc) -> None:
+    attrs = func.attrs or {}
+    if str(attrs.get("triton_tvm.implementation_kind", "")) == "extern_gemm":
+        _validate_matmul_extern_gemm_artifact(name, func)
+        return
+    func_dims = _required_matmul_dims(name, attrs, "function attrs")
+
+    try:
+        sch = tvm.s_tir.Schedule(func)
+        block_rv = sch.get_sblock("matmul")
+        loops = sch.get_loops(block_rv)
+        block = sch.get(block_rv)
+    except Exception as err:  # pylint: disable=broad-except
+        raise TritonTVMContractError(
+            f"{name} matmul_minimal contract requires a matchable matmul block"
+        ) from err
+
+    if len(loops) != 3:
+        raise TritonTVMContractError(
+            f"{name} matmul_minimal contract requires exactly 3 matmul loops, "
+            f"got {len(loops)}"
+        )
+    if len(block.iter_vars) != 3:
+        raise TritonTVMContractError(
+            f"{name} matmul_minimal contract requires 3 block axes"
+        )
+    iter_types = [int(iter_var.iter_type) for iter_var in block.iter_vars]
+    if iter_types != [0, 0, 2]:
+        raise TritonTVMContractError(
+            f"{name} matmul_minimal axes must be spatial, spatial, reduction"
+        )
+    if block.init is None:
+        raise TritonTVMContractError(f"{name} matmul_minimal requires T.init")
+    if len(block.reads) != 2 or len(block.writes) != 1:
+        raise TritonTVMContractError(
+            f"{name} matmul_minimal requires two reads and one write"
+        )
+
+    attrs = block.annotations
+    if attrs is None or attrs.get("triton_tvm.contract", None) != "matmul_minimal":
+        raise TritonTVMContractError(
+            f"{name} matmul block must preserve triton_tvm.contract=matmul_minimal"
+        )
+    if attrs.get("triton_tvm.matmul_source_kind", None) != "tt_dot":
+        raise TritonTVMContractError(
+            f"{name} matmul block must preserve source kind tt_dot"
+        )
+    block_dims = _required_matmul_dims(name, attrs, "block attrs")
+    if block_dims != func_dims:
+        raise TritonTVMContractError(
+            f"{name} matmul block dims must match function attrs"
+        )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.accumulator_dtype",
+        "float32",
+        "matmul block",
+    )
+    _require_attr_value(name, attrs, "triton_tvm.bounds_policy", "exact", "matmul block")
+    _require_attr_value(name, attrs, "triton_tvm.mask_kind", "none", "matmul block")
+    _require_attr_value(name, attrs, "triton_tvm.epilogue_kind", "none", "matmul block")
+    _validate_matmul_block_axes(name, block, block_dims)
+    _validate_matmul_buffer_regions(name, block, block_dims)
+    _validate_matmul_stores(name, block)
+    implementation_kind = str(attrs.get("triton_tvm.implementation_kind", ""))
+    if implementation_kind == "unresolved":
+        _validate_matmul_loop_extents(name, sch, loops, block_dims, implementation_kind)
+        return
+    if implementation_kind == "native_tir_schedule":
+        schedule_id = str(attrs.get("triton_tvm.schedule_id", ""))
+        if schedule_id not in (NATIVE_TIR_MATMUL_SCHEDULE_ID, TILED_TIR_MATMUL_SCHEDULE_ID):
+            raise TritonTVMContractError(
+                f"{name} native matmul schedule has unknown triton_tvm.schedule_id"
+            )
+        func_schedule_id = str(func.attrs.get("triton_tvm.schedule_id", ""))
+        if func_schedule_id != schedule_id:
+            raise TritonTVMContractError(
+                f"{name} native matmul function attrs must match block schedule_id"
+            )
+        if not _is_thread_for(sch.get(loops[0]), "blockIdx.x"):
+            raise TritonTVMContractError(
+                f"{name} native matmul schedule must bind the outer loop to blockIdx.x"
+            )
+        if not _is_thread_for(sch.get(loops[1]), "threadIdx.x"):
+            raise TritonTVMContractError(
+                f"{name} native matmul schedule must bind the inner loop to threadIdx.x"
+            )
+        _validate_matmul_schedule_attrs(name, attrs, block_dims, schedule_id)
+        _validate_matmul_loop_extents(
+            name,
+            sch,
+            loops,
+            block_dims,
+            implementation_kind,
+            schedule_id=schedule_id,
+        )
+        return
+    raise TritonTVMContractError(
+        f"{name} matmul block has unsupported implementation_kind={implementation_kind!r}"
+    )
+
+
+def _validate_matmul_extern_gemm_artifact(name: str, func: tvm.tirx.PrimFunc) -> None:
+    attrs = func.attrs or {}
+    if attrs.get("triton_tvm.contract", None) != "matmul_minimal":
+        raise TritonTVMContractError(
+            f"{name} extern GEMM artifact must preserve triton_tvm.contract=matmul_minimal"
+        )
+    if attrs.get("triton_tvm.matmul_source_kind", None) != "wrapper_extern_gemm":
+        raise TritonTVMContractError(
+            f"{name} extern GEMM artifact must preserve source kind wrapper_extern_gemm"
+        )
+    if str(attrs.get("triton_tvm.extern_symbol", "")) != EXTERN_GEMM_SYMBOL:
+        raise TritonTVMContractError(
+            f"{name} extern GEMM artifact must preserve extern_symbol={EXTERN_GEMM_SYMBOL}"
+        )
+    dims = _required_matmul_dims(name, attrs, "extern GEMM artifact attrs")
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_packed_func",
+        EXTERN_GEMM_PACKED_FUNC,
+        "extern GEMM artifact",
+    )
+    _validate_matmul_extern_runtime_metadata(name, attrs)
+    for attr_name, expected in (
+        ("triton_tvm.accumulator_dtype", "float32"),
+        ("triton_tvm.output_dtype", "float32"),
+        ("triton_tvm.bounds_policy", "exact"),
+        ("triton_tvm.mask_kind", "none"),
+        ("triton_tvm.epilogue_kind", "none"),
+        ("triton_tvm.a_layout", "row_major"),
+        ("triton_tvm.c_layout", "row_major"),
+    ):
+        _require_attr_value(name, attrs, attr_name, expected, "extern GEMM artifact")
+    b_layout = str(attrs.get("triton_tvm.b_layout", ""))
+    if b_layout not in ("row_major", "transposed_weight_view"):
+        raise TritonTVMContractError(
+            f"{name} extern GEMM artifact has unsupported b_layout={b_layout!r}"
+        )
+    _validate_matmul_extern_buffers(name, func, dims, b_layout, attrs)
+
+    script = _prim_func_script(func)
+    packed_call = f'T.call_packed("{EXTERN_GEMM_PACKED_FUNC}"'
+    if script.count(packed_call) != 1:
+        raise TritonTVMContractError(
+            f"{name} extern GEMM artifact must contain exactly one "
+            f"{EXTERN_GEMM_PACKED_FUNC} packed call"
+        )
+    if "call_extern" in script:
+        raise TritonTVMContractError(
+            f"{name} extern GEMM artifact must not use T.call_extern"
+        )
+    if 'thread="blockIdx.x"' in script or 'thread="threadIdx.x"' in script:
+        raise TritonTVMContractError(
+            f"{name} extern GEMM artifact must not contain a native CUDA schedule"
+        )
+
+
+def _required_matmul_dims(name: str, attrs, label: str) -> tuple[int, int, int]:
+    dims = []
+    for dim_name in ("triton_tvm.matmul_m", "triton_tvm.matmul_n", "triton_tvm.matmul_k"):
+        value = _int_attr(attrs, dim_name)
+        if value is None:
+            raise TritonTVMContractError(f"{name} {label} missing {dim_name}")
+        if value <= 0:
+            raise TritonTVMContractError(f"{name} {label} {dim_name} must be positive")
+        dims.append(value)
+    return tuple(dims)  # type: ignore[return-value]
+
+
+def _int_attr(attrs, attr_name: str) -> int | None:
+    value = attrs.get(attr_name, None)
+    if value is None:
+        return None
+    value = _int_imm_value(value)
+    return value
+
+
+def _bool_attr(attrs, attr_name: str) -> bool | None:
+    value = attrs.get(attr_name, None)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    int_value = _int_imm_value(value)
+    if int_value is not None:
+        return bool(int_value)
+    text = str(value).lower()
+    if text in ("true", "1"):
+        return True
+    if text in ("false", "0"):
+        return False
+    return None
+
+
+def _require_attr_value(
+    name: str,
+    attrs,
+    attr_name: str,
+    expected: str,
+    label: str,
+) -> None:
+    actual = attrs.get(attr_name, None)
+    if actual is None:
+        raise TritonTVMContractError(f"{name} {label} missing {attr_name}")
+    if str(actual) != expected:
+        raise TritonTVMContractError(
+            f"{name} {label} requires {attr_name}={expected}"
+        )
+
+
+def _validate_matmul_block_axes(name: str, block, dims: tuple[int, int, int]) -> None:
+    for axis_name, iter_var, expected in zip(("m", "n", "k"), block.iter_vars, dims):
+        extent = None
+        if getattr(iter_var, "dom", None) is not None:
+            extent = _int_imm_value(iter_var.dom.extent)
+        if extent != expected:
+            raise TritonTVMContractError(
+                f"{name} matmul {axis_name} axis extent must be {expected}"
+            )
+
+
+def _validate_matmul_loop_extents(
+    name: str,
+    sch,
+    loops,
+    dims: tuple[int, int, int],
+    implementation_kind: str,
+    *,
+    schedule_id: str = "",
+) -> None:
+    from tvm import tirx  # pylint: disable=import-outside-toplevel
+
+    m, n, k = dims
+    if implementation_kind == "unresolved":
+        expected_extents = (m, n, k)
+        expected_kinds = (tirx.ForKind.SERIAL, tirx.ForKind.SERIAL, tirx.ForKind.SERIAL)
+    elif schedule_id == TILED_TIR_MATMUL_SCHEDULE_ID:
+        expected_extents = (
+            (m // TILED_TIR_MATMUL_TILE_M) * (n // TILED_TIR_MATMUL_TILE_N),
+            TILED_TIR_MATMUL_TILE_M * TILED_TIR_MATMUL_TILE_N,
+            k,
+        )
+        expected_kinds = (
+            tirx.ForKind.THREAD_BINDING,
+            tirx.ForKind.THREAD_BINDING,
+            tirx.ForKind.SERIAL,
+        )
+    else:
+        expected_extents = (m * n, 1, k)
+        expected_kinds = (
+            tirx.ForKind.THREAD_BINDING,
+            tirx.ForKind.THREAD_BINDING,
+            tirx.ForKind.SERIAL,
+        )
+    for idx, loop_rv in enumerate(loops):
+        loop = sch.get(loop_rv)
+        extent = _int_imm_value(loop.extent)
+        if extent != expected_extents[idx]:
+            raise TritonTVMContractError(
+                f"{name} matmul loop {idx} extent must be {expected_extents[idx]}"
+            )
+        if int(loop.kind) != int(expected_kinds[idx]):
+            raise TritonTVMContractError(
+                f"{name} matmul loop {idx} kind does not match {implementation_kind}"
+            )
+
+
+def _validate_matmul_buffer_regions(name: str, block, dims: tuple[int, int, int]) -> None:
+    m, n, k = dims
+    expected = (
+        (block.reads[0], (m, k), "A read"),
+        (block.reads[1], (k, n), "B read"),
+        (block.writes[0], (m, n), "C write"),
+    )
+    for region, shape, label in expected:
+        _validate_buffer_region(name, region, shape, label)
+
+
+def _validate_buffer_region(
+    name: str,
+    buffer_region,
+    expected_shape: tuple[int, int],
+    label: str,
+) -> None:
+    buffer_shape = tuple(_int_imm_value(dim) for dim in buffer_region.buffer.shape)
+    if buffer_shape != expected_shape:
+        raise TritonTVMContractError(
+            f"{name} matmul {label} buffer shape must be {expected_shape}"
+        )
+    if len(buffer_region.region) != 2:
+        raise TritonTVMContractError(f"{name} matmul {label} must be rank-2")
+    region_extents = tuple(_int_imm_value(rng.extent) for rng in buffer_region.region)
+    if region_extents != (1, 1):
+        raise TritonTVMContractError(
+            f"{name} matmul {label} region must access one element per axis"
+        )
+
+
+def _validate_matmul_stores(name: str, block) -> None:
+    from tvm import tirx  # pylint: disable=import-outside-toplevel
+
+    init_stores = [
+        stmt for stmt in _walk_stmt(block.init) if isinstance(stmt, tirx.BufferStore)
+    ]
+    update_stores = [
+        stmt for stmt in _walk_stmt(block.body) if isinstance(stmt, tirx.BufferStore)
+    ]
+    if len(init_stores) != 1 or len(update_stores) != 1:
+        raise TritonTVMContractError(
+            f"{name} matmul block requires one init store and one update store"
+        )
+    write_buffer = str(block.writes[0].buffer.name)
+    for store in init_stores + update_stores:
+        if str(store.buffer.name) != write_buffer:
+            raise TritonTVMContractError(
+                f"{name} matmul init/update stores must write the declared output buffer"
+            )
+        if len(store.indices) != 2:
+            raise TritonTVMContractError(
+                f"{name} matmul init/update stores must be rank-2"
+            )
+
+
+def _validate_matmul_extern_buffers(
+    name: str,
+    func: tvm.tirx.PrimFunc,
+    dims: tuple[int, int, int],
+    b_layout: str,
+    attrs,
+) -> None:
+    m, n, k = dims
+    buffers = list(func.buffer_map.values())
+    if len(buffers) != 3:
+        raise TritonTVMContractError(
+            f"{name} extern GEMM artifact requires exactly three buffers"
+        )
+    transposed_b = _bool_attr(attrs, "triton_tvm.transposed_b")
+    expected_transposed = b_layout == "transposed_weight_view"
+    if transposed_b is not expected_transposed:
+        raise TritonTVMContractError(
+            f"{name} extern GEMM artifact transposed_b must match b_layout"
+        )
+    expected_b_shape = (n, k) if expected_transposed else (k, n)
+    expected_b_stride = (k, 1) if expected_transposed else (n, 1)
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.b_stride",
+        "1, " + str(k) if expected_transposed else f"{n}, 1",
+        "extern GEMM logical metadata",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.b_storage_shape",
+        f"{expected_b_shape[0]}, {expected_b_shape[1]}",
+        "extern GEMM storage metadata",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.b_storage_stride",
+        f"{expected_b_stride[0]}, {expected_b_stride[1]}",
+        "extern GEMM storage metadata",
+    )
+    expected_shapes = ((m, k), expected_b_shape, (m, n))
+    expected_strides = ((k, 1), expected_b_stride, (n, 1))
+    for buffer, shape, strides in zip(buffers, expected_shapes, expected_strides):
+        buffer_shape = tuple(_int_imm_value(dim) for dim in buffer.shape)
+        if buffer_shape != shape:
+            raise TritonTVMContractError(
+                f"{name} extern GEMM artifact buffer shape must be {shape}"
+            )
+        buffer_strides = tuple(_int_imm_value(stride) for stride in buffer.strides)
+        if buffer_strides != strides:
+            raise TritonTVMContractError(
+                f"{name} extern GEMM artifact buffer strides must be {strides}"
+            )
+
+
+def _validate_matmul_schedule_attrs(
+    name: str,
+    attrs,
+    dims: tuple[int, int, int],
+    schedule_id: str,
+) -> None:
+    m, n, _ = dims
+    if schedule_id == NATIVE_TIR_MATMUL_SCHEDULE_ID:
+        return
+    if schedule_id != TILED_TIR_MATMUL_SCHEDULE_ID:
+        raise TritonTVMContractError(
+            f"{name} native matmul schedule has unknown triton_tvm.schedule_id"
+        )
+    tile_m = _int_attr(attrs, "triton_tvm.tile_m")
+    tile_n = _int_attr(attrs, "triton_tvm.tile_n")
+    if tile_m != TILED_TIR_MATMUL_TILE_M or tile_n != TILED_TIR_MATMUL_TILE_N:
+        raise TritonTVMContractError(
+            f"{name} tiled matmul attrs must preserve 8x8 tile shape"
+        )
+    if m % TILED_TIR_MATMUL_TILE_M or n % TILED_TIR_MATMUL_TILE_N:
+        raise TritonTVMContractError(
+            f"{name} tiled matmul schedule requires M and N multiples of 8"
+        )
+
+
+def _validate_matmul_extern_runtime_metadata(name: str, attrs) -> None:
+    status = str(attrs.get("triton_tvm.extern_gemm_runtime_status", ""))
+    provider_kind = str(attrs.get("triton_tvm.extern_gemm_provider_kind", ""))
+    provider_abi_version = _int_attr(attrs, "triton_tvm.extern_gemm_provider_abi_version")
+    performance_claim = _bool_attr(attrs, "triton_tvm.extern_gemm_performance_claim")
+    uses_host_staging = _bool_attr(attrs, "triton_tvm.extern_gemm_uses_host_staging")
+    replacement_available = _bool_attr(
+        attrs,
+        "triton_tvm.extern_runtime_replacement_available",
+    )
+
+    if status == EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY:
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_kind",
+            EXTERN_GEMM_RUNTIME_KIND,
+            "extern GEMM artifact",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_replacement",
+            EXTERN_GEMM_RUNTIME_REPLACEMENT,
+            "extern GEMM artifact",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_replacement_reason",
+            EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON,
+            "extern GEMM artifact",
+        )
+        if replacement_available is not False:
+            raise TritonTVMContractError(
+                f"{name} extern GEMM artifact must keep runtime replacement unavailable"
+            )
+        if provider_kind != EXTERN_GEMM_PROVIDER_NONE or provider_abi_version != 0:
+            raise TritonTVMContractError(
+                f"{name} artifact-only extern GEMM must use provider none"
+            )
+        if performance_claim is not False or uses_host_staging is not False:
+            raise TritonTVMContractError(
+                f"{name} artifact-only extern GEMM must not claim provider execution"
+            )
+        return
+
+    if status != EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED:
+        raise TritonTVMContractError(
+            f"{name} extern GEMM artifact has unsupported runtime status"
+        )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_runtime_kind",
+        EXTERN_GEMM_RUNTIME_PROVIDER_KIND,
+        "extern GEMM runtime provider",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_runtime_replacement",
+        EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+        "extern GEMM runtime provider",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_runtime_replacement_reason",
+        EXTERN_GEMM_RUNTIME_PROVIDER_REASON,
+        "extern GEMM runtime provider",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_gemm_runtime_claim",
+        EXTERN_GEMM_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+        "extern GEMM runtime provider",
+    )
+    if replacement_available is not True:
+        raise TritonTVMContractError(
+            f"{name} runtime-resolved extern GEMM must mark replacement available"
+        )
+    if provider_kind != EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED:
+        raise TritonTVMContractError(
+            f"{name} runtime-resolved extern GEMM must name python_torch_host_staged"
+        )
+    if provider_abi_version != EXTERN_GEMM_PROVIDER_ABI_VERSION:
+        raise TritonTVMContractError(
+            f"{name} runtime-resolved extern GEMM must preserve provider ABI v1"
+        )
+    if performance_claim is not False or uses_host_staging is not True:
+        raise TritonTVMContractError(
+            f"{name} runtime-resolved extern GEMM must be correctness-only host staged"
+        )
+
+
+def _int_imm_value(value) -> int | None:
+    if value is None:
+        return None
+    if hasattr(value, "value"):
+        try:
+            return int(value.value)
+        except (TypeError, ValueError):
+            return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _prim_func_script(func: tvm.tirx.PrimFunc) -> str:
+    try:
+        return func.script()
+    except Exception:  # pylint: disable=broad-except
+        return str(func)
 
 
 def _is_thread_for(stmt, thread_tag: str) -> bool:

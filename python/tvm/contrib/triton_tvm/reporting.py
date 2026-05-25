@@ -407,6 +407,10 @@ def render_capability_markdown(
                 "",
                 f"- Taxonomy version: {pre_m9.get('taxonomy_version', '')}",
                 f"- Detail fields: {', '.join(pre_m9.get('detail_fields', []))}",
+                "- Materialized artifact candidates: "
+                f"{len(pre_m9.get('m9_materialized_artifact_candidates') or [])}",
+                "- M9.6 extern GEMM runtime resolved: "
+                f"{(pre_m9.get('m96_extern_gemm_runtime') or {}).get('runtime_resolved_count', 0)}",
                 f"- M9 entry debt families: {len(pre_m9.get('m9_entry_debt') or [])}",
                 f"- Deferred debt families: {len(pre_m9.get('deferred_debt') or [])}",
                 f"- Observed TTIR dot kernels: {pre_m9.get('observed_ttir_dot_kernels', 0)}",

@@ -34,6 +34,18 @@ from tvm.contrib.triton_tvm.model_corpus import (
     write_model_corpus_report,
 )
 from tvm.contrib.triton_tvm.inductor import InductorKernel, extract_inductor_wrapper_extern_calls
+from tvm.contrib.triton_tvm.matmul import (
+    EXTERN_GEMM_PACKED_FUNC,
+    EXTERN_GEMM_PROVIDER_ABI_VERSION,
+    EXTERN_GEMM_PROVIDER_NONE,
+    EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    EXTERN_GEMM_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+    EXTERN_GEMM_RUNTIME_KIND,
+    EXTERN_GEMM_RUNTIME_REPLACEMENT,
+    EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON,
+    EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY,
+    EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED,
+)
 from tvm.contrib.triton_tvm.reporting import make_report_status, render_capability_markdown
 
 try:
@@ -69,7 +81,7 @@ def test_m8_auto_contract_selection_keeps_deferred_grid_explicit():
 def test_pre_m9_wrapper_extern_extraction_classifies_matmul_conv_attention():
     wrapper_source = """
 def call(arg0, arg1):
-    buf0 = extern_kernels.mm(arg0, arg1, out=None)
+    buf0 = extern_kernels.mm(reinterpret_tensor(buf_a, (16, 64), (64, 1), 0), reinterpret_tensor(weight, (64, 64), (1, 64), 0), out=buf_out)
     buf1 = extern_kernels.addmm(arg0, arg1, arg1, alpha=1, beta=1, out=None)
     buf2 = extern_kernels.convolution(arg0, arg1, stride=(1, 1), padding=(0, 0))
     buf3 = torch.ops.aten._scaled_dot_product_efficient_attention.default(
@@ -95,6 +107,55 @@ def call(arg0, arg1):
     ]
     assert calls[0].case_name == "toy"
     assert calls[0].wrapper_path == "/tmp/toy.py"
+    assert calls[0].matmul_source_kind == "wrapper_extern_gemm"
+    assert (calls[0].matmul_m, calls[0].matmul_n, calls[0].matmul_k) == (16, 64, 64)
+    assert calls[0].matmul_contract == "matmul_minimal"
+    assert calls[0].matmul_contract_ok is True
+    assert calls[0].implementation_kind == "extern_gemm"
+    assert calls[0].extern_symbol == "extern_kernels.mm"
+    assert calls[0].extern_packed_func == EXTERN_GEMM_PACKED_FUNC
+    assert calls[0].extern_runtime_kind == EXTERN_GEMM_RUNTIME_KIND
+    assert calls[0].extern_runtime_replacement == EXTERN_GEMM_RUNTIME_REPLACEMENT
+    assert calls[0].extern_runtime_replacement_available is False
+    assert (
+        calls[0].extern_runtime_replacement_reason
+        == EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON
+    )
+    assert calls[0].extern_gemm_runtime_status == EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+    assert calls[0].extern_gemm_provider_kind == EXTERN_GEMM_PROVIDER_NONE
+    assert calls[0].extern_gemm_provider_abi_version == 0
+    assert calls[0].extern_gemm_performance_claim is False
+    assert calls[0].extern_gemm_uses_host_staging is False
+    assert calls[0].matmul_epilogue_kind == "none"
+    assert calls[0].matmul_b_layout == "transposed_weight_view"
+    assert calls[0].matmul_b_stride == (1, 64)
+    assert calls[1].matmul_source_kind == "wrapper_extern_addmm_bias"
+    assert calls[1].matmul_epilogue_kind == "bias_add"
+    assert calls[1].implementation_kind == "unsupported"
+    assert calls[1].unsupported_matmul_reason == "extern_addmm_bias_epilogue_not_supported"
+
+
+def test_m96_wrapper_extern_provider_marks_runtime_resolved():
+    wrapper_source = """
+def call(arg0, arg1):
+    buf0 = extern_kernels.mm(reinterpret_tensor(buf_a, (16, 64), (64, 1), 0), reinterpret_tensor(weight, (64, 64), (1, 64), 0), out=buf_out)
+    return buf0
+"""
+
+    calls = extract_inductor_wrapper_extern_calls(
+        wrapper_source,
+        case_name="toy",
+        wrapper_path="/tmp/toy.py",
+        extern_gemm_runtime_provider=EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    )
+
+    assert len(calls) == 1
+    assert calls[0].extern_gemm_runtime_status == EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED
+    assert calls[0].extern_gemm_provider_kind == EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED
+    assert calls[0].extern_gemm_provider_abi_version == EXTERN_GEMM_PROVIDER_ABI_VERSION
+    assert calls[0].extern_gemm_runtime_claim == EXTERN_GEMM_RUNTIME_CLAIM_CORRECTNESS_ONLY
+    assert calls[0].extern_gemm_performance_claim is False
+    assert calls[0].extern_gemm_uses_host_staging is True
 
 
 def test_m6_model_report_groups_models_and_ranks_blockers(tmp_path):
@@ -415,7 +476,37 @@ def test_pre_m9_report_section_splits_extern_gemm_from_deferred_grid_conv_attent
             fallback=0,
             extern_calls=[
                 _extern_call("vit", "vit_tiny", "extern_kernels.addmm", "extern_addmm_bias"),
-                _extern_call("vit", "vit_tiny", "extern_kernels.mm", "extern_gemm"),
+                _extern_call(
+                    "vit",
+                    "vit_tiny",
+                    "extern_kernels.mm",
+                    "extern_gemm",
+                    matmul_source_kind="wrapper_extern_gemm",
+                    matmul_m=16,
+                    matmul_n=64,
+                    matmul_k=64,
+                    matmul_contract="matmul_minimal",
+                    matmul_contract_ok=True,
+                    matmul_a_dtype="float32",
+                    matmul_b_dtype="float32",
+                    matmul_accumulator_dtype="float32",
+                    matmul_output_dtype="float32",
+                    matmul_epilogue_kind="none",
+                    implementation_kind="extern_gemm",
+                    extern_symbol="extern_kernels.mm",
+                    extern_packed_func=EXTERN_GEMM_PACKED_FUNC,
+                    extern_runtime_kind=EXTERN_GEMM_RUNTIME_KIND,
+                    extern_runtime_replacement=EXTERN_GEMM_RUNTIME_REPLACEMENT,
+                    extern_runtime_replacement_available=False,
+                    extern_runtime_replacement_reason=(
+                        EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON
+                    ),
+                    source=(
+                        "extern_kernels.mm(reinterpret_tensor(buf1, (16, 64), "
+                        "(64, 1), 0), reinterpret_tensor(arg4_1, (64, 64), "
+                        "(1, 64), 0), out=buf2)"
+                    ),
+                ),
                 _extern_call(
                     "vit",
                     "vit_tiny",
@@ -451,6 +542,28 @@ def test_pre_m9_report_section_splits_extern_gemm_from_deferred_grid_conv_attent
     assert report["model_summary"]["full_tvm_runnable_models"] == 0
     assert report["model_summary"]["triton_kernel_runnable_models"] == 1
     assert report["extern_ops"][0]["op_family"] == "extern_addmm_bias"
+    gemm_record = next(
+        record for record in report["extern_ops"] if record["op_family"] == "extern_gemm"
+    )
+    assert gemm_record["matmul_source_kind"] == "wrapper_extern_gemm"
+    assert (gemm_record["matmul_m"], gemm_record["matmul_n"], gemm_record["matmul_k"]) == (
+        16,
+        64,
+        64,
+    )
+    assert gemm_record["matmul_contract_ok"] is True
+    assert gemm_record["matmul_epilogue_kind"] == "none"
+    assert gemm_record["implementation_kind"] == "extern_gemm"
+    assert gemm_record["extern_symbol"] == "extern_kernels.mm"
+    assert gemm_record["extern_packed_func"] == EXTERN_GEMM_PACKED_FUNC
+    assert gemm_record["extern_runtime_kind"] == EXTERN_GEMM_RUNTIME_KIND
+    assert gemm_record["extern_runtime_replacement"] == EXTERN_GEMM_RUNTIME_REPLACEMENT
+    assert gemm_record["extern_runtime_replacement_available"] is False
+    assert (
+        gemm_record["extern_runtime_replacement_reason"]
+        == EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON
+    )
+    assert gemm_record["unsupported_matmul_reason"] == ""
 
     pre_m9 = report["pre_m9"]
     assert pre_m9["taxonomy_version"] == 1
@@ -460,9 +573,32 @@ def test_pre_m9_report_section_splits_extern_gemm_from_deferred_grid_conv_attent
     assert pre_m9["extern_family_classes"]["extern_addmm_bias"]["call_count"] == 1
     assert pre_m9["extern_family_classes"]["deferred_convolution"]["call_count"] == 1
     assert pre_m9["extern_family_classes"]["deferred_attention"]["call_count"] == 1
+    assert pre_m9["m96_extern_gemm_runtime"]["runtime_resolved_count"] == 0
+    assert pre_m9["m96_extern_gemm_runtime"]["status_counts"] == {
+        EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY: 1
+    }
+    assert pre_m9["m96_extern_gemm_runtime"]["provider_counts"] == {
+        EXTERN_GEMM_PROVIDER_NONE: 1
+    }
+    assert len(pre_m9["m9_materialized_artifact_candidates"]) == 1
+    candidate = pre_m9["m9_materialized_artifact_candidates"][0]
+    assert candidate["op_family"] == "extern_gemm"
+    assert candidate["matmul_source_kind"] == "wrapper_extern_gemm"
+    assert (candidate["matmul_m"], candidate["matmul_n"], candidate["matmul_k"]) == (
+        16,
+        64,
+        64,
+    )
+    assert candidate["implementation_kind"] == "extern_gemm"
+    assert candidate["extern_symbol"] == "extern_kernels.mm"
+    assert candidate["extern_packed_func"] == EXTERN_GEMM_PACKED_FUNC
+    assert candidate["extern_runtime_kind"] == EXTERN_GEMM_RUNTIME_KIND
+    assert candidate["extern_runtime_replacement"] == EXTERN_GEMM_RUNTIME_REPLACEMENT
+    assert candidate["extern_runtime_replacement_available"] is False
+    assert candidate["extern_gemm_runtime_status"] == EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+    assert candidate["extern_gemm_provider_kind"] == EXTERN_GEMM_PROVIDER_NONE
     assert {entry["op_family"] for entry in pre_m9["m9_entry_debt"]} == {
         "extern_addmm_bias",
-        "extern_gemm",
     }
     assert {entry["op_family"] for entry in pre_m9["deferred_debt"]} == {
         "deferred_attention",
@@ -473,6 +609,78 @@ def test_pre_m9_report_section_splits_extern_gemm_from_deferred_grid_conv_attent
     assert "## Pre-M9 Gate" in markdown
     assert "extern_gemm" in markdown
     assert "deferred_convolution" in markdown
+
+
+def test_m96_provider_enabled_report_keeps_captured_kernel_counts_stable():
+    report = build_model_corpus_report(
+        [
+            _kernel_record(
+                "vit",
+                "vit_tiny",
+                "triton_vit_0",
+                make_report_status(ok=True, bucket="translated"),
+            )
+        ],
+        [
+            _model_record(
+                "vit",
+                "vit_tiny",
+                kernel_count=1,
+                translated=1,
+                fallback=0,
+                extern_calls=[
+                    _extern_call(
+                        "vit",
+                        "vit_tiny",
+                        "extern_kernels.mm",
+                        "extern_gemm",
+                        matmul_source_kind="wrapper_extern_gemm",
+                        matmul_m=16,
+                        matmul_n=64,
+                        matmul_k=64,
+                        matmul_contract="matmul_minimal",
+                        matmul_contract_ok=True,
+                        matmul_epilogue_kind="none",
+                        implementation_kind="extern_gemm",
+                        extern_symbol="extern_kernels.mm",
+                        extern_packed_func=EXTERN_GEMM_PACKED_FUNC,
+                        extern_runtime_kind="runtime_provider",
+                        extern_runtime_replacement=(
+                            EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED
+                        ),
+                        extern_runtime_replacement_available=True,
+                        extern_gemm_runtime_status=(
+                            EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED
+                        ),
+                        extern_gemm_provider_kind=(
+                            EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED
+                        ),
+                        extern_gemm_provider_abi_version=EXTERN_GEMM_PROVIDER_ABI_VERSION,
+                        extern_gemm_runtime_claim=EXTERN_GEMM_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+                        extern_gemm_performance_claim=False,
+                        extern_gemm_uses_host_staging=True,
+                    )
+                ],
+            )
+        ],
+        generated_at="2026-05-24T00:00:00+00:00",
+    )
+
+    assert report["model_summary"]["total_kernels"] == 1
+    assert report["model_summary"]["translated_kernels"] == 1
+    assert report["model_summary"]["fallback_kernels"] == 0
+    assert report["model_summary"]["full_tvm_runnable_models"] == 0
+    assert report["summary"]["status_buckets"] == {"translated": 1}
+    runtime = report["pre_m9"]["m96_extern_gemm_runtime"]
+    assert runtime["extern_gemm_runtime_resolved_count"] == 1
+    assert runtime["status_counts"] == {
+        EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED: 1
+    }
+    assert runtime["provider_counts"] == {
+        EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED: 1
+    }
+    assert report["pre_m9"]["m9_materialized_artifact_candidates"] == []
+    assert report["pre_m9"]["m9_entry_debt"] == []
 
 
 def test_m6_zero_kernel_model_is_a_stable_collection_blocker():
@@ -542,6 +750,7 @@ def test_m65_report_diff_ignores_timestamps_and_paths():
     stable_diff = diff_capability_reports(before, same_after)
     assert stable_diff["bucket_delta"] == {}
     assert stable_diff["blocker_delta"] == {}
+    assert stable_diff["extern_family_delta"] == {}
     assert stable_diff["translated_delta"] == 0
 
     regressed = build_model_corpus_report(
@@ -571,6 +780,52 @@ def test_m65_report_diff_ignores_timestamps_and_paths():
     assert regression_diff["blocker_delta"] == {
         "unsupported_ttir_op|unsupported_ttir_op|matmul_dot": 1
     }
+    assert regression_diff["full_tvm_runnable_delta"] == -1
+
+    after_with_extern = build_model_corpus_report(
+        [
+            _kernel_record(
+                "vit",
+                "vit_tiny",
+                "triton_vit_0",
+                make_report_status(ok=True, bucket="translated"),
+            )
+        ],
+        [
+            _model_record(
+                "vit",
+                "vit_tiny",
+                kernel_count=1,
+                translated=1,
+                fallback=0,
+                extern_calls=[
+                    _extern_call(
+                        "vit",
+                        "vit_tiny",
+                        "extern_kernels.mm",
+                        "extern_gemm",
+                        matmul_source_kind="wrapper_extern_gemm",
+                        matmul_m=16,
+                        matmul_n=64,
+                        matmul_k=64,
+                        matmul_contract="matmul_minimal",
+                        matmul_contract_ok=True,
+                        matmul_epilogue_kind="none",
+                        implementation_kind="extern_gemm",
+                        extern_symbol="extern_kernels.mm",
+                        extern_packed_func=EXTERN_GEMM_PACKED_FUNC,
+                        extern_runtime_kind=EXTERN_GEMM_RUNTIME_KIND,
+                        extern_runtime_replacement=EXTERN_GEMM_RUNTIME_REPLACEMENT,
+                        extern_runtime_replacement_available=False,
+                    )
+                ],
+            )
+        ],
+        generated_at="2026-05-24T00:00:00+00:00",
+    )
+    extern_diff = diff_capability_reports(before, after_with_extern)
+    assert extern_diff["extern_family_delta"] == {"extern_gemm": 1}
+    assert extern_diff["m9_materialized_artifact_candidate_delta"] == 1
 
 
 def test_m75_model_supported_kernel_report_is_golden_guard():
@@ -715,8 +970,8 @@ def _model_record(
     }
 
 
-def _extern_call(family, model_case, op_name, op_family):
-    return {
+def _extern_call(family, model_case, op_name, op_family, **kwargs):
+    record = {
         "model_family": family,
         "model_case": model_case,
         "case_name": model_case,
@@ -726,6 +981,8 @@ def _extern_call(family, model_case, op_name, op_family):
         "wrapper_path": f"/tmp/{model_case}.py",
         "source": f"{op_name}(...)",
     }
+    record.update(kwargs)
+    return record
 
 
 def _fake_inductor_kernel(

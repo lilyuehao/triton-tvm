@@ -36,6 +36,14 @@ from .contracts import (
 )
 from .errors import UnsupportedContractError, UnsupportedTargetPolicyError, UnsupportedTTIROpError
 from .indexing import TTIRIndexClassifier, TTIRIndexInfo
+from .matmul import (
+    NATIVE_TIR_MATMUL_SCHEDULE_ID,
+    TILED_TIR_MATMUL_SCHEDULE_ID,
+    TILED_TIR_MATMUL_TILE_M,
+    TILED_TIR_MATMUL_TILE_N,
+    TargetMatmulPolicy,
+    extract_matmul_semantics_from_ttir,
+)
 from .op_graph import NormalizedTTIROpGraph, TTIROp, TTIRType
 from .ttir import TTIRInput, normalize_ttir_input
 
@@ -139,6 +147,24 @@ _SUPPORTED_OPS_BY_CONTRACT["row_reduction"] = _M8_RANK2_OPS
 _SUPPORTED_OPS_BY_CONTRACT["norm_row"] = _M8_RANK2_OPS
 _SUPPORTED_OPS_BY_CONTRACT["softmax_row"] = _M8_RANK2_OPS
 _SUPPORTED_OPS_BY_CONTRACT["masked_softmax_row"] = _M8_RANK2_OPS
+_SUPPORTED_OPS_BY_CONTRACT["matmul_minimal"] = frozenset(
+    {
+        "arith.addi",
+        "arith.constant",
+        "arith.extsi",
+        "arith.muli",
+        "tt.addptr",
+        "tt.broadcast",
+        "tt.dot",
+        "tt.expand_dims",
+        "tt.get_program_id",
+        "tt.load",
+        "tt.make_range",
+        "tt.return",
+        "tt.splat",
+        "tt.store",
+    }
+)
 
 _BINARY_OP_SYMBOLS = {
     "arith.addf": "+",
@@ -160,6 +186,7 @@ _CACHE_POLICY = "disabled"
 _M8_ROW_CONTRACTS = frozenset(
     {"row_reduction", "norm_row", "softmax_row", "masked_softmax_row"}
 )
+_M9_MATMUL_CONTRACTS = frozenset({"matmul_minimal"})
 
 
 @dataclass(frozen=True)
@@ -244,6 +271,15 @@ class TritonTVMMeta:
     disk_cache_enabled: bool
     fallback_reason: str
     cache_key: str
+    matmul_source_kind: str = ""
+    matmul_m: int | None = None
+    matmul_n: int | None = None
+    matmul_k: int | None = None
+    matmul_contract_ok: bool = False
+    implementation_kind: str = ""
+    schedule_id: str = ""
+    extern_symbol: str = ""
+    unsupported_matmul_reason: str = ""
 
 
 def translate_ttir(
@@ -271,18 +307,32 @@ def translate_ttir(
     graph, artifact = normalize_ttir_input(ttir_or_graph)
     _validate_supported_subset(graph, canonical_contract)
 
-    if canonical_contract in _M8_ROW_CONTRACTS:
+    if canonical_contract in _M9_MATMUL_CONTRACTS:
+        builder = _TIRXMatmulSemanticBuilder(graph, target_policy)
+    elif canonical_contract in _M8_ROW_CONTRACTS:
         builder = _TIRXRank2RowBuilder(graph, target_policy, canonical_contract)
     elif canonical_contract in ("reduction_minimal", "norm_single_row"):
         builder = _TIRXReductionBuilder(graph, target_policy, grid)
     else:
         builder = _TIRXTemplateBuilder(graph, target_policy, canonical_contract)
     source = builder.build_source()
-    from tvm.script import ir as I  # pylint: disable=import-outside-toplevel
-    from tvm.script import tirx as T  # pylint: disable=import-outside-toplevel
 
-    irmod = tvm.script.from_source(source, {"I": I, "T": T})
+    irmod = _parse_tirx_source(source)
     validate_triton_tvm_contract(irmod, canonical_contract)
+
+    matmul_semantics = getattr(builder, "matmul_semantics", None)
+    matmul_decision = None
+    if matmul_semantics is not None:
+        matmul_decision = TargetMatmulPolicy(
+            target_kind=target_policy.target_kind,
+        ).decide(
+            matmul_semantics,
+            matmul_contract_ok=True,
+        )
+        if matmul_decision.implementation_kind == "native_tir_schedule":
+            source = builder.build_native_schedule_source(matmul_decision)
+            irmod = _parse_tirx_source(source)
+            validate_triton_tvm_contract(irmod, canonical_contract)
 
     ttir_text = graph.raw_ttir
     signature = artifact.signature if artifact is not None else _signature_from_graph(graph)
@@ -291,6 +341,12 @@ def translate_ttir(
     source_hash = artifact.source_hash if artifact is not None else ""
     ttir_hash = hashlib.sha256(ttir_text.encode("utf-8")).hexdigest()
     abi = _abi_from_graph(graph)
+    matmul_cache_payload = (
+        matmul_semantics.cache_payload() if matmul_semantics is not None else {}
+    )
+    matmul_policy_payload = (
+        matmul_decision.cache_payload() if matmul_decision is not None else {}
+    )
     cache_key = _cache_key(
         kernel_name=graph.function_name,
         signature=signature,
@@ -326,6 +382,8 @@ def translate_ttir(
         launch_policy_id=target_policy.launch_policy_id,
         target_attrs=target_policy.target_attrs,
         cache_policy=_CACHE_POLICY,
+        matmul_semantics=matmul_cache_payload,
+        matmul_policy=matmul_policy_payload,
     )
     meta = TritonTVMMeta(
         kernel_name=graph.function_name,
@@ -367,8 +425,311 @@ def translate_ttir(
         disk_cache_enabled=False,
         fallback_reason="",
         cache_key=cache_key,
+        matmul_source_kind=matmul_semantics.source_kind if matmul_semantics else "",
+        matmul_m=matmul_semantics.m if matmul_semantics else None,
+        matmul_n=matmul_semantics.n if matmul_semantics else None,
+        matmul_k=matmul_semantics.k if matmul_semantics else None,
+        matmul_contract_ok=(
+            matmul_decision.matmul_contract_ok if matmul_decision else False
+        ),
+        implementation_kind=matmul_decision.implementation_kind if matmul_decision else "",
+        schedule_id=matmul_decision.schedule_id if matmul_decision else "",
+        extern_symbol=matmul_decision.extern_symbol if matmul_decision else "",
+        unsupported_matmul_reason=(
+            matmul_decision.unsupported_matmul_reason if matmul_decision else ""
+        ),
     )
     return irmod, meta
+
+
+def _parse_tirx_source(source: str) -> tvm.IRModule:
+    from tvm.script import ir as I  # pylint: disable=import-outside-toplevel
+    from tvm.script import tirx as T  # pylint: disable=import-outside-toplevel
+
+    return tvm.script.from_source(source, {"I": I, "T": T})
+
+
+class _TIRXMatmulSemanticBuilder:
+    def __init__(
+        self,
+        graph: NormalizedTTIROpGraph,
+        target_policy: _PointwiseTargetPolicy,
+    ):
+        self.graph = graph
+        self.target_policy = target_policy
+        self.matmul_semantics = extract_matmul_semantics_from_ttir(graph)
+        self.params = graph.param_by_name()
+        self.names = {param.name: _sanitize_identifier(param.name) for param in graph.params}
+        self.ptr_params = [param for param in graph.params if param.type.is_pointer]
+        self.scalar_params = [param for param in graph.params if not param.type.is_pointer]
+        if self.scalar_params:
+            raise UnsupportedTTIROpError("matmul_minimal only supports static pointer-only ABI")
+        self.block_size = self.matmul_semantics.block_m
+        self.extent_info = _ExtentInfo(
+            kind="constant",
+            expr=f"T.int64({self.matmul_semantics.m})",
+            value=self.matmul_semantics.m,
+        )
+        self.reduction_extent_info = _ExtentInfo(
+            kind="constant",
+            expr=f"T.int64({self.matmul_semantics.k})",
+            value=self.matmul_semantics.k,
+        )
+        self.buffer_extents = self._buffer_extents()
+
+    def build_source(self) -> str:
+        sem = self.matmul_semantics
+        a_name = self.names[sem.a_param]
+        b_name = self.names[sem.b_param]
+        c_name = self.names[sem.c_param]
+        lines: list[str] = [
+            "# from tvm.script import ir as I",
+            "# from tvm.script import tirx as T",
+            "",
+            "@I.ir_module",
+            "class Module:",
+            "    @T.prim_func",
+            f"    def {_sanitize_identifier(self.graph.function_name)}({self._param_signature()}):",
+            "        T.func_attr({"
+            f'"global_symbol": "{self.graph.function_name}", '
+            '"tirx.noalias": True, '
+            f'"target": T.target({self.target_policy.target_attrs!r}), '
+            '"triton_tvm.contract": "matmul_minimal", '
+            f'"triton_tvm.matmul_source_kind": "{sem.source_kind}", '
+            f'"triton_tvm.accumulator_dtype": "{sem.accumulator_dtype}", '
+            f'"triton_tvm.implementation_kind": "{sem.implementation_kind}", '
+            f'"triton_tvm.matmul_m": {sem.m}, '
+            f'"triton_tvm.matmul_n": {sem.n}, '
+            f'"triton_tvm.matmul_k": {sem.k}'
+            "})",
+            "        "
+            f'{a_name} = T.match_buffer({a_name}_handle, ({sem.m}, {sem.k}), '
+            f'"{sem.a_dtype}")',
+            "        "
+            f'{b_name} = T.match_buffer({b_name}_handle, ({sem.k}, {sem.n}), '
+            f'"{sem.b_dtype}")',
+            "        "
+            f'{c_name} = T.match_buffer({c_name}_handle, ({sem.m}, {sem.n}), '
+            f'"{sem.output_dtype}")',
+            f"        for m, n, k in T.grid({sem.m}, {sem.n}, {sem.k}):",
+            '            with T.sblock("matmul"):',
+            '                vm, vn, vk = T.axis.remap("SSR", [m, n, k])',
+            f"                T.reads({a_name}[vm, vk], {b_name}[vk, vn])",
+            f"                T.writes({c_name}[vm, vn])",
+            "                T.sblock_attr({"
+            '"triton_tvm.contract": "matmul_minimal", '
+            f'"triton_tvm.matmul_source_kind": "{sem.source_kind}", '
+            f'"triton_tvm.accumulator_dtype": "{sem.accumulator_dtype}", '
+            f'"triton_tvm.implementation_kind": "{sem.implementation_kind}", '
+            f'"triton_tvm.matmul_m": {sem.m}, '
+            f'"triton_tvm.matmul_n": {sem.n}, '
+            f'"triton_tvm.matmul_k": {sem.k}, '
+            f'"triton_tvm.input_precision": "{sem.input_precision}", '
+            f'"triton_tvm.bounds_policy": "{sem.bounds_policy}", '
+            f'"triton_tvm.mask_kind": "{sem.mask_kind}", '
+            f'"triton_tvm.epilogue_kind": "{sem.epilogue_kind}"'
+            "})",
+            "                with T.init():",
+            f"                    {c_name}[vm, vn] = {_tir_const(0, sem.output_dtype)}",
+            "                "
+            f'{c_name}[vm, vn] = {c_name}[vm, vn] + T.Cast("{sem.accumulator_dtype}", '
+            f'{a_name}[vm, vk]) * T.Cast("{sem.accumulator_dtype}", {b_name}[vk, vn])',
+        ]
+        return "\n".join(lines) + "\n"
+
+    def build_native_schedule_source(self, decision) -> str:
+        if (
+            decision.implementation_kind != "native_tir_schedule"
+            or decision.schedule_id
+            not in (NATIVE_TIR_MATMUL_SCHEDULE_ID, TILED_TIR_MATMUL_SCHEDULE_ID)
+        ):
+            raise UnsupportedTTIROpError(
+                "matmul_minimal native emission requires a known M9 native schedule"
+            )
+
+        if decision.schedule_id == TILED_TIR_MATMUL_SCHEDULE_ID:
+            return self._build_native_tiled_schedule_source(decision)
+        return self._build_native_per_output_schedule_source(decision)
+
+    def _build_native_per_output_schedule_source(self, decision) -> str:
+        sem = self.matmul_semantics
+        a_name = self.names[sem.a_param]
+        b_name = self.names[sem.b_param]
+        c_name = self.names[sem.c_param]
+        output_elems = sem.m * sem.n
+        lines: list[str] = [
+            "# from tvm.script import ir as I",
+            "# from tvm.script import tirx as T",
+            "",
+            "@I.ir_module",
+            "class Module:",
+            "    @T.prim_func",
+            f"    def {_sanitize_identifier(self.graph.function_name)}({self._param_signature()}):",
+            "        T.func_attr({"
+            f'"global_symbol": "{self.graph.function_name}", '
+            '"tirx.noalias": True, '
+            f'"target": T.target({self.target_policy.target_attrs!r}), '
+            '"triton_tvm.contract": "matmul_minimal", '
+            f'"triton_tvm.matmul_source_kind": "{sem.source_kind}", '
+            f'"triton_tvm.accumulator_dtype": "{sem.accumulator_dtype}", '
+            f'"triton_tvm.implementation_kind": "{decision.implementation_kind}", '
+            f'"triton_tvm.schedule_id": "{decision.schedule_id}", '
+            f'"triton_tvm.matmul_m": {sem.m}, '
+            f'"triton_tvm.matmul_n": {sem.n}, '
+            f'"triton_tvm.matmul_k": {sem.k}'
+            "})",
+            "        "
+            f'{a_name} = T.match_buffer({a_name}_handle, ({sem.m}, {sem.k}), '
+            f'"{sem.a_dtype}")',
+            "        "
+            f'{b_name} = T.match_buffer({b_name}_handle, ({sem.k}, {sem.n}), '
+            f'"{sem.b_dtype}")',
+            "        "
+            f'{c_name} = T.match_buffer({c_name}_handle, ({sem.m}, {sem.n}), '
+            f'"{sem.output_dtype}")',
+            "        "
+            f"for {self.target_policy.block_var} in T.thread_binding("
+            f"0, {output_elems}, thread=\"{self.target_policy.block_thread_tag}\"):",
+            "            "
+            f"for {self.target_policy.lane_var} in T.thread_binding(0, 1, "
+            f'thread="{self.target_policy.lane_thread_tag}"):',
+            f"                mi = {self.target_policy.block_var} // {sem.n}",
+            f"                ni = {self.target_policy.block_var} % {sem.n}",
+            f"                for k in T.serial(0, {sem.k}):",
+            '                    with T.sblock("matmul"):',
+            f"                        vm = T.axis.spatial({sem.m}, mi)",
+            f"                        vn = T.axis.spatial({sem.n}, ni)",
+            f"                        vk = T.axis.reduce({sem.k}, k)",
+            f"                        T.reads({a_name}[vm, vk], {b_name}[vk, vn])",
+            f"                        T.writes({c_name}[vm, vn])",
+            "                        T.sblock_attr({"
+            '"triton_tvm.contract": "matmul_minimal", '
+            f'"triton_tvm.matmul_source_kind": "{sem.source_kind}", '
+            f'"triton_tvm.accumulator_dtype": "{sem.accumulator_dtype}", '
+            f'"triton_tvm.implementation_kind": "{decision.implementation_kind}", '
+            f'"triton_tvm.schedule_id": "{decision.schedule_id}", '
+            f'"triton_tvm.matmul_m": {sem.m}, '
+            f'"triton_tvm.matmul_n": {sem.n}, '
+            f'"triton_tvm.matmul_k": {sem.k}, '
+            f'"triton_tvm.input_precision": "{sem.input_precision}", '
+            f'"triton_tvm.bounds_policy": "{sem.bounds_policy}", '
+            f'"triton_tvm.mask_kind": "{sem.mask_kind}", '
+            f'"triton_tvm.epilogue_kind": "{sem.epilogue_kind}"'
+            "})",
+            "                        with T.init():",
+            f"                            {c_name}[vm, vn] = {_tir_const(0, sem.output_dtype)}",
+            "                        "
+            f'{c_name}[vm, vn] = {c_name}[vm, vn] + T.Cast("{sem.accumulator_dtype}", '
+            f'{a_name}[vm, vk]) * T.Cast("{sem.accumulator_dtype}", {b_name}[vk, vn])',
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _build_native_tiled_schedule_source(self, decision) -> str:
+        sem = self.matmul_semantics
+        if sem.m % TILED_TIR_MATMUL_TILE_M or sem.n % TILED_TIR_MATMUL_TILE_N:
+            raise UnsupportedTTIROpError(
+                "tiled matmul schedule requires M and N to be multiples of 8"
+            )
+
+        a_name = self.names[sem.a_param]
+        b_name = self.names[sem.b_param]
+        c_name = self.names[sem.c_param]
+        tiles_m = sem.m // TILED_TIR_MATMUL_TILE_M
+        tiles_n = sem.n // TILED_TIR_MATMUL_TILE_N
+        tile_count = tiles_m * tiles_n
+        tile_elems = TILED_TIR_MATMUL_TILE_M * TILED_TIR_MATMUL_TILE_N
+        lines: list[str] = [
+            "# from tvm.script import ir as I",
+            "# from tvm.script import tirx as T",
+            "",
+            "@I.ir_module",
+            "class Module:",
+            "    @T.prim_func",
+            f"    def {_sanitize_identifier(self.graph.function_name)}({self._param_signature()}):",
+            "        T.func_attr({"
+            f'"global_symbol": "{self.graph.function_name}", '
+            '"tirx.noalias": True, '
+            f'"target": T.target({self.target_policy.target_attrs!r}), '
+            '"triton_tvm.contract": "matmul_minimal", '
+            f'"triton_tvm.matmul_source_kind": "{sem.source_kind}", '
+            f'"triton_tvm.accumulator_dtype": "{sem.accumulator_dtype}", '
+            f'"triton_tvm.implementation_kind": "{decision.implementation_kind}", '
+            f'"triton_tvm.schedule_id": "{decision.schedule_id}", '
+            f'"triton_tvm.tile_m": {TILED_TIR_MATMUL_TILE_M}, '
+            f'"triton_tvm.tile_n": {TILED_TIR_MATMUL_TILE_N}, '
+            f'"triton_tvm.matmul_m": {sem.m}, '
+            f'"triton_tvm.matmul_n": {sem.n}, '
+            f'"triton_tvm.matmul_k": {sem.k}'
+            "})",
+            "        "
+            f'{a_name} = T.match_buffer({a_name}_handle, ({sem.m}, {sem.k}), '
+            f'"{sem.a_dtype}")',
+            "        "
+            f'{b_name} = T.match_buffer({b_name}_handle, ({sem.k}, {sem.n}), '
+            f'"{sem.b_dtype}")',
+            "        "
+            f'{c_name} = T.match_buffer({c_name}_handle, ({sem.m}, {sem.n}), '
+            f'"{sem.output_dtype}")',
+            "        "
+            f"for {self.target_policy.block_var} in T.thread_binding("
+            f"0, {tile_count}, thread=\"{self.target_policy.block_thread_tag}\"):",
+            "            "
+            f"for {self.target_policy.lane_var} in T.thread_binding(0, {tile_elems}, "
+            f'thread="{self.target_policy.lane_thread_tag}"):',
+            f"                tile_m = {self.target_policy.block_var} // {tiles_n}",
+            f"                tile_n = {self.target_policy.block_var} % {tiles_n}",
+            f"                local_m = {self.target_policy.lane_var} // {TILED_TIR_MATMUL_TILE_N}",
+            f"                local_n = {self.target_policy.lane_var} % {TILED_TIR_MATMUL_TILE_N}",
+            f"                mi = tile_m * {TILED_TIR_MATMUL_TILE_M} + local_m",
+            f"                ni = tile_n * {TILED_TIR_MATMUL_TILE_N} + local_n",
+            f"                for k in T.serial(0, {sem.k}):",
+            '                    with T.sblock("matmul"):',
+            f"                        vm = T.axis.spatial({sem.m}, mi)",
+            f"                        vn = T.axis.spatial({sem.n}, ni)",
+            f"                        vk = T.axis.reduce({sem.k}, k)",
+            f"                        T.reads({a_name}[vm, vk], {b_name}[vk, vn])",
+            f"                        T.writes({c_name}[vm, vn])",
+            "                        T.sblock_attr({"
+            '"triton_tvm.contract": "matmul_minimal", '
+            f'"triton_tvm.matmul_source_kind": "{sem.source_kind}", '
+            f'"triton_tvm.accumulator_dtype": "{sem.accumulator_dtype}", '
+            f'"triton_tvm.implementation_kind": "{decision.implementation_kind}", '
+            f'"triton_tvm.schedule_id": "{decision.schedule_id}", '
+            f'"triton_tvm.tile_m": {TILED_TIR_MATMUL_TILE_M}, '
+            f'"triton_tvm.tile_n": {TILED_TIR_MATMUL_TILE_N}, '
+            f'"triton_tvm.matmul_m": {sem.m}, '
+            f'"triton_tvm.matmul_n": {sem.n}, '
+            f'"triton_tvm.matmul_k": {sem.k}, '
+            f'"triton_tvm.input_precision": "{sem.input_precision}", '
+            f'"triton_tvm.bounds_policy": "{sem.bounds_policy}", '
+            f'"triton_tvm.mask_kind": "{sem.mask_kind}", '
+            f'"triton_tvm.epilogue_kind": "{sem.epilogue_kind}"'
+            "})",
+            "                        with T.init():",
+            f"                            {c_name}[vm, vn] = {_tir_const(0, sem.output_dtype)}",
+            "                        "
+            f'{c_name}[vm, vn] = {c_name}[vm, vn] + T.Cast("{sem.accumulator_dtype}", '
+            f'{a_name}[vm, vk]) * T.Cast("{sem.accumulator_dtype}", {b_name}[vk, vn])',
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _param_signature(self) -> str:
+        items: list[str] = []
+        for param in self.graph.params:
+            name = self.names[param.name]
+            if param.type.is_pointer:
+                items.append(f"{name}_handle: T.handle")
+            else:
+                items.append(f"{name}: T.{param.type.dtype}")
+        return ", ".join(items)
+
+    def _buffer_extents(self) -> dict[str, str]:
+        sem = self.matmul_semantics
+        return {
+            sem.a_param: f"T.int64({sem.m * sem.k})",
+            sem.b_param: f"T.int64({sem.k * sem.n})",
+            sem.c_param: f"T.int64({sem.m * sem.n})",
+        }
 
 
 class _TIRXTemplateBuilder:
@@ -2019,8 +2380,8 @@ def _validate_supported_subset(graph: NormalizedTTIROpGraph, contract: str) -> N
     if supported_ops is None:
         raise UnsupportedContractError(
             f"Contract {contract!r} is not implemented yet; "
-            "only pointwise, reduction_minimal, and norm_single_row contracts are "
-            "supported by this translator."
+            "only pointwise, reduction, row-family, and matmul_minimal contracts "
+            "are supported by this translator."
         )
     for op in _iter_ops_with_regions(graph.ops):
         if op.name not in supported_ops:
@@ -2029,6 +2390,8 @@ def _validate_supported_subset(graph: NormalizedTTIROpGraph, contract: str) -> N
             if contract in ("reduction_minimal", "norm_single_row") and len(op.operands) == 1:
                 continue
             if contract in _M8_ROW_CONTRACTS and len(op.operands) in (1, 2):
+                continue
+            if contract in _M9_MATMUL_CONTRACTS and len(op.operands) == 1:
                 continue
             if contract != "pointwise_flat":
                 raise UnsupportedTTIROpError(
@@ -2145,6 +2508,7 @@ def _pointwise_target_policy(target) -> _PointwiseTargetPolicy:
                     "norm_row",
                     "softmax_row",
                     "masked_softmax_row",
+                    "matmul_minimal",
                 }
             ),
             block_var="bx",
