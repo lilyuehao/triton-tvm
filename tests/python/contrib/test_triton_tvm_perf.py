@@ -37,6 +37,7 @@ import pytest
 import tvm
 import tvm.testing
 from tvm.contrib.triton_tvm import build_triton_tvm, lower_to_ttir, translate_ttir
+from tvm.contrib.triton_tvm.m9p_matmul_dashboard import run_dashboard
 from tvm.contrib.triton_tvm.matmul import NATIVE_TIR_MATMUL_SCHEDULE_ID
 
 try:
@@ -49,6 +50,7 @@ except ImportError:
 
 _RUN_PERF = os.environ.get("TRITON_TVM_RUN_PERF_BASELINE") == "1"
 _RUN_M9_MATMUL_PERF = os.environ.get("TRITON_TVM_RUN_M9_MATMUL_PERF_GUARD") == "1"
+_RUN_M9P_MATMUL_DASHBOARD = os.environ.get("TRITON_TVM_RUN_M9P_MATMUL_DASHBOARD") == "1"
 _DEFAULT_N = int(os.environ.get("TRITON_TVM_PERF_N", str(2**22)))
 _DEFAULT_BLOCK = int(os.environ.get("TRITON_TVM_PERF_BLOCK", "256"))
 _TVM_NUMBER = int(os.environ.get("TRITON_TVM_PERF_TVM_NUMBER", "20"))
@@ -289,6 +291,29 @@ def test_m9_matmul_perf_guard_scaffold():
     assert results["implementation_kind"] == "native_tir_schedule"
     assert results["schedule_id"] == NATIVE_TIR_MATMUL_SCHEDULE_ID
     assert results["tvm_us"] > 0.0
+
+
+@pytest.mark.skipif(
+    not _RUN_M9P_MATMUL_DASHBOARD,
+    reason="Set TRITON_TVM_RUN_M9P_MATMUL_DASHBOARD=1 to run the M9.P matmul dashboard",
+)
+@tvm.testing.requires_cuda_compute_version(7)
+def test_m9p_matmul_dashboard_perf(tmp_path):
+    report = run_dashboard(out_dir=tmp_path, warmup=2, repeat=5, run_benchmarks=True)
+    print("TRITON_TVM_M9P_MATMUL_DASHBOARD " + json.dumps(report, indent=2, sort_keys=True))
+
+    assert report["report_kind"] == "triton_tvm_m9p_matmul_phase1_dashboard"
+    assert report["summary"]["measured_cases"] >= 3
+    assert report["summary"]["tensorcore_selected_cases"] >= 3
+    assert report["extern_provider_status"]["performance_claim"] is False
+    for case in report["cases"]:
+        if case["perf_guard_status"] != "measured":
+            continue
+        assert case["baseline_torch_us"] > 0.0
+        assert case["baseline_triton_us"] > 0.0
+        assert case["triton_tvm_us"] > 0.0
+        assert case["tflops"] > 0.0
+        assert case["correctness_allclose"] is True
 
 
 def _run_perf_baseline() -> dict[str, Any]:

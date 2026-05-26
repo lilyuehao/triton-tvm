@@ -37,7 +37,15 @@ from .contracts import (
 from .errors import UnsupportedContractError, UnsupportedTargetPolicyError, UnsupportedTTIROpError
 from .indexing import TTIRIndexClassifier, TTIRIndexInfo
 from .matmul import (
+    MATMUL_PERF_ENVELOPE_ID,
     NATIVE_TIR_MATMUL_SCHEDULE_ID,
+    SIMT_TIR_MATMUL_SCHEDULE_ID,
+    SIMT_TIR_MATMUL_TILE_M,
+    SIMT_TIR_MATMUL_TILE_N,
+    TENSORCORE_TIR_MATMUL_SCHEDULE_ID,
+    TENSORCORE_TIR_MATMUL_TILE_K,
+    TENSORCORE_TIR_MATMUL_TILE_M,
+    TENSORCORE_TIR_MATMUL_TILE_N,
     TILED_TIR_MATMUL_SCHEDULE_ID,
     TILED_TIR_MATMUL_TILE_M,
     TILED_TIR_MATMUL_TILE_N,
@@ -280,6 +288,12 @@ class TritonTVMMeta:
     schedule_id: str = ""
     extern_symbol: str = ""
     unsupported_matmul_reason: str = ""
+    matmul_perf_envelope: str = ""
+    candidate_schedule_ids: tuple[str, ...] = ()
+    selected_schedule_id: str = ""
+    schedule_reject_reasons: dict[str, str] | None = None
+    perf_guard_status: str = ""
+    tune_key: dict[str, Any] | None = None
 
 
 def translate_ttir(
@@ -438,6 +452,18 @@ def translate_ttir(
         unsupported_matmul_reason=(
             matmul_decision.unsupported_matmul_reason if matmul_decision else ""
         ),
+        matmul_perf_envelope=(
+            matmul_decision.matmul_perf_envelope if matmul_decision else ""
+        ),
+        candidate_schedule_ids=(
+            matmul_decision.candidate_schedule_ids if matmul_decision else ()
+        ),
+        selected_schedule_id=matmul_decision.selected_schedule_id if matmul_decision else "",
+        schedule_reject_reasons=(
+            matmul_decision.schedule_reject_reasons if matmul_decision else {}
+        ),
+        perf_guard_status=matmul_decision.perf_guard_status if matmul_decision else "",
+        tune_key=matmul_decision.tune_key if matmul_decision else {},
     )
     return irmod, meta
 
@@ -541,12 +567,21 @@ class _TIRXMatmulSemanticBuilder:
         if (
             decision.implementation_kind != "native_tir_schedule"
             or decision.schedule_id
-            not in (NATIVE_TIR_MATMUL_SCHEDULE_ID, TILED_TIR_MATMUL_SCHEDULE_ID)
+            not in (
+                NATIVE_TIR_MATMUL_SCHEDULE_ID,
+                SIMT_TIR_MATMUL_SCHEDULE_ID,
+                TILED_TIR_MATMUL_SCHEDULE_ID,
+                TENSORCORE_TIR_MATMUL_SCHEDULE_ID,
+            )
         ):
             raise UnsupportedTTIROpError(
                 "matmul_minimal native emission requires a known M9 native schedule"
             )
 
+        if decision.schedule_id == TENSORCORE_TIR_MATMUL_SCHEDULE_ID:
+            return self._build_native_tensorcore_schedule_source(decision)
+        if decision.schedule_id == SIMT_TIR_MATMUL_SCHEDULE_ID:
+            return self._build_native_simt_schedule_source(decision)
         if decision.schedule_id == TILED_TIR_MATMUL_SCHEDULE_ID:
             return self._build_native_tiled_schedule_source(decision)
         return self._build_native_per_output_schedule_source(decision)
@@ -710,6 +745,250 @@ class _TIRXMatmulSemanticBuilder:
             "                        "
             f'{c_name}[vm, vn] = {c_name}[vm, vn] + T.Cast("{sem.accumulator_dtype}", '
             f'{a_name}[vm, vk]) * T.Cast("{sem.accumulator_dtype}", {b_name}[vk, vn])',
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _build_native_simt_schedule_source(self, decision) -> str:
+        sem = self.matmul_semantics
+        if sem.m % SIMT_TIR_MATMUL_TILE_M or sem.n % SIMT_TIR_MATMUL_TILE_N:
+            raise UnsupportedTTIROpError(
+                "SIMT matmul schedule requires M and N to be multiples of 16"
+            )
+        if sem.k % 16:
+            raise UnsupportedTTIROpError("SIMT matmul schedule requires K multiple of 16")
+        if sem.a_dtype not in ("float16", "bfloat16") or sem.b_dtype not in (
+            "float16",
+            "bfloat16",
+        ):
+            raise UnsupportedTTIROpError("SIMT matmul schedule requires fp16/bf16 inputs")
+        if sem.output_dtype != "float32" or sem.accumulator_dtype != "float32":
+            raise UnsupportedTTIROpError(
+                "SIMT matmul schedule requires fp32 accumulator/output"
+            )
+
+        a_name = self.names[sem.a_param]
+        b_name = self.names[sem.b_param]
+        c_name = self.names[sem.c_param]
+        tiles_m = sem.m // SIMT_TIR_MATMUL_TILE_M
+        tiles_n = sem.n // SIMT_TIR_MATMUL_TILE_N
+        tile_count = tiles_m * tiles_n
+        tile_elems = SIMT_TIR_MATMUL_TILE_M * SIMT_TIR_MATMUL_TILE_N
+        reject_text = ";".join(
+            f"{key}:{value}" for key, value in sorted(decision.schedule_reject_reasons.items())
+        )
+        candidate_text = ",".join(decision.candidate_schedule_ids)
+        lines: list[str] = [
+            "# from tvm.script import ir as I",
+            "# from tvm.script import tirx as T",
+            "",
+            "@I.ir_module",
+            "class Module:",
+            "    @T.prim_func",
+            f"    def {_sanitize_identifier(self.graph.function_name)}({self._param_signature()}):",
+            "        T.func_attr({"
+            f'"global_symbol": "{self.graph.function_name}", '
+            '"tirx.noalias": True, '
+            f'"target": T.target({self.target_policy.target_attrs!r}), '
+            '"triton_tvm.contract": "matmul_minimal", '
+            f'"triton_tvm.matmul_source_kind": "{sem.source_kind}", '
+            f'"triton_tvm.a_dtype": "{sem.a_dtype}", '
+            f'"triton_tvm.b_dtype": "{sem.b_dtype}", '
+            f'"triton_tvm.output_dtype": "{sem.output_dtype}", '
+            f'"triton_tvm.accumulator_dtype": "{sem.accumulator_dtype}", '
+            f'"triton_tvm.bounds_policy": "{sem.bounds_policy}", '
+            f'"triton_tvm.mask_kind": "{sem.mask_kind}", '
+            f'"triton_tvm.epilogue_kind": "{sem.epilogue_kind}", '
+            f'"triton_tvm.implementation_kind": "{decision.implementation_kind}", '
+            f'"triton_tvm.schedule_id": "{decision.schedule_id}", '
+            f'"triton_tvm.matmul_perf_envelope": "{MATMUL_PERF_ENVELOPE_ID}", '
+            f'"triton_tvm.candidate_schedule_ids": "{candidate_text}", '
+            f'"triton_tvm.selected_schedule_id": "{decision.selected_schedule_id}", '
+            f'"triton_tvm.schedule_reject_reasons": "{reject_text}", '
+            f'"triton_tvm.perf_guard_status": "{decision.perf_guard_status}", '
+            f'"triton_tvm.tile_m": {SIMT_TIR_MATMUL_TILE_M}, '
+            f'"triton_tvm.tile_n": {SIMT_TIR_MATMUL_TILE_N}, '
+            f'"triton_tvm.matmul_m": {sem.m}, '
+            f'"triton_tvm.matmul_n": {sem.n}, '
+            f'"triton_tvm.matmul_k": {sem.k}'
+            "})",
+            "        "
+            f'{a_name} = T.match_buffer({a_name}_handle, ({sem.m}, {sem.k}), '
+            f'"{sem.a_dtype}")',
+            "        "
+            f'{b_name} = T.match_buffer({b_name}_handle, ({sem.k}, {sem.n}), '
+            f'"{sem.b_dtype}")',
+            "        "
+            f'{c_name} = T.match_buffer({c_name}_handle, ({sem.m}, {sem.n}), '
+            f'"{sem.output_dtype}")',
+            "        "
+            f"for {self.target_policy.block_var} in T.thread_binding("
+            f"0, {tile_count}, thread=\"{self.target_policy.block_thread_tag}\"):",
+            "            "
+            f"for {self.target_policy.lane_var} in T.thread_binding(0, {tile_elems}, "
+            f'thread="{self.target_policy.lane_thread_tag}"):',
+            f"                tile_m = {self.target_policy.block_var} // {tiles_n}",
+            f"                tile_n = {self.target_policy.block_var} % {tiles_n}",
+            f"                local_m = {self.target_policy.lane_var} // {SIMT_TIR_MATMUL_TILE_N}",
+            f"                local_n = {self.target_policy.lane_var} % {SIMT_TIR_MATMUL_TILE_N}",
+            f"                mi = tile_m * {SIMT_TIR_MATMUL_TILE_M} + local_m",
+            f"                ni = tile_n * {SIMT_TIR_MATMUL_TILE_N} + local_n",
+            f"                for k in T.serial(0, {sem.k}):",
+            '                    with T.sblock("matmul"):',
+            f"                        vm = T.axis.spatial({sem.m}, mi)",
+            f"                        vn = T.axis.spatial({sem.n}, ni)",
+            f"                        vk = T.axis.reduce({sem.k}, k)",
+            f"                        T.reads({a_name}[vm, vk], {b_name}[vk, vn])",
+            f"                        T.writes({c_name}[vm, vn])",
+            "                        T.sblock_attr({"
+            '"triton_tvm.contract": "matmul_minimal", '
+            f'"triton_tvm.matmul_source_kind": "{sem.source_kind}", '
+            f'"triton_tvm.accumulator_dtype": "{sem.accumulator_dtype}", '
+            f'"triton_tvm.implementation_kind": "{decision.implementation_kind}", '
+            f'"triton_tvm.schedule_id": "{decision.schedule_id}", '
+            f'"triton_tvm.matmul_perf_envelope": "{MATMUL_PERF_ENVELOPE_ID}", '
+            f'"triton_tvm.tile_m": {SIMT_TIR_MATMUL_TILE_M}, '
+            f'"triton_tvm.tile_n": {SIMT_TIR_MATMUL_TILE_N}, '
+            f'"triton_tvm.matmul_m": {sem.m}, '
+            f'"triton_tvm.matmul_n": {sem.n}, '
+            f'"triton_tvm.matmul_k": {sem.k}, '
+            f'"triton_tvm.input_precision": "{sem.input_precision}", '
+            f'"triton_tvm.bounds_policy": "{sem.bounds_policy}", '
+            f'"triton_tvm.mask_kind": "{sem.mask_kind}", '
+            f'"triton_tvm.epilogue_kind": "{sem.epilogue_kind}"'
+            "})",
+            "                        with T.init():",
+            f"                            {c_name}[vm, vn] = {_tir_const(0, sem.output_dtype)}",
+            "                        "
+            f'{c_name}[vm, vn] = {c_name}[vm, vn] + T.Cast("{sem.accumulator_dtype}", '
+            f'{a_name}[vm, vk]) * T.Cast("{sem.accumulator_dtype}", {b_name}[vk, vn])',
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _build_native_tensorcore_schedule_source(self, decision) -> str:
+        sem = self.matmul_semantics
+        if (
+            sem.m % TENSORCORE_TIR_MATMUL_TILE_M
+            or sem.n % TENSORCORE_TIR_MATMUL_TILE_N
+            or sem.k % 16
+        ):
+            raise UnsupportedTTIROpError(
+                "TensorCore matmul schedule requires M/N/K multiples of 16"
+            )
+        if sem.a_dtype != "float16" or sem.b_dtype != "float16":
+            raise UnsupportedTTIROpError("TensorCore matmul schedule requires fp16 inputs")
+        if sem.output_dtype != "float32" or sem.accumulator_dtype != "float32":
+            raise UnsupportedTTIROpError(
+                "TensorCore matmul schedule requires fp32 accumulator/output"
+            )
+
+        a_name = self.names[sem.a_param]
+        b_name = self.names[sem.b_param]
+        c_name = self.names[sem.c_param]
+        tiles_m = sem.m // TENSORCORE_TIR_MATMUL_TILE_M
+        tiles_n = sem.n // TENSORCORE_TIR_MATMUL_TILE_N
+        tile_count = tiles_m * tiles_n
+        k_chunks = sem.k // TENSORCORE_TIR_MATMUL_TILE_K
+        reject_text = ";".join(
+            f"{key}:{value}" for key, value in sorted(decision.schedule_reject_reasons.items())
+        )
+        candidate_text = ",".join(decision.candidate_schedule_ids)
+        lines: list[str] = [
+            "# from tvm.script import ir as I",
+            "# from tvm.script import tirx as T",
+            "",
+            "@I.ir_module",
+            "class Module:",
+            "    @T.prim_func",
+            f"    def {_sanitize_identifier(self.graph.function_name)}({self._param_signature()}):",
+            "        T.func_attr({"
+            f'"global_symbol": "{self.graph.function_name}", '
+            '"tirx.noalias": True, '
+            f'"target": T.target({self.target_policy.target_attrs!r}), '
+            '"triton_tvm.contract": "matmul_minimal", '
+            f'"triton_tvm.matmul_source_kind": "{sem.source_kind}", '
+            f'"triton_tvm.a_dtype": "{sem.a_dtype}", '
+            f'"triton_tvm.b_dtype": "{sem.b_dtype}", '
+            f'"triton_tvm.output_dtype": "{sem.output_dtype}", '
+            f'"triton_tvm.accumulator_dtype": "{sem.accumulator_dtype}", '
+            f'"triton_tvm.bounds_policy": "{sem.bounds_policy}", '
+            f'"triton_tvm.mask_kind": "{sem.mask_kind}", '
+            f'"triton_tvm.epilogue_kind": "{sem.epilogue_kind}", '
+            f'"triton_tvm.implementation_kind": "{decision.implementation_kind}", '
+            f'"triton_tvm.schedule_id": "{decision.schedule_id}", '
+            f'"triton_tvm.matmul_perf_envelope": "{MATMUL_PERF_ENVELOPE_ID}", '
+            f'"triton_tvm.candidate_schedule_ids": "{candidate_text}", '
+            f'"triton_tvm.selected_schedule_id": "{decision.selected_schedule_id}", '
+            f'"triton_tvm.schedule_reject_reasons": "{reject_text}", '
+            f'"triton_tvm.perf_guard_status": "{decision.perf_guard_status}", '
+            f'"triton_tvm.tile_m": {TENSORCORE_TIR_MATMUL_TILE_M}, '
+            f'"triton_tvm.tile_n": {TENSORCORE_TIR_MATMUL_TILE_N}, '
+            f'"triton_tvm.tile_k": {TENSORCORE_TIR_MATMUL_TILE_K}, '
+            '"triton_tvm.ptx_mma_shape": "m8n8k4", '
+            '"triton_tvm.ptx_mma_a_layout": "row", '
+            '"triton_tvm.ptx_mma_b_layout": "row", '
+            f'"triton_tvm.matmul_m": {sem.m}, '
+            f'"triton_tvm.matmul_n": {sem.n}, '
+            f'"triton_tvm.matmul_k": {sem.k}'
+            "})",
+            "        "
+            f'{a_name} = T.match_buffer({a_name}_handle, ({sem.m}, {sem.k}), '
+            f'"{sem.a_dtype}")',
+            "        "
+            f'{b_name} = T.match_buffer({b_name}_handle, ({sem.k}, {sem.n}), '
+            f'"{sem.b_dtype}")',
+            "        "
+            f'{c_name} = T.match_buffer({c_name}_handle, ({sem.m}, {sem.n}), '
+            f'"{sem.output_dtype}")',
+            f'        block = T.env_thread("{self.target_policy.block_thread_tag}")',
+            f'        tx = T.env_thread("{self.target_policy.lane_thread_tag}")',
+            f"        T.launch_thread(block, {tile_count})",
+            "        T.launch_thread(tx, 32)",
+            "        tile_m = block // " + str(tiles_n),
+            "        tile_n = block % " + str(tiles_n),
+            '        multi_a = T.decl_buffer([4], "float16", scope="local")',
+            '        multi_b = T.decl_buffer([4], "float16", scope="local")',
+            '        accum = T.decl_buffer([8], "float32", scope="local")',
+            "        for accum_i in range(8):",
+            "            accum[accum_i] = T.float32(0)",
+            f"        for k_outer in T.serial(0, {k_chunks}):",
+            "            for mma_multi_a_col in T.vectorized(4):",
+            "                multi_a[mma_multi_a_col] = "
+            f"{a_name}[tile_m * {TENSORCORE_TIR_MATMUL_TILE_M} + "
+            "((tx % 32) % 4) + (4 * (((tx % 32) // 16 + "
+            "(tx % 32) % 16 // 4 * 2) % 4)), "
+            f"k_outer * {TENSORCORE_TIR_MATMUL_TILE_K} + mma_multi_a_col]",
+            "            for mma_multi_b_col in T.vectorized(4):",
+            "                multi_b[mma_multi_b_col] = "
+            f"{b_name}[k_outer * {TENSORCORE_TIR_MATMUL_TILE_K} + "
+            "(tx % 32) % 4, "
+            f"tile_n * {TENSORCORE_TIR_MATMUL_TILE_N} + mma_multi_b_col + "
+            "(4 * ((tx % 32) // 8))]",
+            "            T.evaluate(",
+            "                T.ptx_mma(",
+            '                    "m8n8k4",',
+            '                    "row",',
+            '                    "row",',
+            '                    "fp16",',
+            '                    "fp16",',
+            '                    "fp32",',
+            "                    multi_a.data,",
+            "                    0,",
+            "                    multi_b.data,",
+            "                    0,",
+            "                    accum.data,",
+            "                    0,",
+            "                    False,",
+            '                    dtype="float32",',
+            "                )",
+            "            )",
+            "        for mma_accum_c_id in range(8):",
+            "            "
+            f"{c_name}[tile_m * {TENSORCORE_TIR_MATMUL_TILE_M} + "
+            "((tx % 32) % 2) + ((mma_accum_c_id // 2 % 2) * 2) "
+            "+ 4 * ((tx % 32) // 16) + ((tx % 32) % 16 // 4) % 2 * 8, "
+            f"tile_n * {TENSORCORE_TIR_MATMUL_TILE_N} + "
+            "(tx % 32) % 4 // 2 * 2 + (tx % 32) % 16 // 8 * 4 "
+            "+ mma_accum_c_id % 2 + mma_accum_c_id // 4 * 8] = accum[mma_accum_c_id]",
         ]
         return "\n".join(lines) + "\n"
 

@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .attention import ATTENTION_REPORT_FIELDS, classify_wrapper_sdpa_attention
 from .errors import (
     TritonTVMContractError,
     UnsupportedContractError,
@@ -51,6 +52,9 @@ from .errors import (
 from .frontend import TTIRArtifact, lower_to_ttir
 from .indexing import summarize_ttir_indexing
 from .matmul import (
+    EXTERN_ADDMM_BIAS_PACKED_FUNC,
+    EXTERN_ADDMM_BIAS_RUNTIME_REPLACEMENT_REASON,
+    EXTERN_ADDMM_BIAS_SYMBOL,
     EXTERN_GEMM_PACKED_FUNC,
     EXTERN_GEMM_PROVIDER_NONE,
     EXTERN_GEMM_RUNTIME_KIND,
@@ -59,6 +63,7 @@ from .matmul import (
     EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY,
     EXTERN_GEMM_SYMBOL,
     TargetMatmulPolicy,
+    extract_matmul_semantics_from_wrapper_extern_addmm,
     extract_matmul_semantics_from_wrapper_extern,
 )
 from .op_graph import NormalizedTTIROpGraph
@@ -131,6 +136,18 @@ class InductorWrapperExternCall:
     matmul_a_stride: tuple[int, int] | None = None
     matmul_b_stride: tuple[int, int] | None = None
     matmul_c_stride: tuple[int, int] | None = None
+    attention_source_kind: str = ""
+    attention_contract: str = ""
+    attention_abi_status: str = ""
+    attention_abi_version: int = 0
+    attention_phase: str = ""
+    attention_causal: bool = False
+    attention_mask_kind: str = ""
+    attention_rope_policy: str = ""
+    attention_kv_cache_policy: str = ""
+    attention_sequence_policy: str = ""
+    attention_runtime_status: str = ""
+    unsupported_attention_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -691,7 +708,9 @@ def extract_inductor_wrapper_extern_calls(
         if not op_family:
             continue
         line_no = int(getattr(node, "lineno", 0) or 0)
+        source_segment = ast.get_source_segment(wrapper_source, node)
         source_line = lines[line_no - 1].strip() if 0 < line_no <= len(lines) else ""
+        source = source_segment.strip() if source_segment else source_line
         calls.append(
             InductorWrapperExternCall(
                 case_name=case_name,
@@ -699,13 +718,19 @@ def extract_inductor_wrapper_extern_calls(
                 op_family=op_family,
                 line_no=line_no,
                 wrapper_path=wrapper_path,
-                source=source_line,
+                source=source,
                 **_wrapper_extern_matmul_fields(
                     op_name,
                     op_family,
-                    source_line,
+                    source,
                     case_name=case_name,
                     extern_gemm_runtime_provider=extern_gemm_runtime_provider,
+                ),
+                **_wrapper_extern_attention_fields(
+                    op_name,
+                    op_family,
+                    source,
+                    case_name=case_name,
                 ),
             )
         )
@@ -755,13 +780,78 @@ def _wrapper_extern_matmul_fields(
         "matmul_c_stride": None,
     }
     if op_family == "extern_addmm_bias":
+        try:
+            semantics = extract_matmul_semantics_from_wrapper_extern_addmm(
+                {
+                    "op_name": op_name,
+                    "source": source_line,
+                    "case_name": case_name,
+                    "kernel_name": case_name or "wrapper_extern_addmm_bias",
+                }
+            )
+            decision = TargetMatmulPolicy(
+                target_kind="cuda",
+                extern_gemm_runtime_provider=extern_gemm_runtime_provider,
+            ).decide(
+                semantics,
+                matmul_contract_ok=True,
+            )
+        except UnsupportedTTIROpError as err:
+            return {
+                **empty,
+                "matmul_source_kind": "wrapper_extern_addmm_bias",
+                "matmul_contract": "matmul_minimal",
+                "matmul_epilogue_kind": "bias_add",
+                "implementation_kind": "unsupported",
+                "unsupported_matmul_reason": str(err),
+            }
         return {
             **empty,
-            "matmul_source_kind": "wrapper_extern_addmm_bias",
+            "matmul_source_kind": semantics.source_kind,
+            "matmul_m": semantics.m,
+            "matmul_n": semantics.n,
+            "matmul_k": semantics.k,
             "matmul_contract": "matmul_minimal",
-            "matmul_epilogue_kind": "bias_add",
-            "implementation_kind": "unsupported",
-            "unsupported_matmul_reason": "extern_addmm_bias_epilogue_not_supported",
+            "matmul_contract_ok": decision.matmul_contract_ok
+            and decision.implementation_kind == "extern_addmm_bias",
+            "matmul_a_dtype": semantics.a_dtype,
+            "matmul_b_dtype": semantics.b_dtype,
+            "matmul_accumulator_dtype": semantics.accumulator_dtype,
+            "matmul_output_dtype": semantics.output_dtype,
+            "matmul_epilogue_kind": semantics.epilogue_kind,
+            "implementation_kind": decision.implementation_kind,
+            "schedule_id": decision.schedule_id,
+            "extern_symbol": decision.extern_symbol or EXTERN_ADDMM_BIAS_SYMBOL,
+            "extern_packed_func": decision.extern_packed_func or EXTERN_ADDMM_BIAS_PACKED_FUNC,
+            "extern_runtime_kind": decision.extern_runtime_kind or EXTERN_GEMM_RUNTIME_KIND,
+            "extern_runtime_replacement": (
+                decision.extern_runtime_replacement or EXTERN_GEMM_RUNTIME_REPLACEMENT
+            ),
+            "extern_runtime_replacement_available": (
+                decision.extern_runtime_replacement_available
+            ),
+            "extern_runtime_replacement_reason": (
+                decision.extern_runtime_replacement_reason
+                or EXTERN_ADDMM_BIAS_RUNTIME_REPLACEMENT_REASON
+            ),
+            "extern_gemm_runtime_status": (
+                decision.extern_gemm_runtime_status
+                or EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+            ),
+            "extern_gemm_provider_kind": (
+                decision.extern_gemm_provider_kind or EXTERN_GEMM_PROVIDER_NONE
+            ),
+            "extern_gemm_provider_abi_version": decision.extern_gemm_provider_abi_version,
+            "extern_gemm_runtime_claim": decision.extern_gemm_runtime_claim,
+            "extern_gemm_performance_claim": decision.extern_gemm_performance_claim,
+            "extern_gemm_uses_host_staging": decision.extern_gemm_uses_host_staging,
+            "unsupported_matmul_reason": decision.unsupported_matmul_reason,
+            "matmul_a_layout": semantics.a_layout,
+            "matmul_b_layout": semantics.b_layout,
+            "matmul_c_layout": semantics.c_layout,
+            "matmul_a_stride": semantics.a_stride,
+            "matmul_b_stride": semantics.b_stride,
+            "matmul_c_stride": semantics.c_stride,
         }
     if op_name != EXTERN_GEMM_SYMBOL or op_family != "extern_gemm":
         return empty
@@ -839,6 +929,32 @@ def _wrapper_extern_matmul_fields(
         "matmul_b_stride": semantics.b_stride,
         "matmul_c_stride": semantics.c_stride,
     }
+
+
+def _wrapper_extern_attention_fields(
+    op_name: str,
+    op_family: str,
+    source: str,
+    *,
+    case_name: str,
+) -> dict[str, Any]:
+    if op_family != "deferred_attention":
+        return {
+            field_name: (
+                0
+                if field_name == "attention_abi_version"
+                else False
+                if field_name == "attention_causal"
+                else ""
+            )
+            for field_name in ATTENTION_REPORT_FIELDS
+        }
+    return classify_wrapper_sdpa_attention(
+        op_name=op_name,
+        op_family=op_family,
+        source=source,
+        case_name=case_name,
+    ).as_report_fields()
 
 
 def _attribute_chain(node: ast.AST) -> str:
@@ -1918,6 +2034,12 @@ def _matmul_meta_fields(meta: Any) -> dict[str, Any]:
         "matmul_epilogue_kind": getattr(meta, "matmul_epilogue_kind", ""),
         "implementation_kind": getattr(meta, "implementation_kind", ""),
         "schedule_id": getattr(meta, "schedule_id", ""),
+        "matmul_perf_envelope": getattr(meta, "matmul_perf_envelope", ""),
+        "candidate_schedule_ids": list(getattr(meta, "candidate_schedule_ids", ()) or ()),
+        "selected_schedule_id": getattr(meta, "selected_schedule_id", ""),
+        "schedule_reject_reasons": dict(getattr(meta, "schedule_reject_reasons", {}) or {}),
+        "perf_guard_status": getattr(meta, "perf_guard_status", ""),
+        "tune_key": dict(getattr(meta, "tune_key", {}) or {}),
         "extern_symbol": getattr(meta, "extern_symbol", ""),
         "extern_packed_func": getattr(meta, "extern_packed_func", ""),
         "extern_runtime_kind": getattr(meta, "extern_runtime_kind", ""),

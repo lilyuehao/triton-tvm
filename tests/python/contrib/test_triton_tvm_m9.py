@@ -34,10 +34,15 @@ from tvm.contrib.triton_tvm.matmul import (
     EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED,
     EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED,
     NATIVE_TIR_MATMUL_SCHEDULE_ID,
+    SIMT_TIR_MATMUL_SCHEDULE_ID,
+    TENSORCORE_TIR_MATMUL_SCHEDULE_ID,
     TILED_TIR_MATMUL_SCHEDULE_ID,
     TargetMatmulPolicy,
+    build_extern_addmm_bias_tirx_source,
     build_extern_gemm_tirx_source,
+    extract_matmul_semantics_from_wrapper_extern_addmm,
     extract_matmul_semantics_from_wrapper_extern,
+    register_python_torch_extern_addmm_bias,
 )
 from tvm.contrib.triton_tvm.m98_toy_mlp import (
     M98_BASELINE_KIND,
@@ -92,6 +97,29 @@ def _m97_dot_ttir(dtype: str) -> str:
         .replace("tensor<16x4x" + dtype + ">", "tensor<16x8x" + dtype + ">")
         .replace("tensor<8x4xf32>", "tensor<8x8xf32>")
     )
+
+
+def _m9p_dot_ttir(m: int, n: int, k: int, dtype: str = "f16") -> str:
+    return f"""
+module {{
+  tt.func @_m9p_dot(%a:!tt.ptr<{dtype}>,%b:!tt.ptr<{dtype}>,%out:!tt.ptr<f32>) {{
+    %a_zero = arith.constant dense<0> : tensor<{m}x{k}xi32>
+    %b_zero = arith.constant dense<0> : tensor<{k}x{n}xi32>
+    %c_zero = arith.constant dense<0> : tensor<{m}x{n}xi32>
+    %a_splat = tt.splat %a : !tt.ptr<{dtype}> -> tensor<{m}x{k}x!tt.ptr<{dtype}>>
+    %a_ptr = tt.addptr %a_splat, %a_zero : tensor<{m}x{k}x!tt.ptr<{dtype}>>, tensor<{m}x{k}xi32>
+    %va = tt.load %a_ptr : tensor<{m}x{k}x!tt.ptr<{dtype}>>
+    %b_splat = tt.splat %b : !tt.ptr<{dtype}> -> tensor<{k}x{n}x!tt.ptr<{dtype}>>
+    %b_ptr = tt.addptr %b_splat, %b_zero : tensor<{k}x{n}x!tt.ptr<{dtype}>>, tensor<{k}x{n}xi32>
+    %vb = tt.load %b_ptr : tensor<{k}x{n}x!tt.ptr<{dtype}>>
+    %dot = tt.dot %va, %vb {{inputPrecision = tf32}} : tensor<{m}x{k}x{dtype}>, tensor<{k}x{n}x{dtype}> -> tensor<{m}x{n}xf32>
+    %out_splat = tt.splat %out : !tt.ptr<f32> -> tensor<{m}x{n}x!tt.ptr<f32>>
+    %out_ptr = tt.addptr %out_splat, %c_zero : tensor<{m}x{n}x!tt.ptr<f32>>, tensor<{m}x{n}xi32>
+    tt.store %out_ptr, %dot : tensor<{m}x{n}x!tt.ptr<f32>>
+    tt.return
+  }}
+}}
+"""
 
 
 def _extern_gemm_meta(kernel_name: str, m: int, n: int, k: int) -> TritonTVMMeta:
@@ -156,6 +184,34 @@ def _extern_gemm_meta(kernel_name: str, m: int, n: int, k: int) -> TritonTVMMeta
     )
 
 
+def _extern_addmm_bias_meta(kernel_name: str, m: int, n: int, k: int) -> TritonTVMMeta:
+    abi = [
+        {"name": "bias", "kind": "pointer", "dtype": "float32"},
+        {"name": "a", "kind": "pointer", "dtype": "float32"},
+        {"name": "b", "kind": "pointer", "dtype": "float32"},
+        {"name": "out", "kind": "pointer", "dtype": "float32"},
+    ]
+    meta = _extern_gemm_meta(kernel_name, m, n, k)
+    return TritonTVMMeta(
+        **{
+            **meta.__dict__,
+            "abi": abi,
+            "buffer_extents": {
+                "bias": f"T.int64({n})",
+                "a": f"T.int64({m * k})",
+                "b": f"T.int64({k * n})",
+                "out": f"T.int64({m * n})",
+            },
+            "execution_kind": "extern_addmm_bias_runtime_proof",
+            "launch_policy_id": "extern_addmm_bias_runtime_proof",
+            "cache_key": "m9p_extern_addmm_bias_runtime_proof",
+            "matmul_source_kind": "wrapper_extern_addmm_bias",
+            "implementation_kind": "extern_addmm_bias",
+            "extern_symbol": "extern_kernels.addmm",
+        }
+    )
+
+
 _M98_WRAPPER_FIXTURE = """
 triton_poi_fused_relu_0 = async_compile.triton('triton_poi_fused_relu_0', '''
 def triton_poi_fused_relu_0(in_out_ptr0, xnumel, XBLOCK):
@@ -213,6 +269,73 @@ def test_m9_native_matmul_minimal_build_run(dtype):
         ]
     )
     tvm.testing.assert_allclose(out_tvm.numpy(), expected, rtol=1e-3, atol=1e-3)
+
+
+@tvm.testing.requires_cuda_compute_version(7)
+@pytest.mark.parametrize("shape", [(16, 16, 16), (32, 32, 32)])
+def test_m9p_tensorcore_matmul_build_run(shape):
+    m, n, k = shape
+    rng = np.random.default_rng(0)
+    a_np = rng.uniform(-1, 1, (m, k)).astype("float16")
+    b_np = rng.uniform(-1, 1, (k, n)).astype("float16")
+    expected = a_np.astype("float32") @ b_np.astype("float32")
+
+    irmod, meta = translate_ttir(
+        _m9p_dot_ttir(m, n, k),
+        grid=(1,),
+        contract="matmul_minimal",
+    )
+    validate_matmul_minimal_contract(irmod)
+    assert meta.implementation_kind == "native_tir_schedule"
+    assert meta.schedule_id == TENSORCORE_TIR_MATMUL_SCHEDULE_ID
+    assert meta.selected_schedule_id == TENSORCORE_TIR_MATMUL_SCHEDULE_ID
+
+    built = build_triton_tvm(irmod, meta)
+    dev = tvm.cuda(0)
+    out_tvm = tvm.runtime.empty((m, n), "float32", dev)
+    built.run(
+        [
+            tvm.runtime.tensor(a_np, dev),
+            tvm.runtime.tensor(b_np, dev),
+            out_tvm,
+        ]
+    )
+    tvm.testing.assert_allclose(out_tvm.numpy(), expected, rtol=1e-2, atol=1e-2)
+
+
+@tvm.testing.requires_cuda
+def test_m9p_simt_bf16_matmul_build_run():
+    if ml_dtypes is None:
+        pytest.skip("ml_dtypes is required for bfloat16 numpy conversion")
+
+    m, n, k = 16, 16, 16
+    a_f32 = np.arange(m * k, dtype="float32").reshape(m, k) / 13.0
+    b_f32 = np.arange(k * n, dtype="float32").reshape(k, n) / 17.0
+    a_np = a_f32.astype(ml_dtypes.bfloat16)
+    b_np = b_f32.astype(ml_dtypes.bfloat16)
+    expected = a_np.astype("float32") @ b_np.astype("float32")
+
+    irmod, meta = translate_ttir(
+        _m9p_dot_ttir(m, n, k, dtype="bf16"),
+        grid=(1,),
+        contract="matmul_minimal",
+    )
+    validate_matmul_minimal_contract(irmod)
+    assert meta.implementation_kind == "native_tir_schedule"
+    assert meta.schedule_id == SIMT_TIR_MATMUL_SCHEDULE_ID
+    assert meta.selected_schedule_id == SIMT_TIR_MATMUL_SCHEDULE_ID
+
+    built = build_triton_tvm(irmod, meta)
+    dev = tvm.cuda(0)
+    out_tvm = tvm.runtime.empty((m, n), "float32", dev)
+    built.run(
+        [
+            tvm.runtime.tensor(a_np, dev),
+            tvm.runtime.tensor(b_np, dev),
+            out_tvm,
+        ]
+    )
+    tvm.testing.assert_allclose(out_tvm.numpy(), expected, rtol=1e-2, atol=1e-2)
 
 
 def test_m98_wrapper_plan_extracts_two_runtime_resolved_gemms_and_relu():
@@ -380,6 +503,48 @@ def test_m96_extern_gemm_runtime_provider_transposed_weight_build_run():
         rtol=1e-5,
         atol=1e-5,
     )
+
+
+@tvm.testing.requires_cuda
+def test_m9p_extern_addmm_bias_runtime_provider_build_run():
+    source_line = (
+        "extern_kernels.addmm(bias, reinterpret_tensor(a, (8, 16), (16, 1), 0), "
+        "reinterpret_tensor(b, (16, 4), (4, 1), 0), alpha=1, beta=1, out=out)"
+    )
+    semantics = extract_matmul_semantics_from_wrapper_extern_addmm(
+        source_line,
+        kernel_name="m9p_extern_addmm_bias",
+    )
+    decision = TargetMatmulPolicy(
+        extern_gemm_runtime_provider=EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED
+    ).decide(semantics, matmul_contract_ok=True)
+    assert decision.implementation_kind == "extern_addmm_bias"
+    assert decision.extern_gemm_runtime_status == EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED
+    assert decision.extern_gemm_performance_claim is False
+
+    irmod = tvm.script.from_source(build_extern_addmm_bias_tirx_source(semantics, decision))
+    validate_matmul_minimal_contract(irmod)
+    built = build_triton_tvm(
+        irmod,
+        _extern_addmm_bias_meta("m9p_extern_addmm_bias", 8, 4, 16),
+    )
+
+    dev = tvm.cuda(0)
+    bias_np = np.arange(4, dtype="float32") / 19.0
+    a_np = np.arange(8 * 16, dtype="float32").reshape(8, 16) / 13.0
+    b_np = np.arange(16 * 4, dtype="float32").reshape(16, 4) / 17.0
+    out_tvm = tvm.runtime.empty((8, 4), "float32", dev)
+
+    with register_python_torch_extern_addmm_bias():
+        built.run(
+            [
+                tvm.runtime.tensor(bias_np, dev),
+                tvm.runtime.tensor(a_np, dev),
+                tvm.runtime.tensor(b_np, dev),
+                out_tvm,
+            ]
+        )
+    tvm.testing.assert_allclose(out_tvm.numpy(), a_np @ b_np + bias_np, rtol=1e-5, atol=1e-5)
 
 
 @tvm.testing.requires_cuda

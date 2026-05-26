@@ -442,6 +442,51 @@ def render_capability_markdown(
                     )
                 )
             lines.append("")
+    if "pre_m10" in report:
+        pre_m10 = report.get("pre_m10") or {}
+        lines.extend(
+            [
+                "## Pre-M10 Gate",
+                "",
+                f"- Taxonomy version: {pre_m10.get('taxonomy_version', '')}",
+                f"- Target contracts: {', '.join(pre_m10.get('target_contracts', []))}",
+                f"- Detail fields: {', '.join(pre_m10.get('detail_fields', []))}",
+                f"- Observed attention calls: {pre_m10.get('observed_attention_call_count', 0)}",
+                "- Deferred attention runtime calls: "
+                f"{pre_m10.get('attention_runtime_deferred_count', 0)}",
+                "",
+            ]
+        )
+        contract_classes = pre_m10.get("contract_classes") or {}
+        if contract_classes:
+            lines.extend(
+                [
+                    "| Contract | Calls | Models | Runtime | Phase | Mask | Example model |",
+                    "|---|---:|---:|---|---|---|---|",
+                ]
+            )
+            for contract, entry in sorted(contract_classes.items()):
+                lines.append(
+                    "| {contract} | {calls} | {models} | {runtime} | {phase} | "
+                    "{mask} | {example_model} |".format(
+                        contract=_escape_markdown_cell(str(contract)),
+                        calls=entry.get("call_count", 0),
+                        models=entry.get("models_impacted", 0),
+                        runtime=_escape_markdown_cell(
+                            _format_histogram(entry.get("runtime_status", {}))
+                        ),
+                        phase=_escape_markdown_cell(
+                            _format_histogram(entry.get("phases", {}))
+                        ),
+                        mask=_escape_markdown_cell(
+                            _format_histogram(entry.get("mask_kinds", {}))
+                        ),
+                        example_model=_escape_markdown_cell(
+                            str(entry.get("example_model", ""))
+                        ),
+                    )
+                )
+            lines.append("")
     lines.extend(
         [
             "## TTIR Op Coverage",

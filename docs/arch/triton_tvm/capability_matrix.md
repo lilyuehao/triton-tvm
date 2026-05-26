@@ -16,7 +16,7 @@ matrix and historical reports live in
 | `norm_row` | supported in M8 | rank-2 LayerNorm/RMSNorm-family row reductions |
 | `softmax_row` | supported in M8 | rank-2 row max/exp/sum softmax |
 | `masked_softmax_row` | supported in M8 | rank-2 masked and causal-style row softmax policy |
-| `matmul_minimal` | supported in M9.1-M9.8 semantic/static/native/extern-proof/toy-graph scope | exact unmasked rank-2 `tt.dot` -> unresolved semantic validation block -> native serial-K correctness path plus gated `cuda_block_tile_8x8_serial_k_v1` candidate; wrapper `extern_kernels.mm` -> explicit packed-call artifact with artifact-only default and opt-in correctness-only `python_torch_host_staged` runtime proof; M9.8 adds a separate TinyMNISTMLP diagnostic baseline with two runtime-resolved extern GEMMs and one TVM pointwise ReLU |
+| `matmul_minimal` | supported in M9.1-M9.8 semantic/static/native/extern-proof/toy-graph scope; M9.P Phase 0-3 hardening complete | exact unmasked rank-2 `tt.dot` -> unresolved semantic validation block -> native schedule policy with TensorCore, SIMT16, and serial-K fallback candidates; wrapper `extern_kernels.mm` -> explicit packed-call artifact with artifact-only default and opt-in correctness-only `python_torch_host_staged` runtime proof; wrapper `extern_kernels.addmm` -> minimal `bias_add` packed-call artifact; M9.8 adds a TinyMNISTMLP diagnostic baseline; M9.P introduces `matmul_perf_core_v1`, Torch CUDA/cuBLAS dashboard baseline, and matmul-only dashboard without hidden attention semantics |
 
 ## M7.5 Guard State
 
@@ -82,7 +82,7 @@ Triton-kernel surface:
   fallbacks
 - observed TTIR `tt.dot` kernels: 0
 - M9.4 wrapper extern GEMM artifact candidates: `extern_gemm: 11`
-- remaining M9 entry wrapper debt: `extern_addmm_bias: 3`
+- minimal addmm/bias artifact candidates: `extern_addmm_bias: 3`
 - deferred wrapper debt: `deferred_convolution: 65`,
   `deferred_attention: 2`
 - full TVM runnable models after the extern gate: 0
@@ -112,11 +112,11 @@ M9 owns the matmul entry boundary first. M9 entry is MatmulSemantics-first:
   M/N/K attr consistency, axis/loop extents, read/write shapes, one-element
   regions, init/update stores, and extern artifact metadata. Wrapper
   `extern_gemm` records carry `extern_runtime_kind="artifact_only"` and
-  `extern_runtime_replacement="not_available"`; `extern_addmm_bias` records
-  carry visible `bias_add` epilogue debt. Corpus diff coverage and an opt-in
-  minimal perf scaffold are present. Runtime cublas/cublaslt replacement,
-  bias/add epilogue lowering, TensorCore/vendor scheduling, performance
-  optimization, and model closure remain follow-on work.
+  `extern_runtime_replacement="not_available"`; M9.PE later materializes
+  `extern_addmm_bias` as a minimal `bias_add` packed-call artifact. Corpus diff
+  coverage and an opt-in minimal perf scaffold are present. Runtime
+  cublas/cublaslt replacement, activation epilogues, arbitrary epilogues,
+  performance optimization, and model closure remain follow-on work.
 - M9.6 adds an opt-in correctness-only extern GEMM runtime proof provider,
   `python_torch_host_staged`. It validates the packed ABI and row-major or
   transposed-weight-view storage semantics without making performance,
@@ -132,6 +132,37 @@ M9 owns the matmul entry boundary first. M9 entry is MatmulSemantics-first:
   the full MNIST test split. The staged baseline is
   `diagnostic_host_staged_triton_tvm`, with `extern_gemm_performance_claim=false`;
   it is not autotune or performance closure.
+- M9.P Phase 0-3 is complete after M9.8 as a horizontal CUDA matmul
+  performance hardening track. It keeps `MatmulSemantics` stable and uses
+  `matmul_perf_core_v1` as a target-policy envelope for native CUDA schedules:
+  `tt_dot` native path preferred, fp16/bf16 inputs, fp32 accumulation/output,
+  row-major A/C, row-major or transposed-weight-view B, rank-2 exact static
+  shapes with M/N/K multiples of 16 or 32.
+- M9.PA adds `cuda_ptx_mma_m8n8k4_warp_tile_16x16_fp16fp32_v1` for eligible
+  fp16 `tt_dot` envelope shapes. M9.PC adds
+  `cuda_block_tile_16x16_simt_v1` as the bf16-capable non-TensorCore fallback
+  candidate under the same envelope. M9.PB reports
+  `torch_cuda_cublas_baseline_v1` as a real CUDA dashboard baseline while TVM
+  packed cuBLAS/cuBLASLt runtime replacement remains unavailable. M9.PD reports
+  5 measured TensorCore-selected envelope cases and 2 TinyMLP original coverage
+  records marked unavailable. M9.PE admits only the minimal wrapper
+  `extern_kernels.addmm` `bias_add` artifact and keeps epilogues outside the
+  native performance envelope.
+- M9.P may benchmark QK^T, AV, projection, and MLP/FFN shape suites as matmul
+  performance cases only. Masked softmax, RoPE, KV cache, attention ABI, and
+  attention runtime remain M10 scope.
+- Pre-M10 freezes attention ABI/report vocabulary without adding attention
+  runtime support. Wrapper SDPA stays `deferred_attention` and is classified
+  into `attention_vit_full_v1`, `attention_llama_causal_prefill_v1`, or
+  `attention_llama_decode_v1` with
+  `attention_runtime_status="deferred_attention_runtime"`. Current report
+  coverage observes 2 attention calls: one ViT full attention and one Llama
+  causal prefill. Decode is covered by synthetic tests only.
+- M10 Attention Runtime Entry is planned in slices: SDPA semantics,
+  artifact-only wrapper attention, correctness-only ViT provider, native
+  decomposed ViT attention, Llama causal prefill, and decode synthetic
+  coverage. The old M10.5 label is retired; follow-on stabilization is M10
+  hardening.
 
 The observed M7.5 `grid` blockers and Pre-M9 deferred convolution/attention
 wrapper calls remain separate deferred debt classes and should not be counted as

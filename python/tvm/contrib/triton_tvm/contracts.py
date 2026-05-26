@@ -45,6 +45,10 @@ import tvm
 
 from .errors import TritonTVMContractError, UnsupportedContractError
 from .matmul import (
+    EXTERN_ADDMM_BIAS_PACKED_FUNC,
+    EXTERN_ADDMM_BIAS_RUNTIME_PROVIDER_REASON,
+    EXTERN_ADDMM_BIAS_RUNTIME_REPLACEMENT_REASON,
+    EXTERN_ADDMM_BIAS_SYMBOL,
     EXTERN_GEMM_PACKED_FUNC,
     EXTERN_GEMM_PROVIDER_ABI_VERSION,
     EXTERN_GEMM_PROVIDER_NONE,
@@ -58,7 +62,15 @@ from .matmul import (
     EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY,
     EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED,
     EXTERN_GEMM_SYMBOL,
+    MATMUL_PERF_ENVELOPE_ID,
     NATIVE_TIR_MATMUL_SCHEDULE_ID,
+    SIMT_TIR_MATMUL_SCHEDULE_ID,
+    SIMT_TIR_MATMUL_TILE_M,
+    SIMT_TIR_MATMUL_TILE_N,
+    TENSORCORE_TIR_MATMUL_SCHEDULE_ID,
+    TENSORCORE_TIR_MATMUL_TILE_K,
+    TENSORCORE_TIR_MATMUL_TILE_M,
+    TENSORCORE_TIR_MATMUL_TILE_N,
     TILED_TIR_MATMUL_SCHEDULE_ID,
     TILED_TIR_MATMUL_TILE_M,
     TILED_TIR_MATMUL_TILE_N,
@@ -520,6 +532,12 @@ def _validate_matmul_minimal_body(name: str, func: tvm.tirx.PrimFunc) -> None:
     if str(attrs.get("triton_tvm.implementation_kind", "")) == "extern_gemm":
         _validate_matmul_extern_gemm_artifact(name, func)
         return
+    if str(attrs.get("triton_tvm.implementation_kind", "")) == "extern_addmm_bias":
+        _validate_matmul_extern_addmm_bias_artifact(name, func)
+        return
+    if str(attrs.get("triton_tvm.schedule_id", "")) == TENSORCORE_TIR_MATMUL_SCHEDULE_ID:
+        _validate_matmul_tensorcore_artifact(name, func)
+        return
     func_dims = _required_matmul_dims(name, attrs, "function attrs")
 
     try:
@@ -586,7 +604,11 @@ def _validate_matmul_minimal_body(name: str, func: tvm.tirx.PrimFunc) -> None:
         return
     if implementation_kind == "native_tir_schedule":
         schedule_id = str(attrs.get("triton_tvm.schedule_id", ""))
-        if schedule_id not in (NATIVE_TIR_MATMUL_SCHEDULE_ID, TILED_TIR_MATMUL_SCHEDULE_ID):
+        if schedule_id not in (
+            NATIVE_TIR_MATMUL_SCHEDULE_ID,
+            SIMT_TIR_MATMUL_SCHEDULE_ID,
+            TILED_TIR_MATMUL_SCHEDULE_ID,
+        ):
             raise TritonTVMContractError(
                 f"{name} native matmul schedule has unknown triton_tvm.schedule_id"
             )
@@ -675,6 +697,151 @@ def _validate_matmul_extern_gemm_artifact(name: str, func: tvm.tirx.PrimFunc) ->
         )
 
 
+def _validate_matmul_extern_addmm_bias_artifact(
+    name: str,
+    func: tvm.tirx.PrimFunc,
+) -> None:
+    attrs = func.attrs or {}
+    if attrs.get("triton_tvm.contract", None) != "matmul_minimal":
+        raise TritonTVMContractError(
+            f"{name} extern addmm bias artifact must preserve triton_tvm.contract=matmul_minimal"
+        )
+    if attrs.get("triton_tvm.matmul_source_kind", None) != "wrapper_extern_addmm_bias":
+        raise TritonTVMContractError(
+            f"{name} extern addmm bias artifact must preserve source kind wrapper_extern_addmm_bias"
+        )
+    if str(attrs.get("triton_tvm.extern_symbol", "")) != EXTERN_ADDMM_BIAS_SYMBOL:
+        raise TritonTVMContractError(
+            f"{name} extern addmm bias artifact must preserve extern_symbol={EXTERN_ADDMM_BIAS_SYMBOL}"
+        )
+    dims = _required_matmul_dims(name, attrs, "extern addmm bias artifact attrs")
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_packed_func",
+        EXTERN_ADDMM_BIAS_PACKED_FUNC,
+        "extern addmm bias artifact",
+    )
+    _validate_matmul_extern_runtime_metadata(
+        name,
+        attrs,
+        artifact_reason=EXTERN_ADDMM_BIAS_RUNTIME_REPLACEMENT_REASON,
+        provider_reason=EXTERN_ADDMM_BIAS_RUNTIME_PROVIDER_REASON,
+        label="extern addmm bias artifact",
+    )
+    for attr_name, expected in (
+        ("triton_tvm.accumulator_dtype", "float32"),
+        ("triton_tvm.output_dtype", "float32"),
+        ("triton_tvm.bounds_policy", "exact"),
+        ("triton_tvm.mask_kind", "none"),
+        ("triton_tvm.epilogue_kind", "bias_add"),
+        ("triton_tvm.a_layout", "row_major"),
+        ("triton_tvm.c_layout", "row_major"),
+        ("triton_tvm.alpha", "1"),
+        ("triton_tvm.beta", "1"),
+    ):
+        _require_attr_value(name, attrs, attr_name, expected, "extern addmm bias artifact")
+    b_layout = str(attrs.get("triton_tvm.b_layout", ""))
+    if b_layout not in ("row_major", "transposed_weight_view"):
+        raise TritonTVMContractError(
+            f"{name} extern addmm bias artifact has unsupported b_layout={b_layout!r}"
+        )
+    _validate_matmul_extern_addmm_bias_buffers(name, func, dims, b_layout, attrs)
+
+    script = _prim_func_script(func)
+    packed_call = f'T.call_packed("{EXTERN_ADDMM_BIAS_PACKED_FUNC}"'
+    if script.count(packed_call) != 1:
+        raise TritonTVMContractError(
+            f"{name} extern addmm bias artifact must contain exactly one "
+            f"{EXTERN_ADDMM_BIAS_PACKED_FUNC} packed call"
+        )
+    if "call_extern" in script:
+        raise TritonTVMContractError(
+            f"{name} extern addmm bias artifact must not use T.call_extern"
+        )
+    if 'thread="blockIdx.x"' in script or 'thread="threadIdx.x"' in script:
+        raise TritonTVMContractError(
+            f"{name} extern addmm bias artifact must not contain a native CUDA schedule"
+        )
+
+
+def _validate_matmul_tensorcore_artifact(name: str, func: tvm.tirx.PrimFunc) -> None:
+    attrs = func.attrs or {}
+    if attrs.get("triton_tvm.contract", None) != "matmul_minimal":
+        raise TritonTVMContractError(
+            f"{name} TensorCore matmul must preserve triton_tvm.contract=matmul_minimal"
+        )
+    if attrs.get("triton_tvm.matmul_source_kind", None) != "tt_dot":
+        raise TritonTVMContractError(
+            f"{name} TensorCore matmul must preserve source kind tt_dot"
+        )
+    if str(attrs.get("triton_tvm.implementation_kind", "")) != "native_tir_schedule":
+        raise TritonTVMContractError(
+            f"{name} TensorCore matmul must be a native_tir_schedule"
+        )
+    if str(attrs.get("triton_tvm.schedule_id", "")) != TENSORCORE_TIR_MATMUL_SCHEDULE_ID:
+        raise TritonTVMContractError(
+            f"{name} TensorCore matmul has unknown triton_tvm.schedule_id"
+        )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.matmul_perf_envelope",
+        MATMUL_PERF_ENVELOPE_ID,
+        "TensorCore matmul",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.accumulator_dtype",
+        "float32",
+        "TensorCore matmul",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.output_dtype",
+        "float32",
+        "TensorCore matmul",
+    )
+    _require_attr_value(name, attrs, "triton_tvm.a_dtype", "float16", "TensorCore matmul")
+    _require_attr_value(name, attrs, "triton_tvm.b_dtype", "float16", "TensorCore matmul")
+    _require_attr_value(name, attrs, "triton_tvm.bounds_policy", "exact", "TensorCore matmul")
+    _require_attr_value(name, attrs, "triton_tvm.mask_kind", "none", "TensorCore matmul")
+    _require_attr_value(name, attrs, "triton_tvm.epilogue_kind", "none", "TensorCore matmul")
+    dims = _required_matmul_dims(name, attrs, "TensorCore matmul attrs")
+    m, n, k = dims
+    if (
+        m % TENSORCORE_TIR_MATMUL_TILE_M
+        or n % TENSORCORE_TIR_MATMUL_TILE_N
+        or k % 16
+    ):
+        raise TritonTVMContractError(
+            f"{name} TensorCore matmul requires M/N/K multiples of 16"
+        )
+    if _int_attr(attrs, "triton_tvm.tile_m") != TENSORCORE_TIR_MATMUL_TILE_M:
+        raise TritonTVMContractError(f"{name} TensorCore matmul must preserve tile_m=16")
+    if _int_attr(attrs, "triton_tvm.tile_n") != TENSORCORE_TIR_MATMUL_TILE_N:
+        raise TritonTVMContractError(f"{name} TensorCore matmul must preserve tile_n=16")
+    if _int_attr(attrs, "triton_tvm.tile_k") != TENSORCORE_TIR_MATMUL_TILE_K:
+        raise TritonTVMContractError(f"{name} TensorCore matmul must preserve tile_k=4")
+    _validate_matmul_tensorcore_buffers(name, func, dims)
+
+    script = _prim_func_script(func)
+    if "T.ptx_mma" not in script and "tirx.ptx_mma" not in script:
+        raise TritonTVMContractError(f"{name} TensorCore matmul must use T.ptx_mma")
+    if "m8n8k4" not in script:
+        raise TritonTVMContractError(f"{name} TensorCore matmul must use m8n8k4")
+    if "blockIdx.x" not in script or "threadIdx.x" not in script:
+        raise TritonTVMContractError(
+            f"{name} TensorCore matmul must launch blockIdx.x and threadIdx.x"
+        )
+    if "call_packed" in script or "call_extern" in script:
+        raise TritonTVMContractError(
+            f"{name} TensorCore matmul must not use extern calls"
+        )
+
+
 def _required_matmul_dims(name: str, attrs, label: str) -> tuple[int, int, int]:
     dims = []
     for dim_name in ("triton_tvm.matmul_m", "triton_tvm.matmul_n", "triton_tvm.matmul_k"):
@@ -693,6 +860,13 @@ def _int_attr(attrs, attr_name: str) -> int | None:
         return None
     value = _int_imm_value(value)
     return value
+
+
+def _int_tuple_attr(attrs, attr_name: str) -> tuple[int, ...]:
+    value = attrs.get(attr_name, None)
+    if value is None:
+        return ()
+    return tuple(int(part.strip()) for part in str(value).split(",") if part.strip())
 
 
 def _bool_attr(attrs, attr_name: str) -> bool | None:
@@ -758,6 +932,17 @@ def _validate_matmul_loop_extents(
         expected_extents = (
             (m // TILED_TIR_MATMUL_TILE_M) * (n // TILED_TIR_MATMUL_TILE_N),
             TILED_TIR_MATMUL_TILE_M * TILED_TIR_MATMUL_TILE_N,
+            k,
+        )
+        expected_kinds = (
+            tirx.ForKind.THREAD_BINDING,
+            tirx.ForKind.THREAD_BINDING,
+            tirx.ForKind.SERIAL,
+        )
+    elif schedule_id == SIMT_TIR_MATMUL_SCHEDULE_ID:
+        expected_extents = (
+            (m // SIMT_TIR_MATMUL_TILE_M) * (n // SIMT_TIR_MATMUL_TILE_N),
+            SIMT_TIR_MATMUL_TILE_M * SIMT_TIR_MATMUL_TILE_N,
             k,
         )
         expected_kinds = (
@@ -898,6 +1083,104 @@ def _validate_matmul_extern_buffers(
             )
 
 
+def _validate_matmul_extern_addmm_bias_buffers(
+    name: str,
+    func: tvm.tirx.PrimFunc,
+    dims: tuple[int, int, int],
+    b_layout: str,
+    attrs,
+) -> None:
+    m, n, k = dims
+    buffers = list(func.buffer_map.values())
+    if len(buffers) != 4:
+        raise TritonTVMContractError(
+            f"{name} extern addmm bias artifact requires exactly four buffers"
+        )
+    transposed_b = _bool_attr(attrs, "triton_tvm.transposed_b")
+    expected_transposed = b_layout == "transposed_weight_view"
+    if transposed_b is not expected_transposed:
+        raise TritonTVMContractError(
+            f"{name} extern addmm bias artifact transposed_b must match b_layout"
+        )
+    expected_b_shape = (n, k) if expected_transposed else (k, n)
+    expected_b_stride = (k, 1) if expected_transposed else (n, 1)
+    bias_shape = _int_tuple_attr(attrs, "triton_tvm.bias_shape")
+    bias_stride = _int_tuple_attr(attrs, "triton_tvm.bias_stride")
+    bias_rank = _int_attr(attrs, "triton_tvm.bias_rank")
+    if bias_shape == (n,):
+        expected_bias_stride = (1,)
+        expected_bias_rank = 1
+    elif bias_shape == (m, n):
+        expected_bias_stride = (n, 1)
+        expected_bias_rank = 2
+    else:
+        raise TritonTVMContractError(
+            f"{name} extern addmm bias artifact supports only rank-1 N or rank-2 MxN bias"
+        )
+    if bias_stride != expected_bias_stride or bias_rank != expected_bias_rank:
+        raise TritonTVMContractError(
+            f"{name} extern addmm bias artifact bias metadata does not match shape"
+        )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.b_stride",
+        "1, " + str(k) if expected_transposed else f"{n}, 1",
+        "extern addmm bias logical metadata",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.b_storage_shape",
+        f"{expected_b_shape[0]}, {expected_b_shape[1]}",
+        "extern addmm bias storage metadata",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.b_storage_stride",
+        f"{expected_b_stride[0]}, {expected_b_stride[1]}",
+        "extern addmm bias storage metadata",
+    )
+    expected_shapes = (bias_shape, (m, k), expected_b_shape, (m, n))
+    expected_strides = (expected_bias_stride, (k, 1), expected_b_stride, (n, 1))
+    for buffer, shape, strides in zip(buffers, expected_shapes, expected_strides):
+        buffer_shape = tuple(_int_imm_value(dim) for dim in buffer.shape)
+        if buffer_shape != shape:
+            raise TritonTVMContractError(
+                f"{name} extern addmm bias artifact buffer shape must be {shape}"
+            )
+        buffer_strides = tuple(_int_imm_value(stride) for stride in buffer.strides)
+        if buffer_strides != strides:
+            raise TritonTVMContractError(
+                f"{name} extern addmm bias artifact buffer strides must be {strides}"
+            )
+
+
+def _validate_matmul_tensorcore_buffers(
+    name: str,
+    func: tvm.tirx.PrimFunc,
+    dims: tuple[int, int, int],
+) -> None:
+    m, n, k = dims
+    buffers = list(func.buffer_map.values())
+    if len(buffers) != 3:
+        raise TritonTVMContractError(
+            f"{name} TensorCore matmul requires exactly three buffers"
+        )
+    expected = ((m, k, "float16"), (k, n, "float16"), (m, n, "float32"))
+    for buffer, (dim0, dim1, dtype) in zip(buffers, expected):
+        buffer_shape = tuple(_int_imm_value(dim) for dim in buffer.shape)
+        if buffer_shape != (dim0, dim1):
+            raise TritonTVMContractError(
+                f"{name} TensorCore matmul buffer shape must be {(dim0, dim1)}"
+            )
+        if str(buffer.dtype) != dtype:
+            raise TritonTVMContractError(
+                f"{name} TensorCore matmul buffer dtype must be {dtype}"
+            )
+
+
 def _validate_matmul_schedule_attrs(
     name: str,
     attrs,
@@ -906,6 +1189,25 @@ def _validate_matmul_schedule_attrs(
 ) -> None:
     m, n, _ = dims
     if schedule_id == NATIVE_TIR_MATMUL_SCHEDULE_ID:
+        return
+    if schedule_id == SIMT_TIR_MATMUL_SCHEDULE_ID:
+        tile_m = _int_attr(attrs, "triton_tvm.tile_m")
+        tile_n = _int_attr(attrs, "triton_tvm.tile_n")
+        if tile_m != SIMT_TIR_MATMUL_TILE_M or tile_n != SIMT_TIR_MATMUL_TILE_N:
+            raise TritonTVMContractError(
+                f"{name} SIMT matmul attrs must preserve 16x16 tile shape"
+            )
+        if m % SIMT_TIR_MATMUL_TILE_M or n % SIMT_TIR_MATMUL_TILE_N:
+            raise TritonTVMContractError(
+                f"{name} SIMT matmul schedule requires M and N multiples of 16"
+            )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.matmul_perf_envelope",
+            MATMUL_PERF_ENVELOPE_ID,
+            "SIMT matmul",
+        )
         return
     if schedule_id != TILED_TIR_MATMUL_SCHEDULE_ID:
         raise TritonTVMContractError(
@@ -923,7 +1225,14 @@ def _validate_matmul_schedule_attrs(
         )
 
 
-def _validate_matmul_extern_runtime_metadata(name: str, attrs) -> None:
+def _validate_matmul_extern_runtime_metadata(
+    name: str,
+    attrs,
+    *,
+    artifact_reason: str = EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON,
+    provider_reason: str = EXTERN_GEMM_RUNTIME_PROVIDER_REASON,
+    label: str = "extern GEMM artifact",
+) -> None:
     status = str(attrs.get("triton_tvm.extern_gemm_runtime_status", ""))
     provider_kind = str(attrs.get("triton_tvm.extern_gemm_provider_kind", ""))
     provider_abi_version = _int_attr(attrs, "triton_tvm.extern_gemm_provider_abi_version")
@@ -940,21 +1249,21 @@ def _validate_matmul_extern_runtime_metadata(name: str, attrs) -> None:
             attrs,
             "triton_tvm.extern_runtime_kind",
             EXTERN_GEMM_RUNTIME_KIND,
-            "extern GEMM artifact",
+            label,
         )
         _require_attr_value(
             name,
             attrs,
             "triton_tvm.extern_runtime_replacement",
             EXTERN_GEMM_RUNTIME_REPLACEMENT,
-            "extern GEMM artifact",
+            label,
         )
         _require_attr_value(
             name,
             attrs,
             "triton_tvm.extern_runtime_replacement_reason",
-            EXTERN_GEMM_RUNTIME_REPLACEMENT_REASON,
-            "extern GEMM artifact",
+            artifact_reason,
+            label,
         )
         if replacement_available is not False:
             raise TritonTVMContractError(
@@ -992,7 +1301,7 @@ def _validate_matmul_extern_runtime_metadata(name: str, attrs) -> None:
         name,
         attrs,
         "triton_tvm.extern_runtime_replacement_reason",
-        EXTERN_GEMM_RUNTIME_PROVIDER_REASON,
+        provider_reason,
         "extern GEMM runtime provider",
     )
     _require_attr_value(

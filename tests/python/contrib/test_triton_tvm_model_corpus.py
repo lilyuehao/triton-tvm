@@ -23,6 +23,14 @@ import pytest
 
 import tvm.contrib.triton_tvm as triton_tvm_pkg
 import tvm.testing
+from tvm.contrib.triton_tvm.attention import (
+    ATTENTION_ABI_VERSION,
+    ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL,
+    ATTENTION_CONTRACT_LLAMA_DECODE,
+    ATTENTION_CONTRACT_UNCLASSIFIED,
+    ATTENTION_CONTRACT_VIT_FULL,
+    ATTENTION_RUNTIME_STATUS_DEFERRED,
+)
 from tvm.contrib.triton_tvm.model_corpus import (
     TritonTVMModelAuditConfig,
     _is_model_kernel_replaceable,
@@ -35,6 +43,8 @@ from tvm.contrib.triton_tvm.model_corpus import (
 )
 from tvm.contrib.triton_tvm.inductor import InductorKernel, extract_inductor_wrapper_extern_calls
 from tvm.contrib.triton_tvm.matmul import (
+    EXTERN_ADDMM_BIAS_PACKED_FUNC,
+    EXTERN_ADDMM_BIAS_RUNTIME_REPLACEMENT_REASON,
     EXTERN_GEMM_PACKED_FUNC,
     EXTERN_GEMM_PROVIDER_ABI_VERSION,
     EXTERN_GEMM_PROVIDER_NONE,
@@ -82,7 +92,7 @@ def test_pre_m9_wrapper_extern_extraction_classifies_matmul_conv_attention():
     wrapper_source = """
 def call(arg0, arg1):
     buf0 = extern_kernels.mm(reinterpret_tensor(buf_a, (16, 64), (64, 1), 0), reinterpret_tensor(weight, (64, 64), (1, 64), 0), out=buf_out)
-    buf1 = extern_kernels.addmm(arg0, arg1, arg1, alpha=1, beta=1, out=None)
+    buf1 = extern_kernels.addmm(bias, reinterpret_tensor(buf_a, (16, 64), (64, 1), 0), reinterpret_tensor(weight, (64, 64), (1, 64), 0), alpha=1, beta=1, out=buf_bias)
     buf2 = extern_kernels.convolution(arg0, arg1, stride=(1, 1), padding=(0, 0))
     buf3 = torch.ops.aten._scaled_dot_product_efficient_attention.default(
         arg0, arg1, arg1, None, False, scale=0.25
@@ -131,8 +141,18 @@ def call(arg0, arg1):
     assert calls[0].matmul_b_stride == (1, 64)
     assert calls[1].matmul_source_kind == "wrapper_extern_addmm_bias"
     assert calls[1].matmul_epilogue_kind == "bias_add"
-    assert calls[1].implementation_kind == "unsupported"
-    assert calls[1].unsupported_matmul_reason == "extern_addmm_bias_epilogue_not_supported"
+    assert calls[1].matmul_contract_ok is True
+    assert calls[1].implementation_kind == "extern_addmm_bias"
+    assert calls[1].extern_symbol == "extern_kernels.addmm"
+    assert calls[1].extern_packed_func == EXTERN_ADDMM_BIAS_PACKED_FUNC
+    assert calls[1].extern_runtime_replacement_reason == (
+        EXTERN_ADDMM_BIAS_RUNTIME_REPLACEMENT_REASON
+    )
+    assert calls[1].extern_gemm_performance_claim is False
+    assert calls[1].unsupported_matmul_reason == ""
+    assert calls[3].attention_contract == ATTENTION_CONTRACT_UNCLASSIFIED
+    assert calls[3].attention_runtime_status == ATTENTION_RUNTIME_STATUS_DEFERRED
+    assert "scale=0.25" in calls[3].source
 
 
 def test_m96_wrapper_extern_provider_marks_runtime_resolved():
@@ -156,6 +176,157 @@ def call(arg0, arg1):
     assert calls[0].extern_gemm_runtime_claim == EXTERN_GEMM_RUNTIME_CLAIM_CORRECTNESS_ONLY
     assert calls[0].extern_gemm_performance_claim is False
     assert calls[0].extern_gemm_uses_host_staging is True
+
+
+def test_pre_m10_multiline_sdpa_extraction_preserves_source_and_classifies_vit():
+    wrapper_source = """
+def call(q, k, v):
+    out = torch.ops.aten._scaled_dot_product_efficient_attention.default(
+        q,
+        k,
+        v,
+        None,
+        False,
+        scale=0.125,
+    )
+    return out
+"""
+
+    calls = extract_inductor_wrapper_extern_calls(
+        wrapper_source,
+        case_name="vit_tiny_random",
+        wrapper_path="/tmp/vit.py",
+    )
+
+    assert len(calls) == 1
+    assert calls[0].op_family == "deferred_attention"
+    assert "\n" in calls[0].source
+    assert "scale=0.125" in calls[0].source
+    assert calls[0].attention_contract == ATTENTION_CONTRACT_VIT_FULL
+    assert calls[0].attention_abi_version == ATTENTION_ABI_VERSION
+    assert calls[0].attention_causal is False
+    assert calls[0].attention_mask_kind == "none_or_padding"
+    assert calls[0].attention_runtime_status == ATTENTION_RUNTIME_STATUS_DEFERRED
+
+
+def test_pre_m10_llama_prefill_and_decode_attention_classification():
+    prefill_source = """
+def call(q, k, v):
+    return torch.ops.aten._scaled_dot_product_efficient_attention.default(
+        q, k, v, None, True, scale=0.125
+    )
+"""
+    decode_source = """
+def call(q, k, v, past_key_values):
+    return torch.ops.aten._scaled_dot_product_efficient_attention.default(
+        q, k, v, past_key_values, True, scale=0.125
+    )
+"""
+
+    prefill = extract_inductor_wrapper_extern_calls(
+        prefill_source,
+        case_name="llama_tiny_random",
+        wrapper_path="/tmp/llama_prefill.py",
+    )[0]
+    decode = extract_inductor_wrapper_extern_calls(
+        decode_source,
+        case_name="llama_decode_single_token_cache",
+        wrapper_path="/tmp/llama_decode.py",
+    )[0]
+
+    assert prefill.attention_contract == ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL
+    assert prefill.attention_phase == "causal_prefill"
+    assert prefill.attention_causal is True
+    assert prefill.attention_kv_cache_policy == "prefill_no_cache_update"
+    assert decode.attention_contract == ATTENTION_CONTRACT_LLAMA_DECODE
+    assert decode.attention_phase == "decode"
+    assert decode.attention_kv_cache_policy == "kv_cache_layout_deferred"
+    assert decode.attention_sequence_policy == "single_token_decode"
+
+
+def test_pre_m10_report_section_splits_attention_abi_without_changing_pre_m9():
+    records = [
+        _kernel_record(
+            "vit",
+            "vit_tiny",
+            "triton_vit_0",
+            make_report_status(ok=True, bucket="translated"),
+        ),
+        _kernel_record(
+            "llama",
+            "llama_tiny",
+            "triton_llama_0",
+            make_report_status(ok=True, bucket="translated"),
+        ),
+    ]
+    sdpa_op = "torch.ops.aten._scaled_dot_product_efficient_attention.default"
+    models = [
+        _model_record(
+            "vit",
+            "vit_tiny",
+            kernel_count=1,
+            translated=1,
+            fallback=0,
+            extern_calls=[
+                _extern_call(
+                    "vit",
+                    "vit_tiny",
+                    sdpa_op,
+                    "deferred_attention",
+                    source=f"{sdpa_op}(q, k, v, None, False, scale=0.125)",
+                )
+            ],
+        ),
+        _model_record(
+            "llama",
+            "llama_tiny",
+            kernel_count=1,
+            translated=1,
+            fallback=0,
+            extern_calls=[
+                _extern_call(
+                    "llama",
+                    "llama_tiny",
+                    sdpa_op,
+                    "deferred_attention",
+                    source=f"{sdpa_op}(q, k, v, None, True, scale=0.125)",
+                )
+            ],
+        ),
+    ]
+
+    report = build_model_corpus_report(
+        records,
+        models,
+        generated_at="2026-05-26T00:00:00+00:00",
+    )
+
+    pre_m9 = report["pre_m9"]
+    assert pre_m9["extern_family_classes"]["deferred_attention"]["call_count"] == 2
+    assert {entry["op_family"] for entry in pre_m9["deferred_debt"]} == {
+        "deferred_attention"
+    }
+    assert report["model_summary"]["full_tvm_runnable_models"] == 0
+
+    pre_m10 = report["pre_m10"]
+    assert pre_m10["taxonomy_version"] == 1
+    assert pre_m10["observed_attention_call_count"] == 2
+    assert pre_m10["attention_runtime_deferred_count"] == 2
+    assert pre_m10["contract_classes"][ATTENTION_CONTRACT_VIT_FULL]["call_count"] == 1
+    assert (
+        pre_m10["contract_classes"][ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL][
+            "call_count"
+        ]
+        == 1
+    )
+    assert pre_m10["contract_classes"][ATTENTION_CONTRACT_LLAMA_DECODE]["call_count"] == 0
+    assert len(pre_m10["runtime_deferred_debt"]) == 2
+
+    markdown = render_capability_markdown(report, title="Pre-M10 Snapshot")
+    assert "## Pre-M10 Gate" in markdown
+    assert ATTENTION_CONTRACT_VIT_FULL in markdown
+    assert ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL in markdown
+    assert ATTENTION_CONTRACT_LLAMA_DECODE in markdown
 
 
 def test_m6_model_report_groups_models_and_ranks_blockers(tmp_path):
@@ -475,7 +646,37 @@ def test_pre_m9_report_section_splits_extern_gemm_from_deferred_grid_conv_attent
             translated=1,
             fallback=0,
             extern_calls=[
-                _extern_call("vit", "vit_tiny", "extern_kernels.addmm", "extern_addmm_bias"),
+                _extern_call(
+                    "vit",
+                    "vit_tiny",
+                    "extern_kernels.addmm",
+                    "extern_addmm_bias",
+                    matmul_source_kind="wrapper_extern_addmm_bias",
+                    matmul_m=16,
+                    matmul_n=64,
+                    matmul_k=64,
+                    matmul_contract="matmul_minimal",
+                    matmul_contract_ok=True,
+                    matmul_a_dtype="float32",
+                    matmul_b_dtype="float32",
+                    matmul_accumulator_dtype="float32",
+                    matmul_output_dtype="float32",
+                    matmul_epilogue_kind="bias_add",
+                    implementation_kind="extern_addmm_bias",
+                    extern_symbol="extern_kernels.addmm",
+                    extern_packed_func=EXTERN_ADDMM_BIAS_PACKED_FUNC,
+                    extern_runtime_kind=EXTERN_GEMM_RUNTIME_KIND,
+                    extern_runtime_replacement=EXTERN_GEMM_RUNTIME_REPLACEMENT,
+                    extern_runtime_replacement_available=False,
+                    extern_runtime_replacement_reason=(
+                        EXTERN_ADDMM_BIAS_RUNTIME_REPLACEMENT_REASON
+                    ),
+                    source=(
+                        "extern_kernels.addmm(arg12_1, reinterpret_tensor(buf7, "
+                        "(16, 64), (64, 1), 0), reinterpret_tensor(arg11_1, "
+                        "(64, 64), (1, 64), 0), alpha=1, beta=1, out=buf8)"
+                    ),
+                ),
                 _extern_call(
                     "vit",
                     "vit_tiny",
@@ -580,8 +781,12 @@ def test_pre_m9_report_section_splits_extern_gemm_from_deferred_grid_conv_attent
     assert pre_m9["m96_extern_gemm_runtime"]["provider_counts"] == {
         EXTERN_GEMM_PROVIDER_NONE: 1
     }
-    assert len(pre_m9["m9_materialized_artifact_candidates"]) == 1
-    candidate = pre_m9["m9_materialized_artifact_candidates"][0]
+    assert len(pre_m9["m9_materialized_artifact_candidates"]) == 2
+    candidate = next(
+        entry
+        for entry in pre_m9["m9_materialized_artifact_candidates"]
+        if entry["op_family"] == "extern_gemm"
+    )
     assert candidate["op_family"] == "extern_gemm"
     assert candidate["matmul_source_kind"] == "wrapper_extern_gemm"
     assert (candidate["matmul_m"], candidate["matmul_n"], candidate["matmul_k"]) == (
@@ -597,9 +802,16 @@ def test_pre_m9_report_section_splits_extern_gemm_from_deferred_grid_conv_attent
     assert candidate["extern_runtime_replacement_available"] is False
     assert candidate["extern_gemm_runtime_status"] == EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
     assert candidate["extern_gemm_provider_kind"] == EXTERN_GEMM_PROVIDER_NONE
-    assert {entry["op_family"] for entry in pre_m9["m9_entry_debt"]} == {
-        "extern_addmm_bias",
-    }
+    addmm_candidate = next(
+        entry
+        for entry in pre_m9["m9_materialized_artifact_candidates"]
+        if entry["op_family"] == "extern_addmm_bias"
+    )
+    assert addmm_candidate["matmul_source_kind"] == "wrapper_extern_addmm_bias"
+    assert addmm_candidate["matmul_epilogue_kind"] == "bias_add"
+    assert addmm_candidate["implementation_kind"] == "extern_addmm_bias"
+    assert addmm_candidate["extern_packed_func"] == EXTERN_ADDMM_BIAS_PACKED_FUNC
+    assert pre_m9["m9_entry_debt"] == []
     assert {entry["op_family"] for entry in pre_m9["deferred_debt"]} == {
         "deferred_attention",
         "deferred_convolution",

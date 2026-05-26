@@ -59,11 +59,20 @@ from tvm.contrib.triton_tvm.matmul import (
     EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY,
     EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED,
     EXTERN_GEMM_SYMBOL,
+    MATMUL_PERF_ENVELOPE_ID,
+    MATMUL_SCHEDULE_REGISTRY_VERSION,
     NATIVE_TIR_MATMUL_SCHEDULE_ID,
+    SIMT_TIR_MATMUL_SCHEDULE_ID,
+    TENSORCORE_TIR_MATMUL_SCHEDULE_ID,
     TILED_TIR_MATMUL_SCHEDULE_ID,
+    build_extern_addmm_bias_tirx_source,
     build_extern_gemm_tirx_source,
+    build_matmul_tune_key_payload,
+    extract_matmul_semantics_from_wrapper_extern_addmm,
     extract_matmul_semantics_from_ttir,
     extract_matmul_semantics_from_wrapper_extern,
+    matmul_schedule_candidate_ids,
+    matmul_schedule_candidate_records,
     register_python_torch_extern_gemm,
 )
 from tvm.contrib.triton_tvm.ttir import TTIRReader
@@ -381,6 +390,29 @@ def _static_m97_tiled_dot_ttir(dtype: str = "f16") -> str:
     )
 
 
+def _static_m9p_dot_ttir(m: int, n: int, k: int, dtype: str = "f16") -> str:
+    return f"""
+module {{
+  tt.func @_m9p_dot(%a:!tt.ptr<{dtype}>,%b:!tt.ptr<{dtype}>,%out:!tt.ptr<f32>) {{
+    %a_zero = arith.constant dense<0> : tensor<{m}x{k}xi32>
+    %b_zero = arith.constant dense<0> : tensor<{k}x{n}xi32>
+    %c_zero = arith.constant dense<0> : tensor<{m}x{n}xi32>
+    %a_splat = tt.splat %a : !tt.ptr<{dtype}> -> tensor<{m}x{k}x!tt.ptr<{dtype}>>
+    %a_ptr = tt.addptr %a_splat, %a_zero : tensor<{m}x{k}x!tt.ptr<{dtype}>>, tensor<{m}x{k}xi32>
+    %va = tt.load %a_ptr : tensor<{m}x{k}x!tt.ptr<{dtype}>>
+    %b_splat = tt.splat %b : !tt.ptr<{dtype}> -> tensor<{k}x{n}x!tt.ptr<{dtype}>>
+    %b_ptr = tt.addptr %b_splat, %b_zero : tensor<{k}x{n}x!tt.ptr<{dtype}>>, tensor<{k}x{n}xi32>
+    %vb = tt.load %b_ptr : tensor<{k}x{n}x!tt.ptr<{dtype}>>
+    %dot = tt.dot %va, %vb {{inputPrecision = tf32}} : tensor<{m}x{k}x{dtype}>, tensor<{k}x{n}x{dtype}> -> tensor<{m}x{n}xf32>
+    %out_splat = tt.splat %out : !tt.ptr<f32> -> tensor<{m}x{n}x!tt.ptr<f32>>
+    %out_ptr = tt.addptr %out_splat, %c_zero : tensor<{m}x{n}x!tt.ptr<f32>>, tensor<{m}x{n}xi32>
+    tt.store %out_ptr, %dot : tensor<{m}x{n}x!tt.ptr<f32>>
+    tt.return
+  }}
+}}
+"""
+
+
 _STATIC_PRE_M7_ATOMIC_GRID_TTIR = """
 module {
   tt.func @_pre_m7_atomic_grid(%x:!tt.ptr<f32>,%out:!tt.ptr<f32>) {
@@ -493,8 +525,13 @@ def test_static_pre_m5_public_pass_surface():
 
 def test_static_pre_m5_public_api_freeze():
     assert set(triton_tvm_pkg.__all__) == {
+        "MATMUL_PERF_ENVELOPE_ID",
+        "MATMUL_SCHEDULE_REGISTRY_VERSION",
         "TTIRArtifact",
         "MatmulSemantics",
+        "MatmulScheduleCandidate",
+        "SIMT_TIR_MATMUL_SCHEDULE_ID",
+        "TENSORCORE_TIR_MATMUL_SCHEDULE_ID",
         "TargetMatmulDecision",
         "TargetMatmulPolicy",
         "TritonTVMArtifact",
@@ -507,10 +544,16 @@ def test_static_pre_m5_public_api_freeze():
         "UnsupportedTTIROpError",
         "UnsupportedTargetPolicyError",
         "ValidateTritonKernelTIR",
+        "build_extern_addmm_bias_tirx_source",
+        "build_matmul_tune_key_payload",
         "build_triton_tvm",
+        "extract_matmul_semantics_from_wrapper_extern_addmm",
         "get_triton_tvm_contract",
         "lower_to_ttir",
+        "matmul_schedule_candidate_ids",
+        "matmul_schedule_candidate_records",
         "normalize_triton_tvm_contract",
+        "register_python_torch_extern_addmm_bias",
         "register_python_torch_extern_gemm",
         "translate_ttir",
         "validate_matmul_minimal_contract",
@@ -898,32 +941,74 @@ def test_static_m95_extern_gemm_artifact_requires_runtime_gate_metadata():
         )
 
 
-def test_static_m9_wrapper_extern_addmm_stays_deferred():
-    with pytest.raises(UnsupportedTTIROpError, match="extern_addmm_bias_epilogue"):
-        extract_matmul_semantics_from_wrapper_extern(
-            {
-                "op_name": "extern_kernels.addmm",
-                "source": (
-                    "extern_kernels.addmm(arg0, reinterpret_tensor(arg1, (16, 64), "
-                    "(64, 1), 0), reinterpret_tensor(arg2, (64, 64), (1, 64), 0), "
-                    "alpha=1, beta=1, out=buf0)"
-                ),
-            }
-        )
-
-    base = extract_matmul_semantics_from_wrapper_extern(
-        "extern_kernels.mm(reinterpret_tensor(buf1, (16, 64), (64, 1), 0), "
-        "reinterpret_tensor(arg4_1, (64, 64), (1, 64), 0), out=buf2)",
-        case_name="llama_tiny",
-    ).cache_payload()
-    base["source_kind"] = "wrapper_extern_addmm_bias"
-    base["epilogue_kind"] = "bias_add"
-    decision = TargetMatmulPolicy().decide(
-        MatmulSemantics(**base),
-        matmul_contract_ok=True,
+def test_static_m9p_extern_addmm_bias_minimal_artifact():
+    source_line = (
+        "extern_kernels.addmm(arg0, reinterpret_tensor(arg1, (16, 64), "
+        "(64, 1), 0), reinterpret_tensor(arg2, (64, 64), (1, 64), 0), "
+        "alpha=1, beta=1, out=buf0)"
     )
-    assert decision.implementation_kind == "unsupported"
-    assert decision.unsupported_matmul_reason == "extern_addmm_bias_epilogue_not_supported"
+    semantics = extract_matmul_semantics_from_wrapper_extern_addmm(
+        {
+            "op_name": "extern_kernels.addmm",
+            "source": source_line,
+            "case_name": "vit_tiny",
+        }
+    )
+    same_semantics = extract_matmul_semantics_from_wrapper_extern(source_line)
+    decision = TargetMatmulPolicy().decide(semantics, matmul_contract_ok=True)
+
+    assert semantics.source_kind == "wrapper_extern_addmm_bias"
+    assert semantics.epilogue_kind == "bias_add"
+    assert semantics.bias_param == "arg0"
+    assert semantics.bias_shape == (64,)
+    assert semantics.bias_stride == (1,)
+    assert semantics.b_layout == "transposed_weight_view"
+    assert same_semantics.source_kind == "wrapper_extern_addmm_bias"
+    assert decision.implementation_kind == "extern_addmm_bias"
+    assert decision.extern_symbol == "extern_kernels.addmm"
+    assert decision.extern_gemm_performance_claim is False
+
+    artifact = build_extern_addmm_bias_tirx_source(semantics, decision)
+    irmod = tvm.script.from_source(artifact)
+    validate_matmul_minimal_contract(irmod)
+    attrs = next(iter(irmod.functions.values())).attrs
+    script = irmod.script()
+
+    assert str(attrs["triton_tvm.matmul_source_kind"]) == "wrapper_extern_addmm_bias"
+    assert str(attrs["triton_tvm.implementation_kind"]) == "extern_addmm_bias"
+    assert str(attrs["triton_tvm.epilogue_kind"]) == "bias_add"
+    assert str(attrs["triton_tvm.bias_shape"]) == "64"
+    assert str(attrs["triton_tvm.bias_stride"]) == "1"
+    assert int(attrs["triton_tvm.bias_rank"]) == 1
+    assert "tvm.contrib.triton_tvm.extern_addmm_bias" in script
+    assert 'with T.sblock("matmul")' not in script
+
+
+def test_static_m9p_extern_addmm_bias_rejects_unsupported_subset():
+    bad_alpha = (
+        "extern_kernels.addmm(arg0, reinterpret_tensor(arg1, (16, 64), "
+        "(64, 1), 0), reinterpret_tensor(arg2, (64, 64), (1, 64), 0), "
+        "alpha=2, beta=1, out=buf0)"
+    )
+    with pytest.raises(UnsupportedTTIROpError, match="alpha=1 and beta=1"):
+        extract_matmul_semantics_from_wrapper_extern_addmm(bad_alpha)
+
+    bad_bias = (
+        "extern_kernels.addmm(reinterpret_tensor(arg0, (16, 32), (32, 1), 0), "
+        "reinterpret_tensor(arg1, (16, 64), (64, 1), 0), "
+        "reinterpret_tensor(arg2, (64, 64), (1, 64), 0), "
+        "alpha=1, beta=1, out=buf0)"
+    )
+    with pytest.raises(UnsupportedTTIROpError, match="rank-1 N or rank-2 MxN"):
+        extract_matmul_semantics_from_wrapper_extern_addmm(bad_bias)
+
+    bad_layout = (
+        "extern_kernels.addmm(arg0, reinterpret_tensor(arg1, (16, 64), "
+        "(1, 16), 0), reinterpret_tensor(arg2, (64, 64), (1, 64), 0), "
+        "alpha=1, beta=1, out=buf0)"
+    )
+    with pytest.raises(UnsupportedTTIROpError, match="lhs must be row-major"):
+        extract_matmul_semantics_from_wrapper_extern_addmm(bad_layout)
 
 
 def test_static_m9_matmul_minimal_semantics_negative_boundaries():
@@ -1037,6 +1122,94 @@ def test_static_m97_tiled_matmul_schedule_candidate_without_cuda_runtime():
     )
     with pytest.raises(TritonTVMContractError, match="unknown"):
         validate_matmul_minimal_contract(tvm.script.from_source(unknown_schedule))
+
+
+def test_static_m9p_schedule_registry_and_tune_key_freeze():
+    candidate_ids = matmul_schedule_candidate_ids()
+    records = matmul_schedule_candidate_records()
+
+    assert candidate_ids[0] == TENSORCORE_TIR_MATMUL_SCHEDULE_ID
+    assert candidate_ids[-1] == NATIVE_TIR_MATMUL_SCHEDULE_ID
+    assert len(records) == len(candidate_ids)
+    assert all(record["schedule_id"] for record in records)
+    assert all(record["implementation_kind"] == "native_tir_schedule" for record in records)
+    assert records[0]["package_id"] == "M9.PA"
+    assert records[1]["schedule_id"] == SIMT_TIR_MATMUL_SCHEDULE_ID
+    assert records[1]["package_id"] == "M9.PC"
+    assert records[0]["performance_claim"] is True
+    assert MATMUL_SCHEDULE_REGISTRY_VERSION == "m9p_schedule_registry_v1"
+
+    semantics = extract_matmul_semantics_from_ttir(
+        TTIRReader().read(_static_m9p_dot_ttir(16, 16, 16))
+    )
+    tune_key = build_matmul_tune_key_payload(
+        semantics,
+        schedule_id=TENSORCORE_TIR_MATMUL_SCHEDULE_ID,
+        tune_params={"tile_m": 16, "tile_n": 16, "tile_k": 4},
+        target_arch="sm_90",
+        device_name="unit-test-device",
+        framework_versions={"tvm": "unit", "triton": "unit"},
+        cuda_target_metadata={"target": "cuda"},
+    )
+    assert tune_key["matmul_perf_envelope"] == MATMUL_PERF_ENVELOPE_ID
+    assert tune_key["registry_version"] == MATMUL_SCHEDULE_REGISTRY_VERSION
+    assert (tune_key["m"], tune_key["n"], tune_key["k"]) == (16, 16, 16)
+    assert tune_key["schedule_id"] == TENSORCORE_TIR_MATMUL_SCHEDULE_ID
+    assert tune_key["target_arch"] == "sm_90"
+    assert tune_key["device_name"] == "unit-test-device"
+
+
+def test_static_m9p_tensorcore_candidate_selection_and_report_fields():
+    irmod, meta = translate_ttir(
+        _static_m9p_dot_ttir(16, 16, 16),
+        grid=(1,),
+        contract="matmul_minimal",
+    )
+    validate_matmul_minimal_contract(irmod)
+    func = next(iter(irmod.functions.values()))
+    attrs = func.attrs
+    script = irmod.script()
+
+    assert meta.schedule_id == TENSORCORE_TIR_MATMUL_SCHEDULE_ID
+    assert meta.selected_schedule_id == TENSORCORE_TIR_MATMUL_SCHEDULE_ID
+    assert meta.matmul_perf_envelope == MATMUL_PERF_ENVELOPE_ID
+    assert meta.candidate_schedule_ids[0] == TENSORCORE_TIR_MATMUL_SCHEDULE_ID
+    assert meta.perf_guard_status == "not_measured"
+    assert meta.schedule_reject_reasons[NATIVE_TIR_MATMUL_SCHEDULE_ID]
+    assert meta.tune_key["registry_version"] == MATMUL_SCHEDULE_REGISTRY_VERSION
+    assert meta.tune_key["schedule_id"] == TENSORCORE_TIR_MATMUL_SCHEDULE_ID
+    assert str(attrs["triton_tvm.schedule_id"]) == TENSORCORE_TIR_MATMUL_SCHEDULE_ID
+    assert str(attrs["triton_tvm.matmul_perf_envelope"]) == MATMUL_PERF_ENVELOPE_ID
+    assert int(attrs["triton_tvm.tile_m"]) == 16
+    assert int(attrs["triton_tvm.tile_n"]) == 16
+    assert int(attrs["triton_tvm.tile_k"]) == 4
+    assert "T.ptx_mma" in script or "tirx.ptx_mma" in script
+    assert "m8n8k4" in script
+
+
+def test_static_m9p_tensorcore_rejects_bf16_and_selects_simt_fallback():
+    irmod, meta = translate_ttir(
+        _static_m9p_dot_ttir(16, 16, 16, dtype="bf16"),
+        grid=(1,),
+        contract="matmul_minimal",
+    )
+    validate_matmul_minimal_contract(irmod)
+    func = next(iter(irmod.functions.values()))
+    sch = tvm.s_tir.Schedule(func)
+    block = sch.get_sblock("matmul")
+    attrs = sch.get(block).annotations
+
+    assert meta.schedule_id == SIMT_TIR_MATMUL_SCHEDULE_ID
+    assert meta.selected_schedule_id == SIMT_TIR_MATMUL_SCHEDULE_ID
+    assert meta.matmul_perf_envelope == MATMUL_PERF_ENVELOPE_ID
+    assert (
+        meta.schedule_reject_reasons[TENSORCORE_TIR_MATMUL_SCHEDULE_ID]
+        == "tensorcore_candidate_requires_fp16_inputs"
+    )
+    assert meta.schedule_reject_reasons[TILED_TIR_MATMUL_SCHEDULE_ID]
+    assert meta.tune_key["schedule_id"] == SIMT_TIR_MATMUL_SCHEDULE_ID
+    assert int(attrs["triton_tvm.tile_m"]) == 16
+    assert int(attrs["triton_tvm.tile_n"]) == 16
 
 
 def test_static_m9_audit_record_reports_native_matmul_details():

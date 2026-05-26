@@ -43,9 +43,20 @@ from .errors import (
 )
 from .frontend import TTIRArtifact, lower_to_ttir
 from .matmul import (
+    MATMUL_PERF_ENVELOPE_ID,
+    MATMUL_SCHEDULE_REGISTRY_VERSION,
+    SIMT_TIR_MATMUL_SCHEDULE_ID,
+    TENSORCORE_TIR_MATMUL_SCHEDULE_ID,
     MatmulSemantics,
+    MatmulScheduleCandidate,
     TargetMatmulDecision,
     TargetMatmulPolicy,
+    build_extern_addmm_bias_tirx_source,
+    build_matmul_tune_key_payload,
+    extract_matmul_semantics_from_wrapper_extern_addmm,
+    matmul_schedule_candidate_ids,
+    matmul_schedule_candidate_records,
+    register_python_torch_extern_addmm_bias,
     register_python_torch_extern_gemm,
 )
 from .passes import ValidateTritonKernelTIR
@@ -54,7 +65,12 @@ from .translator import TritonTVMMeta, translate_ttir
 
 __all__ = [
     "TTIRArtifact",
+    "MATMUL_PERF_ENVELOPE_ID",
+    "MATMUL_SCHEDULE_REGISTRY_VERSION",
     "MatmulSemantics",
+    "MatmulScheduleCandidate",
+    "SIMT_TIR_MATMUL_SCHEDULE_ID",
+    "TENSORCORE_TIR_MATMUL_SCHEDULE_ID",
     "TargetMatmulDecision",
     "TargetMatmulPolicy",
     "TritonTVMArtifact",
@@ -67,10 +83,16 @@ __all__ = [
     "UnsupportedTTIROpError",
     "UnsupportedTargetPolicyError",
     "ValidateTritonKernelTIR",
+    "build_extern_addmm_bias_tirx_source",
     "build_triton_tvm",
+    "build_matmul_tune_key_payload",
+    "extract_matmul_semantics_from_wrapper_extern_addmm",
     "get_triton_tvm_contract",
     "lower_to_ttir",
+    "matmul_schedule_candidate_ids",
+    "matmul_schedule_candidate_records",
     "normalize_triton_tvm_contract",
+    "register_python_torch_extern_addmm_bias",
     "register_python_torch_extern_gemm",
     "translate_ttir",
     "validate_matmul_minimal_contract",

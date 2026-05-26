@@ -32,6 +32,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .attention import (
+    ATTENTION_REPORT_FIELDS,
+    ATTENTION_RUNTIME_STATUS_DEFERRED,
+    ATTENTION_TARGET_CONTRACTS,
+    classify_wrapper_sdpa_attention,
+)
 from .inductor import (
     InductorKernel,
     InductorTritonSource,
@@ -42,10 +48,13 @@ from .inductor import (
     load_inductor_kernel,
 )
 from .matmul import (
+    EXTERN_ADDMM_BIAS_PACKED_FUNC,
+    EXTERN_ADDMM_BIAS_SYMBOL,
     EXTERN_GEMM_PROVIDER_NONE,
     EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED,
     EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY,
     EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED,
+    EXTERN_GEMM_SYMBOL,
 )
 from .reporting import (
     build_capability_report,
@@ -59,6 +68,7 @@ PRE_M7_TAXONOMY_VERSION = 1
 PRE_M7_BUILDER_DECISION = "keep_tvmscript_source_builder_for_m7_entry"
 PRE_M8_TAXONOMY_VERSION = 1
 PRE_M9_TAXONOMY_VERSION = 1
+PRE_M10_TAXONOMY_VERSION = 1
 _PRE_M7_READER_CLASSES = (
     "pointwise",
     "broadcast_view_index",
@@ -215,6 +225,7 @@ def build_model_corpus_report(
         normalized_models,
         extern_records,
     )
+    report["pre_m10"] = _pre_m10_report_section(extern_records)
     report["extern_ops"] = extern_records
     report["full_tvm_runnable"] = (
         bool(normalized_models)
@@ -657,6 +668,23 @@ def _extern_call_to_record(call, case: TritonTVMModelAuditCase) -> dict[str, Any
     }
     for field_name in _EXTERN_MATMUL_FIELDS:
         record[field_name] = getattr(call, field_name, _extern_matmul_default(field_name))
+    for field_name in _EXTERN_ATTENTION_FIELDS:
+        record[field_name] = getattr(
+            call,
+            field_name,
+            _extern_attention_default(field_name),
+        )
+    if record["op_family"] == "deferred_attention":
+        record.update(
+            classify_wrapper_sdpa_attention(
+                op_name=record["op_name"],
+                op_family=record["op_family"],
+                source=record["source"],
+                model_family=case.model_family,
+                model_case=case.case_name,
+                case_name=case.case_name,
+            ).as_report_fields()
+        )
     return record
 
 
@@ -676,9 +704,23 @@ def _normalize_extern_call_record(
     normalized.setdefault("source", "")
     for field_name in _EXTERN_MATMUL_FIELDS:
         normalized.setdefault(field_name, _extern_matmul_default(field_name))
+    for field_name in _EXTERN_ATTENTION_FIELDS:
+        normalized.setdefault(field_name, _extern_attention_default(field_name))
+    if normalized.get("op_family") == "deferred_attention":
+        classification = classify_wrapper_sdpa_attention(
+            op_name=str(normalized.get("op_name", "")),
+            op_family=str(normalized.get("op_family", "")),
+            source=str(normalized.get("source", "")),
+            model_family=str(normalized.get("model_family", "")),
+            model_case=str(normalized.get("model_case", "")),
+            case_name=str(normalized.get("case_name", "")),
+        ).as_report_fields()
+        for field_name, value in classification.items():
+            if not normalized.get(field_name):
+                normalized[field_name] = value
     if (
-        normalized.get("op_family") == "extern_gemm"
-        and normalized.get("implementation_kind") == "extern_gemm"
+        normalized.get("op_family") in ("extern_gemm", "extern_addmm_bias")
+        and normalized.get("implementation_kind") in ("extern_gemm", "extern_addmm_bias")
     ):
         normalized["extern_gemm_runtime_status"] = (
             normalized.get("extern_gemm_runtime_status")
@@ -727,6 +769,8 @@ _EXTERN_MATMUL_FIELDS = (
     "matmul_c_stride",
 )
 
+_EXTERN_ATTENTION_FIELDS = ATTENTION_REPORT_FIELDS
+
 
 def _extern_matmul_default(field_name: str) -> Any:
     if field_name in {
@@ -745,6 +789,14 @@ def _extern_matmul_default(field_name: str) -> Any:
         return False
     if field_name.endswith("_stride"):
         return None
+    return ""
+
+
+def _extern_attention_default(field_name: str) -> Any:
+    if field_name == "attention_abi_version":
+        return 0
+    if field_name == "attention_causal":
+        return False
     return ""
 
 
@@ -1088,12 +1140,160 @@ def _pre_m9_report_section(
     }
 
 
+def _pre_m10_report_section(extern_records: list[dict[str, Any]]) -> dict[str, Any]:
+    attention_records = [
+        record
+        for record in extern_records
+        if str(record.get("op_family", "")) == "deferred_attention"
+    ]
+    contract_classes = _pre_m10_attention_contract_classes(attention_records)
+    runtime_deferred_debt = [
+        _pre_m10_entry_from_attention_contract(contract, entry)
+        for contract, entry in contract_classes.items()
+        if int(entry.get("call_count", 0) or 0) > 0
+    ]
+    return {
+        "taxonomy_version": PRE_M10_TAXONOMY_VERSION,
+        "report_policy": {
+            "attention_abi_gate": (
+                "Pre-M10 classifies wrapper-level attention calls before M10 "
+                "runtime work. It does not count attention calls as translated "
+                "Triton kernels or runtime-resolved model progress."
+            ),
+            "schema_policy": (
+                "Report schema v1 top-level buckets remain stable; attention "
+                "ABI details are additive fields on deferred_attention records."
+            ),
+            "runtime_policy": (
+                "All Pre-M10 attention contracts use deferred_attention_runtime "
+                "until an explicit M10 runtime milestone admits lowering."
+            ),
+        },
+        "target_contracts": list(ATTENTION_TARGET_CONTRACTS),
+        "detail_fields": list(ATTENTION_REPORT_FIELDS),
+        "contract_policy": {
+            "attention_vit_full_v1": (
+                "ViT full attention ABI with no RoPE or KV cache requirement; "
+                "runtime remains deferred."
+            ),
+            "attention_llama_causal_prefill_v1": (
+                "Llama causal prefill ABI with RoPE reported as deferred "
+                "pointwise policy and no KV cache update requirement."
+            ),
+            "attention_llama_decode_v1": (
+                "Llama single-token decode ABI with RoPE and KV cache layout "
+                "reported but not implemented in Pre-M10."
+            ),
+        },
+        "contract_classes": contract_classes,
+        "observed_attention_call_count": len(attention_records),
+        "attention_runtime_deferred_count": sum(
+            1
+            for record in attention_records
+            if str(record.get("attention_runtime_status", ""))
+            == ATTENTION_RUNTIME_STATUS_DEFERRED
+        ),
+        "runtime_deferred_debt": runtime_deferred_debt,
+    }
+
+
+def _pre_m10_attention_contract_classes(
+    attention_records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    classes: dict[str, dict[str, Any]] = {}
+
+    def get_entry(contract: str) -> dict[str, Any]:
+        if contract not in classes:
+            classes[contract] = {
+                "call_count": 0,
+                "models": set(),
+                "abi_status": Counter(),
+                "runtime_status": Counter(),
+                "phases": Counter(),
+                "mask_kinds": Counter(),
+                "rope_policies": Counter(),
+                "kv_cache_policies": Counter(),
+                "sequence_policies": Counter(),
+                "unsupported_reasons": Counter(),
+                "example_op": "",
+                "example_model": "",
+                "example_source": "",
+            }
+        return classes[contract]
+
+    for contract in ATTENTION_TARGET_CONTRACTS:
+        get_entry(contract)
+
+    for record in attention_records:
+        contract = str(record.get("attention_contract", "")) or "attention_unclassified"
+        entry = get_entry(contract)
+        entry["call_count"] += 1
+        if record.get("model_case"):
+            entry["models"].add(str(record.get("model_case", "")))
+        _counter_add(entry["abi_status"], record.get("attention_abi_status", ""))
+        _counter_add(entry["runtime_status"], record.get("attention_runtime_status", ""))
+        _counter_add(entry["phases"], record.get("attention_phase", ""))
+        _counter_add(entry["mask_kinds"], record.get("attention_mask_kind", ""))
+        _counter_add(entry["rope_policies"], record.get("attention_rope_policy", ""))
+        _counter_add(entry["kv_cache_policies"], record.get("attention_kv_cache_policy", ""))
+        _counter_add(entry["sequence_policies"], record.get("attention_sequence_policy", ""))
+        _counter_add(entry["unsupported_reasons"], record.get("unsupported_attention_reason", ""))
+        if not entry["example_op"]:
+            entry["example_op"] = str(record.get("op_name", ""))
+            entry["example_model"] = str(record.get("model_case", ""))
+            entry["example_source"] = str(record.get("source", ""))
+
+    normalized = {}
+    for contract, entry in sorted(classes.items()):
+        models = sorted(entry["models"])
+        normalized[contract] = {
+            "call_count": int(entry["call_count"]),
+            "models_impacted": len(models),
+            "models": models,
+            "abi_status": dict(sorted(entry["abi_status"].items())),
+            "runtime_status": dict(sorted(entry["runtime_status"].items())),
+            "phases": dict(sorted(entry["phases"].items())),
+            "mask_kinds": dict(sorted(entry["mask_kinds"].items())),
+            "rope_policies": dict(sorted(entry["rope_policies"].items())),
+            "kv_cache_policies": dict(sorted(entry["kv_cache_policies"].items())),
+            "sequence_policies": dict(sorted(entry["sequence_policies"].items())),
+            "unsupported_reasons": dict(sorted(entry["unsupported_reasons"].items())),
+            "example_op": entry["example_op"],
+            "example_model": entry["example_model"],
+            "example_source": entry["example_source"],
+        }
+    return normalized
+
+
+def _counter_add(counter: Counter, value: Any) -> None:
+    text = str(value or "")
+    if text:
+        counter[text] += 1
+
+
+def _pre_m10_entry_from_attention_contract(
+    contract: str,
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "attention_contract": contract,
+        "call_count": int(entry.get("call_count", 0)),
+        "models_impacted": int(entry.get("models_impacted", 0)),
+        "models": list(entry.get("models", [])),
+        "runtime_status": dict(entry.get("runtime_status", {})),
+        "unsupported_reasons": dict(entry.get("unsupported_reasons", {})),
+        "example_op": entry.get("example_op", ""),
+        "example_model": entry.get("example_model", ""),
+        "example_source": entry.get("example_source", ""),
+    }
+
+
 def _pre_m9_materialized_artifact_candidates(
     extern_records: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     candidates = []
     for record in extern_records:
-        if not _is_materialized_extern_gemm_record(record):
+        if not _is_materialized_extern_artifact_record(record):
             continue
         candidates.append(
             {
@@ -1172,7 +1372,7 @@ def _is_pre_m9_entry_debt_record(record: dict[str, Any]) -> bool:
         str(record.get("op_name", ""))
     )
     if family == "extern_addmm_bias":
-        return True
+        return not _is_materialized_extern_addmm_bias_record(record)
     if family == "extern_gemm":
         return not (
             _is_materialized_extern_gemm_record(record)
@@ -1181,13 +1381,39 @@ def _is_pre_m9_entry_debt_record(record: dict[str, Any]) -> bool:
     return False
 
 
+def _is_materialized_extern_artifact_record(record: dict[str, Any]) -> bool:
+    return _is_materialized_extern_gemm_record(record) or _is_materialized_extern_addmm_bias_record(
+        record
+    )
+
+
 def _is_materialized_extern_gemm_record(record: dict[str, Any]) -> bool:
     return (
         str(record.get("op_family", "")) == "extern_gemm"
         and str(record.get("matmul_source_kind", "")) == "wrapper_extern_gemm"
         and bool(record.get("matmul_contract_ok", False))
         and str(record.get("implementation_kind", "")) == "extern_gemm"
-        and str(record.get("extern_symbol", "")) == "extern_kernels.mm"
+        and str(record.get("extern_symbol", "")) == EXTERN_GEMM_SYMBOL
+        and str(record.get("extern_packed_func", "")) != EXTERN_ADDMM_BIAS_PACKED_FUNC
+        and str(record.get("extern_runtime_kind", "") or "artifact_only") == "artifact_only"
+        and not bool(record.get("extern_runtime_replacement_available", False))
+        and str(
+            record.get("extern_gemm_runtime_status", "")
+            or EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+        )
+        == EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+    )
+
+
+def _is_materialized_extern_addmm_bias_record(record: dict[str, Any]) -> bool:
+    return (
+        str(record.get("op_family", "")) == "extern_addmm_bias"
+        and str(record.get("matmul_source_kind", "")) == "wrapper_extern_addmm_bias"
+        and str(record.get("matmul_epilogue_kind", "")) == "bias_add"
+        and bool(record.get("matmul_contract_ok", False))
+        and str(record.get("implementation_kind", "")) == "extern_addmm_bias"
+        and str(record.get("extern_symbol", "")) == EXTERN_ADDMM_BIAS_SYMBOL
+        and str(record.get("extern_packed_func", "")) == EXTERN_ADDMM_BIAS_PACKED_FUNC
         and str(record.get("extern_runtime_kind", "") or "artifact_only") == "artifact_only"
         and not bool(record.get("extern_runtime_replacement_available", False))
         and str(

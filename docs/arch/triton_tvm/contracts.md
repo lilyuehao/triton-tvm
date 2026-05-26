@@ -108,6 +108,30 @@ wrapper-level extern calls remain. `triton_kernel_runnable` records the narrower
 condition where captured Triton kernels translate even if wrapper externs are
 still present.
 
+## Pre-M10 Attention ABI Policy
+
+Pre-M10 freezes attention ABI/report vocabulary before M10 runtime work. It does
+not implement attention lowering, RoPE runtime, KV cache runtime, or attention
+performance.
+
+Target attention contract ids:
+
+- `attention_vit_full_v1`
+- `attention_llama_causal_prefill_v1`
+- `attention_llama_decode_v1`
+
+Wrapper-level
+`torch.ops.aten._scaled_dot_product_efficient_attention.default` calls remain
+`op_family="deferred_attention"` and receive additive ABI fields such as
+`attention_contract`, `attention_phase`, `attention_mask_kind`,
+`attention_rope_policy`, `attention_kv_cache_policy`, and
+`attention_runtime_status`.
+
+All Pre-M10 attention records use
+`attention_runtime_status="deferred_attention_runtime"`. `full_tvm_runnable`
+still requires no wrapper-level extern calls, so attention ABI classification is
+not model runtime closure.
+
 ## M9 Matmul Semantics and Contract Policy
 
 M9 uses a unified `MatmulSemantics` / `MatmulContract` boundary before target
@@ -200,8 +224,26 @@ report is `diagnostic_host_staged_triton_tvm`, keeps
 `extern_gemm_performance_claim=false`, and does not change captured corpus
 accounting or full-model runnable status.
 
-M9.5 added corpus report diff coverage and an opt-in minimal perf scaffold only.
-Bias/add epilogue lowering, runtime cublas/cublaslt replacement,
-TensorCore/vendor scheduling, performance optimization, and model closure are
-not part of the M9.1-M9.8 semantic, policy, correctness, artifact, hardening,
-and diagnostic entry.
+M9.P keeps the same `matmul_minimal` core semantic contract and adds a
+target-policy performance envelope, `matmul_perf_core_v1`. Native decisions
+carry the frozen schedule registry version `m9p_schedule_registry_v1`,
+candidate schedule ids, selected schedule id, reject reasons, perf guard
+status, and a tune-key payload covering M/N/K, dtype, layout, stride,
+transpose, epilogue, target/device, schedule id, tune params, framework
+versions, CUDA metadata, and registry version.
+
+M9.PA selects
+`cuda_ptx_mma_m8n8k4_warp_tile_16x16_fp16fp32_v1` only for eligible fp16
+`tt_dot` shapes inside the envelope. M9.PC adds
+`cuda_block_tile_16x16_simt_v1` as the non-TensorCore fallback candidate for
+eligible fp16/bf16 envelope shapes when TensorCore is unavailable or rejected;
+legacy serial-K schedules remain lower-priority correctness fallbacks. M9.PB's
+`torch_cuda_cublas_baseline_v1` remains an external dashboard baseline, not a
+TVM packed runtime replacement.
+
+M9.PE admits only the minimal wrapper `extern_kernels.addmm` bias slice as
+`source_kind="wrapper_extern_addmm_bias"` with `epilogue_kind="bias_add"`.
+It materializes an explicit packed-call artifact
+`tvm.contrib.triton_tvm.extern_addmm_bias` and optional correctness-only
+host-staged provider metadata. This does not widen `matmul_perf_core_v1`;
+native performance schedules still reject epilogues through target policy.
