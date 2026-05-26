@@ -33,10 +33,25 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .attention import (
+    ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL,
+    ATTENTION_CONTRACT_VIT_FULL,
+    ATTENTION_EXTERN_PACKED_FUNC,
+    ATTENTION_EXTERN_SYMBOL,
+    ATTENTION_IMPLEMENTATION_KIND_EXTERN_SDPA,
+    ATTENTION_IMPLEMENTATION_KIND_NATIVE_DECOMPOSED,
+    ATTENTION_PROVIDER_NONE,
+    ATTENTION_PROVIDER_NATIVE_DECOMPOSED,
+    ATTENTION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
     ATTENTION_REPORT_FIELDS,
+    ATTENTION_RUNTIME_KIND_ARTIFACT_ONLY,
+    ATTENTION_RUNTIME_KIND_NATIVE_DECOMPOSED,
+    ATTENTION_RUNTIME_KIND_PROVIDER,
+    ATTENTION_RUNTIME_REPLACEMENT,
+    ATTENTION_RUNTIME_STATUS_ARTIFACT_ONLY,
     ATTENTION_RUNTIME_STATUS_DEFERRED,
+    ATTENTION_RUNTIME_STATUS_RUNTIME_RESOLVED,
     ATTENTION_TARGET_CONTRACTS,
-    classify_wrapper_sdpa_attention,
+    wrapper_sdpa_attention_report_fields,
 )
 from .inductor import (
     InductorKernel,
@@ -61,6 +76,48 @@ from .reporting import (
     make_report_status,
     write_capability_report,
 )
+from .vision import (
+    M11_GRID_FAMILIES,
+    M11_GRID2D_ARTIFACT_READY,
+    M11_GRID2D_IMPLEMENTATION_KIND_NATIVE_TVM,
+    M11_GRID2D_PROVIDER_NATIVE_TVM,
+    M11_GRID2D_READINESS_VERSION,
+    M11_GRID2D_RUNTIME_READY,
+    M11_GRID_REPORT_FIELDS,
+    M11_GRID_TAXONOMY_VERSION,
+    VISION_CONTRACT_CONV2D_NCHW_STATIC,
+    VISION_CONTRACT_POINTWISE_GRID2D_STATIC,
+    VISION_CONTRACT_VERSION,
+    VISION_EXTERN_PACKED_FUNC,
+    VISION_EXTERN_SYMBOL,
+    VISION_IMPLEMENTATION_KIND_EXTERN_CONV2D,
+    VISION_M11_4_INTERFACE_STATUS,
+    VISION_M11_4_VIT_PATCH_DILATION,
+    VISION_M11_4_VIT_PATCH_INPUT_SHAPE,
+    VISION_M11_4_VIT_PATCH_OUTPUT_SHAPE,
+    VISION_M11_4_VIT_PATCH_PADDING,
+    VISION_M11_4_VIT_PATCH_STRIDE,
+    VISION_M11_4_VIT_PATCH_WEIGHT_SHAPE,
+    VISION_M11_5_CORPUS_DIFF_BASELINE_ID,
+    VISION_M11_5_HARDENING_STATUS,
+    VISION_M11_5_RUNTIME_SCOPE_STATUS,
+    VISION_M11_6_CORPUS_DIFF_BASELINE_ID,
+    VISION_M11_6_INTERFACE_STATUS,
+    VISION_M11_6_RUNTIME_SCOPE_STATUS,
+    VISION_PROVIDER_NONE,
+    VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    VISION_REPORT_FIELDS,
+    VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+    VISION_RUNTIME_KIND_ARTIFACT_ONLY,
+    VISION_RUNTIME_KIND_PROVIDER,
+    VISION_RUNTIME_REPLACEMENT,
+    VISION_RUNTIME_PROVIDER_SCOPE_REASON,
+    VISION_RUNTIME_STATUS_ARTIFACT_ONLY,
+    VISION_RUNTIME_STATUS_RUNTIME_RESOLVED,
+    VISION_SEMANTICS_STATUS_ACCEPTED,
+    classify_m11_captured_grid_record,
+    wrapper_conv2d_vision_report_fields,
+)
 
 
 MODEL_CORPUS = "m6_model_corpus"
@@ -69,6 +126,7 @@ PRE_M7_BUILDER_DECISION = "keep_tvmscript_source_builder_for_m7_entry"
 PRE_M8_TAXONOMY_VERSION = 1
 PRE_M9_TAXONOMY_VERSION = 1
 PRE_M10_TAXONOMY_VERSION = 1
+PRE_M11_TAXONOMY_VERSION = 1
 _PRE_M7_READER_CLASSES = (
     "pointwise",
     "broadcast_view_index",
@@ -106,6 +164,8 @@ class TritonTVMModelAuditConfig:
     target: str = "cuda"
     min_models: int = 1
     extern_gemm_runtime_provider: str = EXTERN_GEMM_PROVIDER_NONE
+    attention_runtime_provider: str = ATTENTION_PROVIDER_NONE
+    vision_runtime_provider: str = VISION_PROVIDER_NONE
 
 
 @dataclass(frozen=True)
@@ -226,6 +286,17 @@ def build_model_corpus_report(
         extern_records,
     )
     report["pre_m10"] = _pre_m10_report_section(extern_records)
+    report["m10"] = _m10_attention_runtime_section(extern_records)
+    report["pre_m11"] = _pre_m11_report_section(
+        normalized_kernels,
+        normalized_models,
+        extern_records,
+    )
+    report["m11"] = _m11_vision_runtime_section(
+        extern_records,
+        normalized_models,
+        normalized_kernels,
+    )
     report["extern_ops"] = extern_records
     report["full_tvm_runnable"] = (
         bool(normalized_models)
@@ -290,6 +361,62 @@ def diff_capability_reports(before: dict[str, Any], after: dict[str, Any]) -> di
             (after.get("pre_m9") or {}).get("m9_materialized_artifact_candidates", [])
         )
         - len((before.get("pre_m9") or {}).get("m9_materialized_artifact_candidates", [])),
+        "m11_vision_delta": _m11_vision_diff_delta(before, after),
+    }
+
+
+def _m11_vision_diff_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    before_m11 = before.get("m11") or {}
+    after_m11 = after.get("m11") or {}
+    before_grid = before_m11.get("captured_grid_taxonomy") or {}
+    after_grid = after_m11.get("captured_grid_taxonomy") or {}
+    numeric_fields = (
+        "observed_convolution_call_count",
+        "artifact_count",
+        "artifact_only_count",
+        "runtime_resolved_count",
+        "runtime_launch_count",
+        "artifact_call_count",
+        "total_io_bytes",
+        "host_staging_bytes",
+        "total_accounted_bytes",
+        "model_full_tvm_runnable_after_m11_5_gate",
+        "model_full_tvm_runnable_after_m11_6_gate",
+    )
+    return {
+        field: int(after_m11.get(field, 0) or 0) - int(before_m11.get(field, 0) or 0)
+        for field in numeric_fields
+    } | {
+        "status_delta": _counter_delta(
+            Counter(before_m11.get("status_counts", {})),
+            Counter(after_m11.get("status_counts", {})),
+        ),
+        "provider_delta": _counter_delta(
+            Counter(before_m11.get("provider_counts", {})),
+            Counter(after_m11.get("provider_counts", {})),
+        ),
+        "contract_delta": _counter_delta(
+            Counter(before_m11.get("contract_counts", {})),
+            Counter(after_m11.get("contract_counts", {})),
+        ),
+        "grid_family_delta": _counter_delta(
+            Counter(before_grid.get("family_counts", {})),
+            Counter(after_grid.get("family_counts", {})),
+        ),
+        "grid_kernel_delta": int(after_grid.get("kernel_count", 0) or 0)
+        - int(before_grid.get("kernel_count", 0) or 0),
+        "grid2d_native_runtime_ready_delta": int(
+            (after_m11.get("captured_grid_readiness") or {}).get(
+                "native_runtime_ready_count", 0
+            )
+            or 0
+        )
+        - int(
+            (before_m11.get("captured_grid_readiness") or {}).get(
+                "native_runtime_ready_count", 0
+            )
+            or 0
+        ),
     }
 
 
@@ -306,6 +433,20 @@ def main(argv: list[str] | None = None) -> int:
         choices=[EXTERN_GEMM_PROVIDER_NONE, EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED],
         default=EXTERN_GEMM_PROVIDER_NONE,
     )
+    parser.add_argument(
+        "--attention-runtime-provider",
+        choices=[
+            ATTENTION_PROVIDER_NONE,
+            ATTENTION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+            ATTENTION_PROVIDER_NATIVE_DECOMPOSED,
+        ],
+        default=ATTENTION_PROVIDER_NONE,
+    )
+    parser.add_argument(
+        "--vision-runtime-provider",
+        choices=[VISION_PROVIDER_NONE, VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED],
+        default=VISION_PROVIDER_NONE,
+    )
     args = parser.parse_args(argv)
 
     if not args.builtin_model_corpus:
@@ -318,6 +459,8 @@ def main(argv: list[str] | None = None) -> int:
             contract=args.contract,
             min_models=args.min_models,
             extern_gemm_runtime_provider=args.extern_gemm_runtime_provider,
+            attention_runtime_provider=args.attention_runtime_provider,
+            vision_runtime_provider=args.vision_runtime_provider,
         ),
     )
     print(
@@ -361,12 +504,14 @@ def _run_one_model_case(
         wrapper_path.write_text(wrapper_source, encoding="utf-8")
         model_record["wrapper_paths"].append(str(wrapper_path))
         model_record["extern_calls"].extend(
-            _extern_call_to_record(call, case)
+            _extern_call_to_record(call, case, cfg)
             for call in extract_inductor_wrapper_extern_calls(
                 wrapper_source,
                 case_name=case.case_name,
                 wrapper_path=str(wrapper_path),
                 extern_gemm_runtime_provider=cfg.extern_gemm_runtime_provider,
+                attention_runtime_provider=cfg.attention_runtime_provider,
+                vision_runtime_provider=cfg.vision_runtime_provider,
             )
         )
         sources.extend(
@@ -652,10 +797,17 @@ def _normalize_model_kernel_record(record: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("size_hints", {})
     normalized.setdefault("blocker_class", _blocker_class(normalized))
     normalized.setdefault("pre_m8_family", _pre_m8_family(normalized))
+    for field, value in classify_m11_captured_grid_record(normalized).items():
+        normalized.setdefault(field, value)
     return normalized
 
 
-def _extern_call_to_record(call, case: TritonTVMModelAuditCase) -> dict[str, Any]:
+def _extern_call_to_record(
+    call,
+    case: TritonTVMModelAuditCase,
+    cfg: TritonTVMModelAuditConfig | None = None,
+) -> dict[str, Any]:
+    cfg = cfg or TritonTVMModelAuditConfig()
     record = {
         "model_family": case.model_family,
         "model_case": case.case_name,
@@ -674,16 +826,33 @@ def _extern_call_to_record(call, case: TritonTVMModelAuditCase) -> dict[str, Any
             field_name,
             _extern_attention_default(field_name),
         )
+    for field_name in _EXTERN_VISION_FIELDS:
+        record[field_name] = getattr(call, field_name, _extern_vision_default(field_name))
     if record["op_family"] == "deferred_attention":
         record.update(
-            classify_wrapper_sdpa_attention(
+            wrapper_sdpa_attention_report_fields(
                 op_name=record["op_name"],
                 op_family=record["op_family"],
                 source=record["source"],
                 model_family=case.model_family,
                 model_case=case.case_name,
                 case_name=case.case_name,
-            ).as_report_fields()
+                attention_runtime_provider=cfg.attention_runtime_provider,
+            )
+        )
+    if record["op_family"] == "deferred_convolution" and not record.get(
+        "vision_semantics_status"
+    ):
+        record.update(
+            wrapper_conv2d_vision_report_fields(
+                op_name=record["op_name"],
+                op_family=record["op_family"],
+                source=record["source"],
+                line_no=int(record.get("line_no", 0) or 0),
+                model_case=case.case_name,
+                case_name=case.case_name,
+                vision_runtime_provider=cfg.vision_runtime_provider,
+            )
         )
     return record
 
@@ -706,15 +875,37 @@ def _normalize_extern_call_record(
         normalized.setdefault(field_name, _extern_matmul_default(field_name))
     for field_name in _EXTERN_ATTENTION_FIELDS:
         normalized.setdefault(field_name, _extern_attention_default(field_name))
+    for field_name in _EXTERN_VISION_FIELDS:
+        normalized.setdefault(field_name, _extern_vision_default(field_name))
     if normalized.get("op_family") == "deferred_attention":
-        classification = classify_wrapper_sdpa_attention(
+        classification = wrapper_sdpa_attention_report_fields(
             op_name=str(normalized.get("op_name", "")),
             op_family=str(normalized.get("op_family", "")),
             source=str(normalized.get("source", "")),
             model_family=str(normalized.get("model_family", "")),
             model_case=str(normalized.get("model_case", "")),
             case_name=str(normalized.get("case_name", "")),
-        ).as_report_fields()
+        )
+        for field_name, value in classification.items():
+            if (
+                field_name == "unsupported_attention_runtime_reason"
+                and str(normalized.get("attention_runtime_status", ""))
+                == ATTENTION_RUNTIME_STATUS_RUNTIME_RESOLVED
+            ):
+                continue
+            if not normalized.get(field_name):
+                normalized[field_name] = value
+    if normalized.get("op_family") == "deferred_convolution" and not normalized.get(
+        "vision_semantics_status"
+    ):
+        classification = wrapper_conv2d_vision_report_fields(
+            op_name=str(normalized.get("op_name", "")),
+            op_family=str(normalized.get("op_family", "")),
+            source=str(normalized.get("source", "")),
+            line_no=int(normalized.get("line_no", 0) or 0),
+            model_case=str(normalized.get("model_case", "")),
+            case_name=str(normalized.get("case_name", "")),
+        )
         for field_name, value in classification.items():
             if not normalized.get(field_name):
                 normalized[field_name] = value
@@ -770,6 +961,7 @@ _EXTERN_MATMUL_FIELDS = (
 )
 
 _EXTERN_ATTENTION_FIELDS = ATTENTION_REPORT_FIELDS
+_EXTERN_VISION_FIELDS = VISION_REPORT_FIELDS
 
 
 def _extern_matmul_default(field_name: str) -> Any:
@@ -793,9 +985,52 @@ def _extern_matmul_default(field_name: str) -> Any:
 
 
 def _extern_attention_default(field_name: str) -> Any:
-    if field_name == "attention_abi_version":
+    if field_name in {"attention_abi_version", "attention_provider_abi_version"}:
         return 0
-    if field_name == "attention_causal":
+    if field_name in {
+        "attention_runtime_launch_count",
+        "attention_artifact_call_count",
+        "attention_qkv_bytes",
+        "attention_mask_bytes",
+        "attention_output_bytes",
+        "attention_total_io_bytes",
+        "attention_intermediate_buffer_bytes",
+        "attention_host_staging_bytes",
+        "attention_total_accounted_bytes",
+    }:
+        return 0
+    if field_name in {
+        "attention_causal",
+        "attention_runtime_replacement_available",
+        "attention_performance_claim",
+        "attention_uses_host_staging",
+    }:
+        return False
+    if field_name == "attention_scale":
+        return None
+    return ""
+
+
+def _extern_vision_default(field_name: str) -> Any:
+    if field_name in {
+        "vision_groups",
+        "vision_provider_abi_version",
+        "vision_runtime_launch_count",
+        "vision_artifact_call_count",
+        "vision_input_bytes",
+        "vision_weight_bytes",
+        "vision_output_bytes",
+        "vision_total_io_bytes",
+        "vision_host_staging_bytes",
+        "vision_total_accounted_bytes",
+    }:
+        return 0
+    if field_name in {
+        "vision_transposed",
+        "vision_runtime_replacement_available",
+        "vision_performance_claim",
+        "vision_uses_host_staging",
+    }:
         return False
     return ""
 
@@ -1288,6 +1523,1118 @@ def _pre_m10_entry_from_attention_contract(
     }
 
 
+def _m10_attention_runtime_section(extern_records: list[dict[str, Any]]) -> dict[str, Any]:
+    attention_records = [
+        record
+        for record in extern_records
+        if str(record.get("op_family", "")) == "deferred_attention"
+    ]
+    artifact_only_records = [
+        record for record in attention_records if _is_materialized_attention_artifact(record)
+    ]
+    runtime_resolved = [
+        record for record in attention_records if _is_runtime_resolved_attention_record(record)
+    ]
+    artifact_records = artifact_only_records + runtime_resolved
+    status_counts = Counter(
+        str(record.get("attention_runtime_status", ""))
+        or ATTENTION_RUNTIME_STATUS_DEFERRED
+        for record in attention_records
+    )
+    provider_counts = Counter(
+        str(record.get("attention_provider_kind", "")) or ATTENTION_PROVIDER_NONE
+        for record in attention_records
+    )
+    unsupported_runtime_reasons = Counter(
+        str(record.get("unsupported_attention_runtime_reason", ""))
+        for record in attention_records
+        if str(record.get("unsupported_attention_runtime_reason", ""))
+    )
+    total_runtime_launches = sum(
+        int(record.get("attention_runtime_launch_count", 0) or 0)
+        for record in attention_records
+    )
+    total_artifact_calls = sum(
+        int(record.get("attention_artifact_call_count", 0) or 0)
+        for record in attention_records
+    )
+    total_io_bytes = sum(
+        int(record.get("attention_total_io_bytes", 0) or 0)
+        for record in attention_records
+    )
+    total_intermediate_bytes = sum(
+        int(record.get("attention_intermediate_buffer_bytes", 0) or 0)
+        for record in attention_records
+    )
+    total_host_staging_bytes = sum(
+        int(record.get("attention_host_staging_bytes", 0) or 0)
+        for record in attention_records
+    )
+    total_accounted_bytes = sum(
+        int(record.get("attention_total_accounted_bytes", 0) or 0)
+        for record in attention_records
+    )
+    return {
+        "taxonomy_version": 1,
+        "provider_policy": "opt_in_correctness_only",
+        "performance_claim": False,
+        "hardening_status": "m10_runtime_hardened_v1",
+        "rope_runtime_policy": "deferred_explicit",
+        "kv_cache_runtime_policy": "deferred_explicit",
+        "decode_runtime_policy": "synthetic_report_only",
+        "artifact_count": len(artifact_records),
+        "artifact_only_count": len(artifact_only_records),
+        "runtime_resolved_count": len(runtime_resolved),
+        "runtime_launch_count": total_runtime_launches,
+        "artifact_call_count": total_artifact_calls,
+        "total_io_bytes": total_io_bytes,
+        "intermediate_buffer_bytes": total_intermediate_bytes,
+        "host_staging_bytes": total_host_staging_bytes,
+        "total_accounted_bytes": total_accounted_bytes,
+        "status_counts": dict(sorted(status_counts.items())),
+        "provider_counts": dict(sorted(provider_counts.items())),
+        "unsupported_runtime_reasons": dict(sorted(unsupported_runtime_reasons.items())),
+        "runtime_resolved_records": [
+            {
+                "model_case": record.get("model_case", ""),
+                "op_name": record.get("op_name", ""),
+                "line_no": int(record.get("line_no", 0) or 0),
+                "attention_contract": record.get("attention_contract", ""),
+                "attention_provider_kind": record.get("attention_provider_kind", ""),
+                "attention_provider_abi_version": record.get(
+                    "attention_provider_abi_version",
+                ),
+                "attention_runtime_claim": record.get("attention_runtime_claim", ""),
+                "attention_performance_claim": bool(
+                    record.get("attention_performance_claim", False)
+                ),
+                "attention_uses_host_staging": bool(
+                    record.get("attention_uses_host_staging", False)
+                ),
+                "attention_phase": record.get("attention_phase", ""),
+                "attention_mask_kind": record.get("attention_mask_kind", ""),
+                "attention_q_shape": record.get("attention_q_shape", ""),
+                "attention_mask_shape": record.get("attention_mask_shape", ""),
+                "attention_scale": record.get("attention_scale"),
+                "attention_runtime_launch_count": int(
+                    record.get("attention_runtime_launch_count", 0) or 0
+                ),
+                "attention_total_io_bytes": int(
+                    record.get("attention_total_io_bytes", 0) or 0
+                ),
+                "attention_intermediate_buffer_bytes": int(
+                    record.get("attention_intermediate_buffer_bytes", 0) or 0
+                ),
+                "attention_host_staging_bytes": int(
+                    record.get("attention_host_staging_bytes", 0) or 0
+                ),
+                "attention_total_accounted_bytes": int(
+                    record.get("attention_total_accounted_bytes", 0) or 0
+                ),
+            }
+            for record in runtime_resolved
+        ],
+    }
+
+
+def _m11_vision_runtime_section(
+    extern_records: list[dict[str, Any]],
+    model_records: list[dict[str, Any]],
+    kernel_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    conv_records = [
+        record
+        for record in extern_records
+        if str(record.get("op_family", "")) == "deferred_convolution"
+    ]
+    materialized_records = [
+        record for record in conv_records if _is_materialized_vision_conv_record(record)
+    ]
+    artifact_only_records = [
+        record for record in conv_records if _is_materialized_vision_conv_artifact(record)
+    ]
+    runtime_resolved = [
+        record for record in conv_records if _is_runtime_resolved_vision_record(record)
+    ]
+    status_counts = Counter(
+        str(record.get("vision_runtime_status", "")) or "unsupported"
+        for record in conv_records
+    )
+    contract_counts = Counter(
+        str(record.get("vision_contract", "")) or "vision_unclassified"
+        for record in conv_records
+    )
+    semantics_status_counts = Counter(
+        str(record.get("vision_semantics_status", "")) or "vision_semantics_unclassified"
+        for record in conv_records
+    )
+    layout_counts = Counter(
+        str(record.get("vision_layout", "")) or "unknown"
+        for record in conv_records
+    )
+    unsupported_reasons = Counter(
+        str(record.get("unsupported_vision_reason", ""))
+        for record in conv_records
+        if str(record.get("unsupported_vision_reason", ""))
+    )
+    unsupported_runtime_reasons = Counter(
+        str(record.get("unsupported_vision_runtime_reason", ""))
+        for record in conv_records
+        if str(record.get("unsupported_vision_runtime_reason", ""))
+    )
+    provider_counts = Counter(
+        str(record.get("vision_provider_kind", "")) or VISION_PROVIDER_NONE
+        for record in conv_records
+    )
+    runnable_models = sum(1 for record in model_records if record.get("full_tvm_runnable"))
+    runtime_launch_count = sum(
+        int(record.get("vision_runtime_launch_count", 0) or 0)
+        for record in conv_records
+    )
+    artifact_call_count = sum(
+        int(record.get("vision_artifact_call_count", 0) or 0)
+        for record in conv_records
+    )
+    provider_enabled = any(
+        str(record.get("vision_provider_kind", "")) == VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED
+        for record in runtime_resolved
+    )
+    hardening = _m11_vision_hardening_section(
+        conv_records,
+        materialized_records,
+        artifact_only_records,
+        runtime_resolved,
+        model_records,
+        kernel_records,
+        provider_enabled=provider_enabled,
+    )
+    grid_readiness = _m11_grid2d_readiness_section(kernel_records)
+    model_smoke = _m11_runtime_resolved_model_smoke_section(
+        model_records,
+        kernel_records,
+        extern_records,
+    )
+    m11_6_enabled = provider_enabled or int(grid_readiness.get("native_runtime_ready_count", 0))
+    return {
+        "taxonomy_version": 1,
+        "interface_status": (
+            VISION_M11_6_INTERFACE_STATUS
+            if m11_6_enabled
+            else M11_GRID_TAXONOMY_VERSION
+        ),
+        "convolution_interface_status": "m11_2_artifact_only_convolution_boundary_v1",
+        "runtime_interface_status": (
+            VISION_M11_6_INTERFACE_STATUS if m11_6_enabled else ""
+        ),
+        "hardening_status": VISION_M11_5_HARDENING_STATUS if provider_enabled else "",
+        "runtime_scope_status": VISION_M11_6_RUNTIME_SCOPE_STATUS if provider_enabled else "",
+        "provider_policy": (
+            "opt_in_python_torch_host_staged_correctness_only"
+            if provider_enabled
+            else "artifact_only_no_runtime_provider"
+        ),
+        "performance_claim": False,
+        "vision_contract_version": VISION_CONTRACT_VERSION,
+        "detail_fields": list(VISION_REPORT_FIELDS) + list(M11_GRID_REPORT_FIELDS),
+        "observed_convolution_call_count": len(conv_records),
+        "artifact_count": len(materialized_records),
+        "artifact_only_count": len(artifact_only_records),
+        "runtime_resolved_count": len(runtime_resolved),
+        "runtime_launch_count": runtime_launch_count,
+        "artifact_call_count": artifact_call_count,
+        "provider_counts": dict(sorted(provider_counts.items())),
+        "total_io_bytes": sum(
+            int(record.get("vision_total_io_bytes", 0) or 0) for record in conv_records
+        ),
+        "host_staging_bytes": sum(
+            int(record.get("vision_host_staging_bytes", 0) or 0)
+            for record in conv_records
+        ),
+        "total_accounted_bytes": sum(
+            int(record.get("vision_total_accounted_bytes", 0) or 0)
+            for record in conv_records
+        ),
+        "status_counts": dict(sorted(status_counts.items())),
+        "contract_counts": dict(sorted(contract_counts.items())),
+        "semantics_status_counts": dict(sorted(semantics_status_counts.items())),
+        "layout_counts": dict(sorted(layout_counts.items())),
+        "unsupported_reasons": dict(sorted(unsupported_reasons.items())),
+        "unsupported_runtime_reasons": dict(sorted(unsupported_runtime_reasons.items())),
+        "artifact_records": [
+            {
+                "model_case": record.get("model_case", ""),
+                "op_name": record.get("op_name", ""),
+                "line_no": int(record.get("line_no", 0) or 0),
+                "vision_contract": record.get("vision_contract", ""),
+                "vision_layout": record.get("vision_layout", ""),
+                "vision_input_shape": record.get("vision_input_shape", ""),
+                "vision_weight_shape": record.get("vision_weight_shape", ""),
+                "vision_output_shape": record.get("vision_output_shape", ""),
+                "vision_stride": record.get("vision_stride", ""),
+                "vision_padding": record.get("vision_padding", ""),
+                "vision_dilation": record.get("vision_dilation", ""),
+                "vision_groups": int(record.get("vision_groups", 0) or 0),
+                "vision_runtime_status": record.get("vision_runtime_status", ""),
+                "vision_performance_claim": bool(
+                    record.get("vision_performance_claim", False)
+                ),
+            }
+            for record in materialized_records
+        ],
+        "runtime_resolved_records": [
+            {
+                "model_case": record.get("model_case", ""),
+                "op_name": record.get("op_name", ""),
+                "line_no": int(record.get("line_no", 0) or 0),
+                "vision_contract": record.get("vision_contract", ""),
+                "vision_provider_kind": record.get("vision_provider_kind", ""),
+                "vision_provider_abi_version": int(
+                    record.get("vision_provider_abi_version", 0) or 0
+                ),
+                "vision_runtime_claim": record.get("vision_runtime_claim", ""),
+                "vision_performance_claim": bool(
+                    record.get("vision_performance_claim", False)
+                ),
+                "vision_uses_host_staging": bool(
+                    record.get("vision_uses_host_staging", False)
+                ),
+                "vision_runtime_launch_count": int(
+                    record.get("vision_runtime_launch_count", 0) or 0
+                ),
+                "vision_artifact_call_count": int(
+                    record.get("vision_artifact_call_count", 0) or 0
+                ),
+                "vision_input_bytes": int(record.get("vision_input_bytes", 0) or 0),
+                "vision_weight_bytes": int(record.get("vision_weight_bytes", 0) or 0),
+                "vision_output_bytes": int(record.get("vision_output_bytes", 0) or 0),
+                "vision_total_io_bytes": int(
+                    record.get("vision_total_io_bytes", 0) or 0
+                ),
+                "vision_host_staging_bytes": int(
+                    record.get("vision_host_staging_bytes", 0) or 0
+                ),
+                "vision_total_accounted_bytes": int(
+                    record.get("vision_total_accounted_bytes", 0) or 0
+                ),
+            }
+            for record in runtime_resolved
+        ],
+        "captured_grid_taxonomy": _m11_captured_grid_taxonomy_section(kernel_records),
+        "captured_grid_readiness": grid_readiness,
+        "m11_6_readiness": {
+            "status": VISION_M11_6_INTERFACE_STATUS if m11_6_enabled else "not_enabled",
+            "conv_runtime_target": {
+                "target_min_runtime_resolved": 10,
+                "observed_runtime_resolved": len(runtime_resolved),
+                "runtime_scope_status": (
+                    VISION_M11_6_RUNTIME_SCOPE_STATUS if provider_enabled else ""
+                ),
+                "provider_kind": (
+                    VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED
+                    if provider_enabled
+                    else VISION_PROVIDER_NONE
+                ),
+                "runtime_claim": (
+                    VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY if provider_enabled else ""
+                ),
+                "performance_claim": False,
+            },
+            "grid2d_target": {
+                "target_classified": 48,
+                "target_artifact_generated_min": 10,
+                "target_native_runtime_min": 5,
+                "classified_count": grid_readiness.get("classified_count", 0),
+                "artifact_ready_count": grid_readiness.get("artifact_ready_count", 0),
+                "native_runtime_ready_count": grid_readiness.get(
+                    "native_runtime_ready_count", 0
+                ),
+                "silent_fallback_count": grid_readiness.get("silent_fallback_count", 0),
+            },
+        },
+        "runtime_resolved_model_smoke": model_smoke["runtime_resolved_model_smoke"],
+        "runtime_resolved_model_provider_mix": model_smoke[
+            "runtime_resolved_model_provider_mix"
+        ],
+        "full_tvm_native_model": model_smoke["full_tvm_native_model"],
+        "full_tvm_runnable_model": runnable_models,
+        "report_cache_invariants": hardening["report_cache_invariants"],
+        "corpus_diff_guard": hardening["corpus_diff_guard"],
+        "m10_attention_boundary": hardening["m10_attention_boundary"],
+        "runtime_scope": hardening["runtime_scope"],
+        "model_full_tvm_runnable_after_m11_2_gate": runnable_models,
+        "model_full_tvm_runnable_after_m11_3_gate": runnable_models,
+        "model_full_tvm_runnable_after_m11_4_gate": runnable_models,
+        "model_full_tvm_runnable_after_m11_5_gate": runnable_models,
+        "model_full_tvm_runnable_after_m11_6_gate": runnable_models,
+    }
+
+
+def _m11_vision_hardening_section(
+    conv_records: list[dict[str, Any]],
+    materialized_records: list[dict[str, Any]],
+    artifact_only_records: list[dict[str, Any]],
+    runtime_resolved: list[dict[str, Any]],
+    model_records: list[dict[str, Any]],
+    kernel_records: list[dict[str, Any]],
+    *,
+    provider_enabled: bool,
+) -> dict[str, Any]:
+    attention_records = [
+        record
+        for record in _extern_records_from_models(model_records)
+        if str(record.get("op_family", "")) == "deferred_attention"
+    ]
+    runtime_attention = [
+        record for record in attention_records if _is_runtime_resolved_attention_record(record)
+    ]
+    runnable_models = sum(1 for record in model_records if record.get("full_tvm_runnable"))
+    failures = _m11_vision_hardening_failures(
+        conv_records,
+        materialized_records,
+        artifact_only_records,
+        runtime_resolved,
+        attention_records,
+        runtime_attention,
+        runnable_models,
+        provider_enabled=provider_enabled,
+    )
+    invariant_status = (
+        "passed"
+        if provider_enabled and not failures
+        else "failed"
+        if provider_enabled
+        else "not_applicable_no_vision_runtime_provider"
+    )
+    status_buckets = Counter(
+        str((record.get("translate_status") or {}).get("bucket", ""))
+        for record in kernel_records
+        if (record.get("translate_status") or {}).get("bucket", "")
+    )
+    translated_kernel_count = sum(
+        1 for record in kernel_records if (record.get("translate_status") or {}).get("ok")
+    )
+    captured_grid_count = sum(
+        1
+        for record in kernel_records
+        if str(record.get("m11_grid_status", "")) == "m11_grid_classified"
+    )
+    return {
+        "report_cache_invariants": {
+            "status": invariant_status,
+            "schema_version": 1,
+            "hardening_status": (
+                VISION_M11_5_HARDENING_STATUS if provider_enabled else ""
+            ),
+            "vision_report_fields_frozen": list(VISION_REPORT_FIELDS),
+            "m11_grid_report_fields_frozen": list(M11_GRID_REPORT_FIELDS),
+            "implicit_pytorch_fallback_allowed": False,
+            "runtime_provider_opt_in": provider_enabled,
+            "runtime_provider": (
+                VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED
+                if provider_enabled
+                else VISION_PROVIDER_NONE
+            ),
+            "artifact_call_count_matches_materialized": sum(
+                int(record.get("vision_artifact_call_count", 0) or 0)
+                for record in conv_records
+            )
+            == len(materialized_records),
+            "runtime_launch_count_matches_runtime_records": sum(
+                int(record.get("vision_runtime_launch_count", 0) or 0)
+                for record in conv_records
+            )
+            == len(runtime_resolved),
+            "runtime_provider_performance_claim": False,
+            "full_model_runnable_claim": False,
+            "invariant_failures": failures,
+        },
+        "corpus_diff_guard": {
+            "baseline_id": (
+                VISION_M11_6_CORPUS_DIFF_BASELINE_ID
+                if provider_enabled
+                else VISION_M11_5_CORPUS_DIFF_BASELINE_ID
+            ),
+            "baseline_status": "recorded" if provider_enabled else "not_applicable",
+            "schema_version": 1,
+            "status_buckets": dict(sorted(status_buckets.items())),
+            "captured_kernel_count": len(kernel_records),
+            "translated_kernel_count": translated_kernel_count,
+            "captured_grid_fallback_count": captured_grid_count,
+            "observed_convolution_call_count": len(conv_records),
+            "vision_artifact_count": len(materialized_records),
+            "vision_artifact_only_count": len(artifact_only_records),
+            "vision_runtime_resolved_count": len(runtime_resolved),
+            "vision_runtime_launch_count": sum(
+                int(record.get("vision_runtime_launch_count", 0) or 0)
+                for record in conv_records
+            ),
+            "vision_artifact_call_count": sum(
+                int(record.get("vision_artifact_call_count", 0) or 0)
+                for record in conv_records
+            ),
+            "runtime_resolved_attention_count": len(runtime_attention),
+            "full_tvm_runnable_models": runnable_models,
+        },
+        "m10_attention_boundary": {
+            "status": (
+                "m10_attention_boundary_closed"
+                if len(attention_records) == len(runtime_attention)
+                else "m10_attention_boundary_not_closed"
+            ),
+            "historical_deferred_attention_family_count": len(attention_records),
+            "runtime_resolved_attention_count": len(runtime_attention),
+            "runtime_deferred_attention_count": len(attention_records)
+            - len(runtime_attention),
+            "boundary_policy": "do_not_reopen_m10_attention_in_m11_5",
+        },
+        "runtime_scope": {
+            "status": VISION_M11_6_RUNTIME_SCOPE_STATUS if provider_enabled else "",
+            "provider": (
+                VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED
+                if provider_enabled
+                else VISION_PROVIDER_NONE
+            ),
+            "runtime_claim": (
+                VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY if provider_enabled else ""
+            ),
+            "performance_claim": False,
+            "supported_contracts": [
+                VISION_CONTRACT_CONV2D_NCHW_STATIC,
+                "conv2d_1x1_nchw_static_v1",
+            ],
+            "supported_batch": "N=1",
+            "supported_stride": "1, 2, or 16",
+            "supported_padding": "0 or 1",
+            "supported_dilation": "1, 1",
+            "supported_groups": 1,
+            "unsupported_runtime_reason_for_other_convs": (
+                VISION_RUNTIME_PROVIDER_SCOPE_REASON if provider_enabled else ""
+            ),
+            "observed_runtime_records": len(runtime_resolved),
+        },
+    }
+
+
+def _m11_vision_hardening_failures(
+    conv_records: list[dict[str, Any]],
+    materialized_records: list[dict[str, Any]],
+    artifact_only_records: list[dict[str, Any]],
+    runtime_resolved: list[dict[str, Any]],
+    attention_records: list[dict[str, Any]],
+    runtime_attention: list[dict[str, Any]],
+    runnable_models: int,
+    *,
+    provider_enabled: bool,
+) -> list[str]:
+    failures: list[str] = []
+    artifact_call_count = sum(
+        int(record.get("vision_artifact_call_count", 0) or 0) for record in conv_records
+    )
+    runtime_launch_count = sum(
+        int(record.get("vision_runtime_launch_count", 0) or 0) for record in conv_records
+    )
+    if artifact_call_count != len(materialized_records):
+        failures.append("vision_artifact_call_count_mismatch")
+    if runtime_launch_count != len(runtime_resolved):
+        failures.append("vision_runtime_launch_count_mismatch")
+    if runnable_models:
+        failures.append("m11_full_tvm_runnable_claim_not_allowed")
+    if len(attention_records) != len(runtime_attention):
+        failures.append("m10_attention_boundary_not_closed")
+
+    for record in runtime_resolved:
+        if not _m11_record_is_static_conv_runtime_scope(record):
+            failures.append("vision_runtime_scope_not_m11_6_static_conv2d")
+            break
+        if str(record.get("vision_provider_kind", "")) != VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED:
+            failures.append("vision_runtime_provider_kind_mismatch")
+            break
+        if str(record.get("vision_runtime_claim", "")) != VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY:
+            failures.append("vision_runtime_claim_not_correctness_only")
+            break
+        if bool(record.get("vision_performance_claim", False)):
+            failures.append("vision_runtime_performance_claim_not_allowed")
+            break
+        if not bool(record.get("vision_uses_host_staging", False)):
+            failures.append("vision_runtime_host_staging_not_recorded")
+            break
+        if not _m11_record_accounting_is_consistent(record, runtime_resolved=True):
+            failures.append("vision_runtime_byte_accounting_mismatch")
+            break
+
+    for record in artifact_only_records:
+        if str(record.get("vision_provider_kind", "") or VISION_PROVIDER_NONE) != VISION_PROVIDER_NONE:
+            failures.append("vision_artifact_only_provider_not_none")
+            break
+        if int(record.get("vision_runtime_launch_count", 0) or 0) != 0:
+            failures.append("vision_artifact_only_runtime_launch_not_zero")
+            break
+        if bool(record.get("vision_uses_host_staging", False)):
+            failures.append("vision_artifact_only_host_staging_not_allowed")
+            break
+        if bool(record.get("vision_performance_claim", False)):
+            failures.append("vision_artifact_only_performance_claim_not_allowed")
+            break
+        if provider_enabled and not str(record.get("unsupported_vision_runtime_reason", "")):
+            failures.append("vision_artifact_only_scope_reason_missing")
+            break
+        if not _m11_record_accounting_is_consistent(record, runtime_resolved=False):
+            failures.append("vision_artifact_only_byte_accounting_mismatch")
+            break
+    return sorted(set(failures))
+
+
+def _m11_record_is_static_conv_runtime_scope(record: dict[str, Any]) -> bool:
+    contract = str(record.get("vision_contract", ""))
+    stride = _m11_int_tuple_record(record, "vision_stride")
+    padding = _m11_int_tuple_record(record, "vision_padding")
+    dilation = _m11_int_tuple_record(record, "vision_dilation")
+    input_shape = _m11_int_tuple_record(record, "vision_input_shape")
+    weight_shape = _m11_int_tuple_record(record, "vision_weight_shape")
+    if (
+        len(input_shape) != 4
+        or len(weight_shape) != 4
+        or input_shape[0] != 1
+        or int(record.get("vision_groups", 0) or 0) != 1
+        or str(record.get("vision_bias_policy", "")) != "none"
+        or bool(record.get("vision_transposed", False))
+        or _m11_int_tuple_record(record, "vision_output_padding") != (0, 0)
+        or dilation != (1, 1)
+    ):
+        return False
+    if contract == "conv2d_1x1_nchw_static_v1":
+        return weight_shape[2:] == (1, 1) and stride == (1, 1) and padding == (0, 0)
+    if contract != VISION_CONTRACT_CONV2D_NCHW_STATIC:
+        return False
+    if len(stride) != 2 or len(padding) != 2:
+        return False
+    return stride[0] == stride[1] and padding[0] == padding[1] and stride[0] in {
+        1,
+        2,
+        16,
+    } and padding[0] in {0, 1}
+
+
+def _m11_record_accounting_is_consistent(
+    record: dict[str, Any],
+    *,
+    runtime_resolved: bool,
+) -> bool:
+    input_shape = _m11_int_tuple_record(record, "vision_input_shape")
+    weight_shape = _m11_int_tuple_record(record, "vision_weight_shape")
+    output_shape = _m11_int_tuple_record(record, "vision_output_shape")
+    if not input_shape or not weight_shape or not output_shape:
+        return False
+    input_bytes = _m11_numel(input_shape) * 4
+    weight_bytes = _m11_numel(weight_shape) * 4
+    output_bytes = _m11_numel(output_shape) * 4
+    total_io_bytes = input_bytes + weight_bytes + output_bytes
+    host_staging_bytes = total_io_bytes if runtime_resolved else 0
+    return (
+        int(record.get("vision_input_bytes", 0) or 0) == input_bytes
+        and int(record.get("vision_weight_bytes", 0) or 0) == weight_bytes
+        and int(record.get("vision_output_bytes", 0) or 0) == output_bytes
+        and int(record.get("vision_total_io_bytes", 0) or 0) == total_io_bytes
+        and int(record.get("vision_host_staging_bytes", 0) or 0) == host_staging_bytes
+        and int(record.get("vision_total_accounted_bytes", 0) or 0)
+        == total_io_bytes + host_staging_bytes
+    )
+
+
+def _m11_int_tuple_record(record: dict[str, Any], field: str) -> tuple[int, ...]:
+    value = record.get(field, "")
+    if isinstance(value, (tuple, list)):
+        return tuple(int(item) for item in value)
+    text = str(value).strip()
+    if not text:
+        return ()
+    return tuple(int(part.strip()) for part in text.split(",") if part.strip())
+
+
+def _m11_tuple_text(values: tuple[int, ...]) -> str:
+    return ", ".join(str(value) for value in values)
+
+
+def _m11_numel(shape: tuple[int, ...]) -> int:
+    result = 1
+    for value in shape:
+        result *= int(value)
+    return result
+
+
+def _m11_captured_grid_taxonomy_section(
+    kernel_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    grid_records = [
+        record
+        for record in kernel_records
+        if str(record.get("m11_grid_status", "")) == "m11_grid_classified"
+    ]
+    family_counts = Counter(str(record.get("m11_grid_family", "")) for record in grid_records)
+    grid_type_counts = Counter(
+        str(record.get("m11_grid_launch_kind", "")) or "unknown"
+        for record in grid_records
+    )
+    model_counts = Counter(str(record.get("model_case", "")) for record in grid_records)
+    operator_tag_counts: Counter[str] = Counter()
+    for record in grid_records:
+        operator_tag_counts.update(
+            tag.strip()
+            for tag in str(record.get("m11_grid_operator_tags", "")).split(",")
+            if tag.strip()
+        )
+    artifact_ready_count = sum(
+        1
+        for record in grid_records
+        if str(record.get("m11_grid_artifact_status", "")) == M11_GRID2D_ARTIFACT_READY
+    )
+    native_runtime_ready_count = sum(
+        1
+        for record in grid_records
+        if str(record.get("m11_grid_runtime_status", "")) == M11_GRID2D_RUNTIME_READY
+    )
+    performance_claim_count = sum(
+        1 for record in grid_records if bool(record.get("m11_grid_performance_claim", False))
+    )
+    unsupported_runtime_reasons = Counter(
+        str(record.get("unsupported_m11_grid_runtime_reason", ""))
+        for record in grid_records
+        if str(record.get("unsupported_m11_grid_runtime_reason", ""))
+    )
+
+    family_counts_with_zeros = {
+        family: int(family_counts.get(family, 0)) for family in M11_GRID_FAMILIES
+    }
+    return {
+        "taxonomy_version": M11_GRID_TAXONOMY_VERSION,
+        "status": "m11_6_captured_grid2d_readiness_classified_v1"
+        if grid_records
+        else "m11_3_captured_grid_taxonomy_classified_v1",
+        "readiness_version": M11_GRID2D_READINESS_VERSION,
+        "detail_fields": list(M11_GRID_REPORT_FIELDS),
+        "kernel_count": len(grid_records),
+        "artifact_ready_count": artifact_ready_count,
+        "native_runtime_ready_count": native_runtime_ready_count,
+        "performance_claim_count": performance_claim_count,
+        "silent_fallback_count": 0,
+        "unsupported_runtime_reasons": dict(sorted(unsupported_runtime_reasons.items())),
+        "family_counts": family_counts_with_zeros,
+        "grid_type_counts": dict(sorted(grid_type_counts.items())),
+        "model_counts": dict(sorted(model_counts.items())),
+        "operator_tag_counts": dict(sorted(operator_tag_counts.items())),
+        "record_sample_limit": 16,
+        "records": [
+            {
+                "model_case": record.get("model_case", ""),
+                "kernel_name": record.get("kernel_name", ""),
+                "m11_grid_family": record.get("m11_grid_family", ""),
+                "m11_grid_launch_kind": record.get("m11_grid_launch_kind", ""),
+                "m11_grid_program_axes": record.get("m11_grid_program_axes", ""),
+                "m11_grid_size_hints": record.get("m11_grid_size_hints", ""),
+                "m11_grid_operator_tags": record.get("m11_grid_operator_tags", ""),
+                "m11_grid_contract": record.get("m11_grid_contract", ""),
+                "m11_grid_artifact_status": record.get("m11_grid_artifact_status", ""),
+                "m11_grid_runtime_status": record.get("m11_grid_runtime_status", ""),
+                "m11_grid_implementation_kind": record.get(
+                    "m11_grid_implementation_kind", ""
+                ),
+                "unsupported_m11_grid_reason": record.get(
+                    "unsupported_m11_grid_reason", ""
+                ),
+                "unsupported_m11_grid_runtime_reason": record.get(
+                    "unsupported_m11_grid_runtime_reason", ""
+                ),
+            }
+            for record in grid_records[:16]
+        ],
+    }
+
+
+def _m11_grid2d_readiness_section(kernel_records: list[dict[str, Any]]) -> dict[str, Any]:
+    grid_records = [
+        record
+        for record in kernel_records
+        if str(record.get("m11_grid_status", "")) == "m11_grid_classified"
+    ]
+    artifact_ready = [
+        record
+        for record in grid_records
+        if str(record.get("m11_grid_artifact_status", "")) == M11_GRID2D_ARTIFACT_READY
+    ]
+    native_ready = [
+        record
+        for record in grid_records
+        if str(record.get("m11_grid_runtime_status", "")) == M11_GRID2D_RUNTIME_READY
+    ]
+    unsupported_reasons = Counter(
+        str(record.get("unsupported_m11_grid_runtime_reason", ""))
+        for record in grid_records
+        if str(record.get("unsupported_m11_grid_runtime_reason", ""))
+    )
+    return {
+        "status": M11_GRID2D_READINESS_VERSION if grid_records else "not_applicable",
+        "contract": VISION_CONTRACT_POINTWISE_GRID2D_STATIC,
+        "implementation_kind": M11_GRID2D_IMPLEMENTATION_KIND_NATIVE_TVM,
+        "provider_kind": M11_GRID2D_PROVIDER_NATIVE_TVM,
+        "classified_count": len(grid_records),
+        "artifact_ready_count": len(artifact_ready),
+        "native_runtime_ready_count": len(native_ready),
+        "runtime_launch_count": sum(
+            int(record.get("m11_grid_runtime_launch_count", 0) or 0)
+            for record in native_ready
+        ),
+        "artifact_call_count": sum(
+            int(record.get("m11_grid_artifact_call_count", 0) or 0)
+            for record in artifact_ready
+        ),
+        "host_staging_bytes": sum(
+            int(record.get("m11_grid_host_staging_bytes", 0) or 0)
+            for record in native_ready
+        ),
+        "performance_claim_count": sum(
+            1 for record in native_ready if bool(record.get("m11_grid_performance_claim", False))
+        ),
+        "silent_fallback_count": 0,
+        "unsupported_runtime_count": len(grid_records) - len(native_ready),
+        "unsupported_runtime_reasons": dict(sorted(unsupported_reasons.items())),
+        "family_counts": dict(
+            sorted(Counter(str(record.get("m11_grid_family", "")) for record in grid_records).items())
+        ),
+        "records": [
+            {
+                "model_case": record.get("model_case", ""),
+                "kernel_name": record.get("kernel_name", ""),
+                "m11_grid_family": record.get("m11_grid_family", ""),
+                "m11_grid_size_hints": record.get("m11_grid_size_hints", ""),
+                "m11_grid_artifact_status": record.get("m11_grid_artifact_status", ""),
+                "m11_grid_runtime_status": record.get("m11_grid_runtime_status", ""),
+                "m11_grid_implementation_kind": record.get(
+                    "m11_grid_implementation_kind", ""
+                ),
+                "unsupported_m11_grid_runtime_reason": record.get(
+                    "unsupported_m11_grid_runtime_reason", ""
+                ),
+            }
+            for record in grid_records[:16]
+        ],
+    }
+
+
+def _m11_runtime_resolved_model_smoke_section(
+    model_records: list[dict[str, Any]],
+    kernel_records: list[dict[str, Any]],
+    extern_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    kernels_by_model: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in kernel_records:
+        kernels_by_model[str(record.get("model_case", ""))].append(record)
+    extern_by_model: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in extern_records:
+        extern_by_model[str(record.get("model_case", ""))].append(record)
+
+    records: list[dict[str, Any]] = []
+    provider_mix: dict[str, dict[str, int]] = {}
+    for model in model_records:
+        model_case = str(model.get("model_case", ""))
+        model_family = str(model.get("model_family", ""))
+        kernels = kernels_by_model.get(model_case, [])
+        externs = extern_by_model.get(model_case, [])
+        translated = sum(1 for record in kernels if (record.get("translate_status") or {}).get("ok"))
+        grid_ready = sum(
+            1
+            for record in kernels
+            if str(record.get("m11_grid_runtime_status", "")) == M11_GRID2D_RUNTIME_READY
+        )
+        grid_unsupported = sum(
+            1
+            for record in kernels
+            if str(record.get("m11_grid_status", "")) == "m11_grid_classified"
+            and str(record.get("m11_grid_runtime_status", "")) != M11_GRID2D_RUNTIME_READY
+        )
+        conv_records = [
+            record for record in externs if str(record.get("op_family", "")) == "deferred_convolution"
+        ]
+        conv_runtime = sum(1 for record in conv_records if _is_runtime_resolved_vision_record(record))
+        conv_artifact = sum(1 for record in conv_records if _is_materialized_vision_conv_artifact(record))
+        attention_records = [
+            record for record in externs if str(record.get("op_family", "")) == "deferred_attention"
+        ]
+        attention_runtime = sum(
+            1 for record in attention_records if _is_runtime_resolved_attention_record(record)
+        )
+        attention_deferred = len(attention_records) - attention_runtime
+        full_native = bool(model.get("full_tvm_runnable", False)) and not conv_artifact
+        vision_model = model_family in {"vit", "yolo"}
+        partial_smoke_ok = (
+            vision_model
+            and bool(conv_runtime or grid_ready)
+            and attention_deferred == 0
+        )
+        smoke_ok = (
+            partial_smoke_ok
+            and grid_unsupported == 0
+            and attention_deferred == 0
+        )
+        mix = {
+            "translated_captured_kernels": translated,
+            "native_grid2d_runtime_ready": grid_ready,
+            "unsupported_grid2d_runtime": grid_unsupported,
+            "conv_runtime_resolved": conv_runtime,
+            "conv_artifact_only": conv_artifact,
+            "attention_runtime_resolved": attention_runtime,
+            "attention_deferred": attention_deferred,
+        }
+        provider_mix[model_case] = mix
+        records.append(
+            {
+                "model_case": model_case,
+                "model_family": model_family,
+                "runtime_resolved_model_smoke": smoke_ok,
+                "partial_runtime_resolved_model_smoke": partial_smoke_ok,
+                "provider_mix": mix,
+                "full_tvm_native_model": full_native,
+                "full_tvm_runnable_model": bool(model.get("full_tvm_runnable", False)),
+            }
+        )
+    return {
+        "runtime_resolved_model_smoke": {
+            "schema_version": 1,
+            "definition": (
+                "diagnostic vision readiness smoke: ViT/YOLO captured kernels are "
+                "translated or native Grid2D-ready, wrapper calls have explicit runtime "
+                "providers or explicit artifacts, and no silent fallback is counted as "
+                "runnable closure"
+            ),
+            "model_count": sum(
+                1 for record in records if record.get("runtime_resolved_model_smoke")
+            ),
+            "partial_model_count": sum(
+                1
+                for record in records
+                if record.get("partial_runtime_resolved_model_smoke")
+            ),
+            "records": records,
+        },
+        "runtime_resolved_model_provider_mix": provider_mix,
+        "full_tvm_native_model": sum(1 for record in records if record["full_tvm_native_model"]),
+    }
+
+
+def _pre_m11_report_section(
+    kernel_records: list[dict[str, Any]],
+    model_records: list[dict[str, Any]],
+    extern_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    extern_family_classes = _pre_m9_extern_family_classes(extern_records)
+    convolution_entry = extern_family_classes.get(
+        "deferred_convolution",
+        _empty_pre_m9_extern_family_entry(),
+    )
+    grid_entry = _pre_m11_grid_debt_entry(kernel_records)
+    attention_records = [
+        record
+        for record in extern_records
+        if str(record.get("op_family", "")) == "deferred_attention"
+    ]
+    runtime_resolved_attention = [
+        record for record in attention_records if _is_runtime_resolved_attention_record(record)
+    ]
+    attention_status_counts = Counter(
+        str(record.get("attention_runtime_status", ""))
+        or ATTENTION_RUNTIME_STATUS_DEFERRED
+        for record in attention_records
+    )
+    attention_provider_counts = Counter(
+        str(record.get("attention_provider_kind", "")) or ATTENTION_PROVIDER_NONE
+        for record in attention_records
+    )
+    entry_debt = []
+    if int(convolution_entry.get("call_count", 0) or 0) > 0:
+        conv_debt = _pre_m9_entry_from_extern_family(
+            "deferred_convolution",
+            convolution_entry,
+        )
+        conv_debt["debt_kind"] = "wrapper_convolution"
+        entry_debt.append(conv_debt)
+    if int(grid_entry.get("kernel_count", 0) or 0) > 0:
+        grid_debt = dict(grid_entry)
+        grid_debt["debt_kind"] = "captured_grid"
+        entry_debt.append(grid_debt)
+
+    return {
+        "taxonomy_version": PRE_M11_TAXONOMY_VERSION,
+        "gate_status": "pre_m11_debt_classified_v1",
+        "report_policy": {
+            "scope": (
+                "Pre-M11 classifies vision/convolution wrapper debt and captured "
+                "Triton grid blockers before M11 implementation."
+            ),
+            "schema_policy": (
+                "Schema-v1 top-level buckets and captured-kernel accounting remain "
+                "stable; Pre-M11 details are additive report fields."
+            ),
+            "fallback_policy": (
+                "Implicit PyTorch fallback is disallowed. TVM externs are allowed "
+                "only when explicit in reports."
+            ),
+            "full_tvm_runnable": (
+                "full_tvm_runnable remains false until all captured-kernel "
+                "fallbacks and wrapper-level extern calls are resolved."
+            ),
+            "attention_boundary": (
+                "Historical deferred_attention wrapper-family counts remain "
+                "visible, but M10 runtime-resolved observed SDPA is not M11 "
+                "vision entry debt."
+            ),
+        },
+        "detail_fields": [
+            "fallback_reason",
+            "blocker_class",
+            "pre_m8_family",
+            "op_family",
+            "vision_op_policy_family",
+            "vision_layout_policy",
+            "vision_implementation_policy",
+            "attention_runtime_status",
+            "attention_provider_kind",
+        ],
+        "primary_debt_counts": {
+            "deferred_convolution": int(convolution_entry.get("call_count", 0) or 0),
+            "captured_grid": int(grid_entry.get("kernel_count", 0) or 0),
+        },
+        "entry_debt": entry_debt,
+        "vision_op_policy": _pre_m11_vision_op_policy(),
+        "grid_policy": {
+            "entry_policy": "explicit_grid_blocker_until_m11_grid_or_launch_policy",
+            "implementation_requirement": (
+                "Expand supported grid/launch semantics or keep a stable "
+                "unsupported taxonomy; do not silently translate unsupported "
+                "multi-dimensional launch patterns."
+            ),
+            "debt": grid_entry,
+        },
+        "convolution_policy": {
+            "entry_policy": "explicit_wrapper_debt_before_runtime_or_native_lowering",
+            "implementation_requirement": (
+                "Convolution/operator records must expose TVM extern or native "
+                "TIR/TIRX implementation choices before affecting full-model "
+                "runnable claims."
+            ),
+            "debt": _pre_m9_entry_from_extern_family(
+                "deferred_convolution",
+                convolution_entry,
+            ),
+        },
+        "attention_boundary": {
+            "m11_entry_debt": False,
+            "historical_deferred_attention_family_count": len(attention_records),
+            "runtime_resolved_attention_count": len(runtime_resolved_attention),
+            "runtime_deferred_attention_count": int(
+                attention_status_counts.get(ATTENTION_RUNTIME_STATUS_DEFERRED, 0)
+            ),
+            "status_counts": dict(sorted(attention_status_counts.items())),
+            "provider_counts": dict(sorted(attention_provider_counts.items())),
+            "boundary_status": (
+                "m10_runtime_closed"
+                if len(attention_records) == len(runtime_resolved_attention)
+                else "attention_runtime_not_closed_for_this_snapshot"
+            ),
+        },
+        "still_deferred_elsewhere": [
+            "rope_runtime",
+            "kv_cache_runtime",
+            "decode_runtime",
+            "arbitrary_attention_masks",
+            "attention_performance_claim",
+        ],
+        "model_full_tvm_runnable_after_pre_m11_gate": sum(
+            1 for record in model_records if record.get("full_tvm_runnable")
+        ),
+    }
+
+
+def _pre_m11_vision_op_policy() -> dict[str, Any]:
+    return {
+        "operator_families": {
+            "convolution": [
+                "conv2d",
+                "1x1_conv",
+                "depthwise_conv",
+                "grouped_conv",
+            ],
+            "structural": ["pool", "resize", "concat", "slice"],
+            "yolo_postprocess": ["yolo_decode", "postprocess", "nms"],
+        },
+        "layout_policy": {
+            "nchw": "supported_policy_target",
+            "nhwc": "must_be_classified_before_lowering",
+            "channels_last": "must_be_classified_before_lowering",
+            "stride_padding_dilation": "must_be_reported_explicitly",
+        },
+        "implementation_policy": {
+            "implicit_pytorch_fallback": "disallowed",
+            "explicit_tvm_extern": "allowed_when_reported",
+            "native_tir_or_tirx": "preferred_after_contract_boundary",
+            "nms": "may_start_as_explicit_tvm_extern_then_move_native_later",
+        },
+    }
+
+
+def _pre_m11_grid_debt_entry(
+    kernel_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    grid_records = [
+        record
+        for record in kernel_records
+        if not record.get("translate_status", {}).get("ok", False)
+        and record.get("blocker_class") == "grid"
+    ]
+    buckets: Counter = Counter()
+    blocker_classes: Counter = Counter()
+    grid_types: Counter = Counter()
+    models: set[str] = set()
+    families: set[str] = set()
+    example_kernel = ""
+    example_message = ""
+    for record in grid_records:
+        status = record.get("translate_status", {})
+        buckets[str(status.get("bucket", "unknown"))] += 1
+        blocker_classes[str(record.get("blocker_class", "unknown"))] += 1
+        grid_types[str(record.get("grid_type", "unknown"))] += 1
+        if record.get("model_case"):
+            models.add(str(record.get("model_case", "")))
+        if record.get("model_family"):
+            families.add(str(record.get("model_family", "")))
+        if not example_kernel:
+            example_kernel = str(record.get("kernel_name", ""))
+            example_message = str(status.get("message", ""))
+
+    return {
+        "pre_m11_family": "captured_grid",
+        "kernel_count": len(grid_records),
+        "buckets": dict(sorted(buckets.items())),
+        "blocker_classes": dict(sorted(blocker_classes.items())),
+        "grid_types": dict(sorted(grid_types.items())),
+        "models_impacted": len(models),
+        "models": sorted(models),
+        "model_families": sorted(families),
+        "example_kernel": example_kernel,
+        "example_message": example_message,
+    }
+
+
+def _empty_pre_m9_extern_family_entry() -> dict[str, Any]:
+    return {
+        "call_count": 0,
+        "op_names": {},
+        "models_impacted": 0,
+        "models": [],
+        "example_op": "",
+        "example_model": "",
+        "example_source": "",
+    }
+
+
 def _pre_m9_materialized_artifact_candidates(
     extern_records: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1384,6 +2731,96 @@ def _is_pre_m9_entry_debt_record(record: dict[str, Any]) -> bool:
 def _is_materialized_extern_artifact_record(record: dict[str, Any]) -> bool:
     return _is_materialized_extern_gemm_record(record) or _is_materialized_extern_addmm_bias_record(
         record
+    )
+
+
+def _is_materialized_attention_artifact(record: dict[str, Any]) -> bool:
+    return (
+        str(record.get("op_family", "")) == "deferred_attention"
+        and str(record.get("attention_contract", "")) == ATTENTION_CONTRACT_VIT_FULL
+        and str(record.get("attention_semantics_status", "")) == "attention_semantics_accepted"
+        and str(record.get("attention_implementation_kind", ""))
+        == ATTENTION_IMPLEMENTATION_KIND_EXTERN_SDPA
+        and str(record.get("attention_extern_symbol", "")) == ATTENTION_EXTERN_SYMBOL
+        and str(record.get("attention_extern_packed_func", "")) == ATTENTION_EXTERN_PACKED_FUNC
+        and str(record.get("attention_runtime_kind", "") or ATTENTION_RUNTIME_KIND_ARTIFACT_ONLY)
+        == ATTENTION_RUNTIME_KIND_ARTIFACT_ONLY
+        and str(record.get("attention_runtime_replacement", ""))
+        == ATTENTION_RUNTIME_REPLACEMENT
+        and not bool(record.get("attention_runtime_replacement_available", False))
+        and str(
+            record.get("attention_runtime_status", "")
+            or ATTENTION_RUNTIME_STATUS_ARTIFACT_ONLY
+        )
+        == ATTENTION_RUNTIME_STATUS_ARTIFACT_ONLY
+    )
+
+
+def _is_materialized_vision_conv_artifact(record: dict[str, Any]) -> bool:
+    return (
+        _is_materialized_vision_conv_record(record)
+        and str(record.get("vision_runtime_kind", "")) == VISION_RUNTIME_KIND_ARTIFACT_ONLY
+        and str(record.get("vision_runtime_replacement", "")) == VISION_RUNTIME_REPLACEMENT
+        and not bool(record.get("vision_runtime_replacement_available", False))
+        and str(record.get("vision_runtime_status", ""))
+        == VISION_RUNTIME_STATUS_ARTIFACT_ONLY
+        and not bool(record.get("vision_performance_claim", False))
+    )
+
+
+def _is_materialized_vision_conv_record(record: dict[str, Any]) -> bool:
+    return (
+        str(record.get("op_family", "")) == "deferred_convolution"
+        and str(record.get("vision_source_kind", "")) == "wrapper_extern_convolution"
+        and str(record.get("vision_semantics_status", ""))
+        == VISION_SEMANTICS_STATUS_ACCEPTED
+        and str(record.get("vision_implementation_kind", ""))
+        == VISION_IMPLEMENTATION_KIND_EXTERN_CONV2D
+        and str(record.get("vision_extern_symbol", "")) == VISION_EXTERN_SYMBOL
+        and str(record.get("vision_extern_packed_func", "")) == VISION_EXTERN_PACKED_FUNC
+        and not bool(record.get("vision_performance_claim", False))
+    )
+
+
+def _is_runtime_resolved_vision_record(record: dict[str, Any]) -> bool:
+    return (
+        str(record.get("op_family", "")) == "deferred_convolution"
+        and str(record.get("vision_runtime_kind", "")) == VISION_RUNTIME_KIND_PROVIDER
+        and str(record.get("vision_runtime_status", ""))
+        == VISION_RUNTIME_STATUS_RUNTIME_RESOLVED
+    )
+
+
+def _is_runtime_resolved_attention_record(record: dict[str, Any]) -> bool:
+    contract = str(record.get("attention_contract", ""))
+    native_decomposed = (
+        str(record.get("attention_implementation_kind", ""))
+        == ATTENTION_IMPLEMENTATION_KIND_NATIVE_DECOMPOSED
+        and str(record.get("attention_runtime_kind", "")) == ATTENTION_RUNTIME_KIND_NATIVE_DECOMPOSED
+        and str(record.get("attention_provider_kind", ""))
+        == ATTENTION_PROVIDER_NATIVE_DECOMPOSED
+        and not bool(record.get("attention_performance_claim", False))
+        and not bool(record.get("attention_uses_host_staging", False))
+    )
+    extern_provider = (
+        str(record.get("attention_implementation_kind", ""))
+        == ATTENTION_IMPLEMENTATION_KIND_EXTERN_SDPA
+        and str(record.get("attention_extern_symbol", "")) == ATTENTION_EXTERN_SYMBOL
+        and str(record.get("attention_extern_packed_func", "")) == ATTENTION_EXTERN_PACKED_FUNC
+        and str(record.get("attention_runtime_kind", "")) == ATTENTION_RUNTIME_KIND_PROVIDER
+        and str(record.get("attention_provider_kind", ""))
+        == ATTENTION_PROVIDER_PYTHON_TORCH_HOST_STAGED
+        and not bool(record.get("attention_performance_claim", False))
+        and bool(record.get("attention_uses_host_staging", False))
+    )
+    return (
+        str(record.get("op_family", "")) == "deferred_attention"
+        and contract
+        in (ATTENTION_CONTRACT_VIT_FULL, ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL)
+        and str(record.get("attention_semantics_status", "")) == "attention_semantics_accepted"
+        and str(record.get("attention_runtime_status", ""))
+        == ATTENTION_RUNTIME_STATUS_RUNTIME_RESOLVED
+        and ((contract == ATTENTION_CONTRACT_VIT_FULL and extern_provider) or native_decomposed)
     )
 
 

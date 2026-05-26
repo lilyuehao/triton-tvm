@@ -487,6 +487,297 @@ def render_capability_markdown(
                     )
                 )
             lines.append("")
+    if "m10" in report:
+        m10 = report.get("m10") or {}
+        lines.extend(
+            [
+                "## M10 Attention Runtime Entry",
+                "",
+                f"- Provider policy: {m10.get('provider_policy', '')}",
+                f"- Hardening status: {m10.get('hardening_status', '')}",
+                f"- Performance claim: {m10.get('performance_claim', False)}",
+                f"- Materialized attention artifacts: {m10.get('artifact_count', 0)}",
+                f"- Artifact-only attention calls: {m10.get('artifact_only_count', 0)}",
+                f"- Runtime-resolved attention calls: {m10.get('runtime_resolved_count', 0)}",
+                f"- Runtime launches: {m10.get('runtime_launch_count', 0)}",
+                f"- Artifact calls: {m10.get('artifact_call_count', 0)}",
+                f"- Total IO bytes: {m10.get('total_io_bytes', 0)}",
+                f"- Intermediate buffer bytes: {m10.get('intermediate_buffer_bytes', 0)}",
+                f"- Host staging bytes: {m10.get('host_staging_bytes', 0)}",
+                f"- Runtime statuses: {_format_histogram(m10.get('status_counts', {}))}",
+                f"- Provider counts: {_format_histogram(m10.get('provider_counts', {}))}",
+                "- Unsupported runtime reasons: "
+                f"{_format_histogram(m10.get('unsupported_runtime_reasons', {}))}",
+                "",
+            ]
+        )
+    if "pre_m11" in report:
+        pre_m11 = report.get("pre_m11") or {}
+        debt_counts = pre_m11.get("primary_debt_counts") or {}
+        attention_boundary = pre_m11.get("attention_boundary") or {}
+        lines.extend(
+            [
+                "## Pre-M11 Gate",
+                "",
+                f"- Taxonomy version: {pre_m11.get('taxonomy_version', '')}",
+                f"- Gate status: {pre_m11.get('gate_status', '')}",
+                f"- Detail fields: {', '.join(pre_m11.get('detail_fields', []))}",
+                "- Deferred convolution wrapper calls: "
+                f"{debt_counts.get('deferred_convolution', 0)}",
+                f"- Captured grid blockers: {debt_counts.get('captured_grid', 0)}",
+                "- Historical deferred attention family count: "
+                f"{attention_boundary.get('historical_deferred_attention_family_count', 0)}",
+                "- Runtime-resolved attention calls: "
+                f"{attention_boundary.get('runtime_resolved_attention_count', 0)}",
+                f"- Attention boundary status: {attention_boundary.get('boundary_status', '')}",
+                "",
+            ]
+        )
+        entry_debt = pre_m11.get("entry_debt") or []
+        if entry_debt:
+            lines.extend(
+                [
+                    "| Debt | Kind | Count | Models | Example |",
+                    "|---|---|---:|---:|---|",
+                ]
+            )
+            for entry in entry_debt:
+                name = entry.get("op_family") or entry.get("pre_m11_family", "")
+                count = entry.get("call_count", entry.get("kernel_count", 0))
+                example = entry.get("example_op") or entry.get("example_kernel", "")
+                lines.append(
+                    "| {name} | {kind} | {count} | {models} | {example} |".format(
+                        name=_escape_markdown_cell(str(name)),
+                        kind=_escape_markdown_cell(str(entry.get("debt_kind", ""))),
+                        count=count,
+                        models=entry.get("models_impacted", 0),
+                        example=_escape_markdown_cell(str(example)[:160]),
+                    )
+                )
+            lines.append("")
+        vision_policy = pre_m11.get("vision_op_policy") or {}
+        operator_families = vision_policy.get("operator_families") or {}
+        if operator_families:
+            lines.extend(
+                [
+                    "| Vision policy family | Operators |",
+                    "|---|---|",
+                ]
+            )
+            for family, ops in sorted(operator_families.items()):
+                lines.append(
+                    "| {family} | {ops} |".format(
+                        family=_escape_markdown_cell(str(family)),
+                        ops=_escape_markdown_cell(", ".join(str(op) for op in ops)),
+                    )
+                )
+            lines.append("")
+    if "m11" in report:
+        m11 = report.get("m11") or {}
+        lines.extend(
+            [
+                "## M11 Vision Convolution Entry",
+                "",
+                f"- Interface status: {m11.get('interface_status', '')}",
+                f"- Provider policy: {m11.get('provider_policy', '')}",
+                f"- Performance claim: {m11.get('performance_claim', False)}",
+                "- Observed convolution wrapper calls: "
+                f"{m11.get('observed_convolution_call_count', 0)}",
+                f"- Artifact-only convolution calls: {m11.get('artifact_only_count', 0)}",
+                f"- Runtime-resolved convolution calls: {m11.get('runtime_resolved_count', 0)}",
+                f"- Runtime launches: {m11.get('runtime_launch_count', 0)}",
+                f"- Artifact calls: {m11.get('artifact_call_count', 0)}",
+                f"- Total IO bytes: {m11.get('total_io_bytes', 0)}",
+                f"- Host staging bytes: {m11.get('host_staging_bytes', 0)}",
+                f"- Total accounted bytes: {m11.get('total_accounted_bytes', 0)}",
+                f"- Runtime statuses: {_format_histogram(m11.get('status_counts', {}))}",
+                f"- Provider counts: {_format_histogram(m11.get('provider_counts', {}))}",
+                f"- Contract counts: {_format_histogram(m11.get('contract_counts', {}))}",
+                f"- Layout counts: {_format_histogram(m11.get('layout_counts', {}))}",
+                "- Unsupported vision reasons: "
+                f"{_format_histogram(m11.get('unsupported_reasons', {}))}",
+                "- Unsupported vision runtime reasons: "
+                f"{_format_histogram(m11.get('unsupported_runtime_reasons', {}))}",
+                "",
+            ]
+        )
+        hardening = m11.get("report_cache_invariants") or {}
+        if hardening:
+            diff_guard = m11.get("corpus_diff_guard") or {}
+            attention_boundary = m11.get("m10_attention_boundary") or {}
+            runtime_scope = m11.get("runtime_scope") or {}
+            lines.extend(
+                [
+                    "### M11.5 Hardening",
+                    "",
+                    f"- Hardening status: {hardening.get('hardening_status', '')}",
+                    f"- Invariant status: {hardening.get('status', '')}",
+                    f"- Runtime scope: {runtime_scope.get('status', '')}",
+                    f"- Corpus diff baseline: {diff_guard.get('baseline_id', '')}",
+                    f"- Diff guard status: {diff_guard.get('baseline_status', '')}",
+                    f"- M10 attention boundary: {attention_boundary.get('status', '')}",
+                    "- Full TVM runnable after M11.5 gate: "
+                    f"{m11.get('model_full_tvm_runnable_after_m11_5_gate', 0)}",
+                    "- Full TVM runnable after M11.6 gate: "
+                    f"{m11.get('model_full_tvm_runnable_after_m11_6_gate', 0)}",
+                    "- Invariant failures: "
+                    f"{', '.join(hardening.get('invariant_failures', [])) or 'none'}",
+                    "",
+                ]
+            )
+        readiness = m11.get("m11_6_readiness") or {}
+        grid_readiness = m11.get("captured_grid_readiness") or {}
+        model_smoke = m11.get("runtime_resolved_model_smoke") or {}
+        if readiness or grid_readiness:
+            conv_target = readiness.get("conv_runtime_target") or {}
+            lines.extend(
+                [
+                    "### M11.6 Vision Readiness",
+                    "",
+                    f"- Readiness status: {readiness.get('status', '')}",
+                    f"- Conv runtime scope: {conv_target.get('runtime_scope_status', '')}",
+                    "- Conv runtime-resolved observed: "
+                    f"{conv_target.get('observed_runtime_resolved', 0)}",
+                    f"- Grid2D readiness status: {grid_readiness.get('status', '')}",
+                    f"- Grid2D contract: {grid_readiness.get('contract', '')}",
+                    f"- Grid2D artifact-ready kernels: {grid_readiness.get('artifact_ready_count', 0)}",
+                    "- Grid2D native runtime-ready kernels: "
+                    f"{grid_readiness.get('native_runtime_ready_count', 0)}",
+                    f"- Grid2D silent fallbacks: {grid_readiness.get('silent_fallback_count', 0)}",
+                    "- Runtime-resolved model smoke count: "
+                    f"{model_smoke.get('model_count', 0)}",
+                    "- Partial vision model smoke count: "
+                    f"{model_smoke.get('partial_model_count', 0)}",
+                    f"- Full TVM native models: {m11.get('full_tvm_native_model', 0)}",
+                    "",
+                ]
+            )
+        runtime_records = m11.get("runtime_resolved_records") or []
+        if runtime_records:
+            lines.extend(
+                [
+                    "### M11 Runtime-Resolved Vision",
+                    "",
+                    "| Model | Contract | Provider | Claim | IO bytes | Host staging | Accounted |",
+                    "|---|---|---|---|---:|---:|---:|",
+                ]
+            )
+            for record in runtime_records[:12]:
+                lines.append(
+                    "| {model} | {contract} | {provider} | {claim} | {io} | "
+                    "{host} | {accounted} |".format(
+                        model=_escape_markdown_cell(str(record.get("model_case", ""))),
+                        contract=_escape_markdown_cell(
+                            str(record.get("vision_contract", ""))
+                        ),
+                        provider=_escape_markdown_cell(
+                            str(record.get("vision_provider_kind", ""))
+                        ),
+                        claim=_escape_markdown_cell(
+                            str(record.get("vision_runtime_claim", ""))
+                        ),
+                        io=record.get("vision_total_io_bytes", 0),
+                        host=record.get("vision_host_staging_bytes", 0),
+                        accounted=record.get("vision_total_accounted_bytes", 0),
+                    )
+                )
+            lines.append("")
+        artifact_records = m11.get("artifact_records") or []
+        if artifact_records:
+            lines.extend(
+                [
+                    "| Model | Contract | Layout | Input | Weight | Output | Stride | Padding |",
+                    "|---|---|---|---|---|---|---|---|",
+                ]
+            )
+            for record in artifact_records[:12]:
+                lines.append(
+                    "| {model} | {contract} | {layout} | {input_shape} | {weight_shape} | "
+                    "{output_shape} | {stride} | {padding} |".format(
+                        model=_escape_markdown_cell(str(record.get("model_case", ""))),
+                        contract=_escape_markdown_cell(
+                            str(record.get("vision_contract", ""))
+                        ),
+                        layout=_escape_markdown_cell(str(record.get("vision_layout", ""))),
+                        input_shape=_escape_markdown_cell(
+                            str(record.get("vision_input_shape", ""))
+                        ),
+                        weight_shape=_escape_markdown_cell(
+                            str(record.get("vision_weight_shape", ""))
+                        ),
+                        output_shape=_escape_markdown_cell(
+                            str(record.get("vision_output_shape", ""))
+                        ),
+                        stride=_escape_markdown_cell(str(record.get("vision_stride", ""))),
+                        padding=_escape_markdown_cell(
+                            str(record.get("vision_padding", ""))
+                        ),
+                    )
+                )
+            lines.append("")
+
+        grid_taxonomy = m11.get("captured_grid_taxonomy") or {}
+        if grid_taxonomy:
+            lines.extend(
+                [
+                    "## M11 Captured Grid Taxonomy",
+                    "",
+                    f"- Taxonomy version: {grid_taxonomy.get('taxonomy_version', '')}",
+                    f"- Status: {grid_taxonomy.get('status', '')}",
+                    f"- Captured grid blockers: {grid_taxonomy.get('kernel_count', 0)}",
+                    "- Grid family counts: "
+                    f"{_format_histogram(grid_taxonomy.get('family_counts', {}))}",
+                    "- Grid type counts: "
+                    f"{_format_histogram(grid_taxonomy.get('grid_type_counts', {}))}",
+                    "- Model counts: "
+                    f"{_format_histogram(grid_taxonomy.get('model_counts', {}))}",
+                    "- Operator tag counts: "
+                    f"{_format_histogram(grid_taxonomy.get('operator_tag_counts', {}))}",
+                    "- Grid2D artifact-ready kernels: "
+                    f"{grid_taxonomy.get('artifact_ready_count', 0)}",
+                    "- Grid2D native runtime-ready kernels: "
+                    f"{grid_taxonomy.get('native_runtime_ready_count', 0)}",
+                    "- Grid2D unsupported runtime reasons: "
+                    f"{_format_histogram(grid_taxonomy.get('unsupported_runtime_reasons', {}))}",
+                    "",
+                ]
+            )
+            grid_records = grid_taxonomy.get("records") or []
+            if grid_records:
+                lines.extend(
+                    [
+                        "| Model | Kernel | Family | Launch | Axes | Size hints | Tags |",
+                        "|---|---|---|---|---|---|---|",
+                    ]
+                )
+                for record in grid_records:
+                    lines.append(
+                        "| {model} | {kernel} | {family} | {launch} | {axes} | "
+                        "{size_hints} | {tags} |".format(
+                            model=_escape_markdown_cell(
+                                str(record.get("model_case", ""))
+                            ),
+                            kernel=_escape_markdown_cell(
+                                str(record.get("kernel_name", ""))
+                            ),
+                            family=_escape_markdown_cell(
+                                str(record.get("m11_grid_family", ""))
+                            ),
+                            launch=_escape_markdown_cell(
+                                str(record.get("m11_grid_launch_kind", ""))
+                            ),
+                            axes=_escape_markdown_cell(
+                                str(record.get("m11_grid_program_axes", ""))
+                            ),
+                            size_hints=_escape_markdown_cell(
+                                str(record.get("m11_grid_size_hints", ""))
+                            ),
+                            tags=_escape_markdown_cell(
+                                str(record.get("m11_grid_operator_tags", ""))
+                            ),
+                        )
+                    )
+                lines.append("")
     lines.extend(
         [
             "## TTIR Op Coverage",

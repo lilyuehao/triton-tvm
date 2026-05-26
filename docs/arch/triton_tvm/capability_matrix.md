@@ -17,6 +17,13 @@ matrix and historical reports live in
 | `softmax_row` | supported in M8 | rank-2 row max/exp/sum softmax |
 | `masked_softmax_row` | supported in M8 | rank-2 masked and causal-style row softmax policy |
 | `matmul_minimal` | supported in M9.1-M9.8 semantic/static/native/extern-proof/toy-graph scope; M9.P Phase 0-3 hardening complete | exact unmasked rank-2 `tt.dot` -> unresolved semantic validation block -> native schedule policy with TensorCore, SIMT16, and serial-K fallback candidates; wrapper `extern_kernels.mm` -> explicit packed-call artifact with artifact-only default and opt-in correctness-only `python_torch_host_staged` runtime proof; wrapper `extern_kernels.addmm` -> minimal `bias_add` packed-call artifact; M9.8 adds a TinyMNISTMLP diagnostic baseline; M9.P introduces `matmul_perf_core_v1`, Torch CUDA/cuBLAS dashboard baseline, and matmul-only dashboard without hidden attention semantics |
+| `attention_vit_full_v1` | supported in M10.1-M10.4 artifact/provider/native-decomposed scope | observed wrapper SDPA ViT full-attention call -> semantic extraction -> explicit packed-call artifact `tvm.contrib.triton_tvm.extern_attention_sdpa`; opt-in correctness-only `python_torch_host_staged` provider; opt-in correctness-only native decomposed QK^T, row softmax, and AV path via `native_decomposed`; no performance or full-model runnable claim |
+| `attention_llama_causal_prefill_v1` | supported in M10.5 native-decomposed correctness scope | observed wrapper SDPA Llama causal prefill call -> semantic extraction for already-RoPE'd Q/K tensors, rank-4 V, additive causal mask metadata, `is_causal=False`, and numeric scale; opt-in correctness-only native decomposed QK^T, masked row softmax, and AV path via `native_decomposed`; no RoPE, KV-cache, decode, performance, or full-model runnable claim |
+| `conv2d_nchw_static_v1` | supported in M11.6 static correctness-provider scope | static fp32 rank-4 NCHW/OIHW wrapper `extern_kernels.convolution` metadata -> explicit packed-call artifact `tvm.contrib.triton_tvm.extern_conv2d`; no bias/transposed/output-padding and output shape formula validation; opt-in correctness-only `python_torch_host_staged` runtime now admits N=1 groups=1 dilation=1 regular conv stride 1/2/16 and padding 0/1; provider performance claim remains false and full-model closure remains false |
+| `conv2d_1x1_nchw_static_v1` | supported in M11.6 static correctness-provider scope | 1x1 static fp32 rank-4 NCHW/OIHW wrapper conv artifact metadata; opt-in correctness-only `python_torch_host_staged` admits N=1 groups=1 stride=1 padding=0; no provider performance or full-model closure claim |
+| `depthwise_conv2d_nchw_static_v1` | supported in M11.2 artifact-only scope | depthwise static fp32 rank-4 NCHW/OIHW wrapper conv artifact metadata; no runtime or performance claim |
+| `grouped_conv2d_nchw_static_v1` | supported in M11.2 artifact-only scope | grouped static fp32 rank-4 NCHW/OIHW wrapper conv artifact metadata; no runtime or performance claim |
+| `pointwise_grid2d_static_v1` | supported in M11.6 native Grid2D readiness scope | static Grid2D affine f32 pointwise/fusion scaffold for conv-adjacent and BN/SiLU families; `native_tvm_grid2d`, zero host staging, perf dashboard measured 5/5 allclose cases; concat/split Grid2D remains explicitly unsupported |
 
 ## M7.5 Guard State
 
@@ -154,15 +161,106 @@ M9 owns the matmul entry boundary first. M9 entry is MatmulSemantics-first:
 - Pre-M10 freezes attention ABI/report vocabulary without adding attention
   runtime support. Wrapper SDPA stays `deferred_attention` and is classified
   into `attention_vit_full_v1`, `attention_llama_causal_prefill_v1`, or
-  `attention_llama_decode_v1` with
-  `attention_runtime_status="deferred_attention_runtime"`. Current report
-  coverage observes 2 attention calls: one ViT full attention and one Llama
-  causal prefill. Decode is covered by synthetic tests only.
-- M10 Attention Runtime Entry is planned in slices: SDPA semantics,
-  artifact-only wrapper attention, correctness-only ViT provider, native
-  decomposed ViT attention, Llama causal prefill, and decode synthetic
-  coverage. The old M10.5 label is retired; follow-on stabilization is M10
-  hardening.
+  `attention_llama_decode_v1`. Current report coverage observes 2 attention
+  calls: one ViT full attention and one Llama causal prefill. Decode is covered
+  by synthetic tests only.
+- M10.1-M10.4 are complete for `attention_vit_full_v1`: wrapper SDPA semantic
+  extraction, explicit packed-call artifact
+  `tvm.contrib.triton_tvm.extern_attention_sdpa`, and opt-in
+  correctness-only `python_torch_host_staged` provider. M10.4 adds the opt-in
+  correctness-only `native_decomposed` provider for ViT QK^T, row softmax, and
+  AV. The native-provider corpus reports 1 ViT runtime-resolved attention
+  record, 1 Llama deferred attention record, 1 materialized attention artifact,
+  and 0 full TVM runnable models while keeping captured-kernel accounting at
+  89/41/48.
+- M10.5 is complete for `attention_llama_causal_prefill_v1`: observed wrapper
+  SDPA semantic extraction, additive causal mask metadata, and opt-in
+  correctness-only `native_decomposed` provider for QK^T, masked row softmax,
+  and AV. Q/K are treated as already-RoPE'd upstream tensors; RoPE and
+  KV-cache runtime remain deferred.
+- M10.6 keeps `attention_llama_decode_v1` synthetic/report-only until a real
+  corpus decode wrapper call appears.
+- The M10.5 native-provider corpus reports 2 native runtime-resolved attention
+  records, 0 artifact-only attention calls, and 0 full TVM runnable models
+  while keeping captured-kernel accounting at 89/41/48.
+- M10 attention baseline is complete as a separate same-machine report:
+  `m10_attention_native_decomposed_vs_torch_sdpa_v1` measures fixed
+  `attention_vit_full_v1` and `attention_llama_causal_prefill_v1` shapes
+  against Torch CUDA SDPA. Corpus provider records still keep
+  `attention_performance_claim=false`.
+- M10 hardening is complete. Unknown attention provider ids fail explicitly;
+  attention records and TIR attrs carry launch/byte accounting; report
+  summaries aggregate launch, memory, host-staging, and unsupported runtime
+  reason counters; and runtime-resolved attention records are protected from
+  stale fallback reason pollution during normalization.
+- The regenerated native-provider corpus reports
+  `m10_runtime_hardened_v1`, 2 runtime launches, 2 artifact calls, 25,600 total
+  IO bytes, 154,624 intermediate buffer bytes, 0 host-staging bytes, and 0 full
+  TVM runnable models.
+- The old M10.5 label is retired.
+- Pre-M11 is complete as the vision/convolution and captured-grid debt cleanup
+  gate. The model-corpus report now emits a `pre_m11` section that freezes M11
+  entry debt as `deferred_convolution=65` wrapper-level
+  `extern_kernels.convolution` calls and `captured_grid=48` explicit
+  captured-kernel `contract_error/grid` blockers. Both debt families affect
+  `vit_tiny_random` and `yolov8n_yaml_random`.
+- Pre-M11 freezes the vision policy boundary for conv2d, 1x1 conv,
+  depthwise/grouped conv, pool, resize, concat, slice, YOLO
+  decode/postprocess, NMS, NCHW/NHWC, channels-last, and
+  stride/padding/dilation. Explicit TVM extern is allowed when reported;
+  implicit PyTorch fallback is disallowed.
+- Historical `deferred_attention=2` remains visible as wrapper-family history,
+  but both observed SDPA calls are runtime-resolved under M10
+  `native_decomposed`; attention is not M11 vision entry debt.
+- M11.0-M11.2 are complete as artifact-only convolution entry. The report
+  vocabulary uses `vision_*` fields and `vision_contract_version="m11_v1"`;
+  accepted wrapper convs materialize exactly one packed call to
+  `tvm.contrib.triton_tvm.extern_conv2d` with
+  `vision_runtime_status="artifact_only"`, `vision_runtime_launch_count=0`,
+  `vision_artifact_call_count=1`, and
+  `vision_performance_claim=false`.
+- The generated M11.2 corpus reports 89 captured kernels, 41 translated, 48
+  captured-grid fallbacks, 65 observed wrapper conv records, 65 artifact-only
+  conv records, 2 M10 runtime-resolved attention records, and 0 full TVM
+  runnable models.
+- M11.3 is complete as captured-grid taxonomy only. The report vocabulary adds
+  `m11_3_grid_taxonomy_v1` and per-kernel `m11_grid_*` fields for nontranslated
+  `blocker_class="grid"` records. The regenerated corpus keeps 89 captured
+  kernels, 41 translated, 48 explicit Grid2D fallbacks, 65 artifact-only conv
+  records, 2 M10 runtime-resolved attention records, and 0 full TVM runnable
+  models.
+- M11.3 captured-grid split: 17 `grid_conv_adjacent_pointwise`, 14
+  `grid_bn_silu_fusion`, 17 `grid_concat_split`, 0 `grid_pool_or_softmax`, 0
+  `grid_yolo_decode_postprocess`, and 0 `grid_other_multidim_pointwise`.
+- M11.4/M11.P complete the first narrow runtime and diagnostic baseline slice:
+  the exact ViT patch conv is runtime-resolved through the opt-in
+  correctness-only `python_torch_host_staged`
+  `tvm.contrib.triton_tvm.extern_conv2d` provider, and a same-machine baseline
+  compares it against Torch CUDA conv2d. The regenerated corpus keeps 89
+  captured kernels, 41 translated, 48 explicit Grid2D fallbacks, 65 wrapper
+  conv records, 1 runtime-resolved ViT patch conv, 64 artifact-only convs, 65
+  artifact calls, 1 vision runtime launch, 2 M10 runtime-resolved attention
+  records, and 0 full TVM runnable models. The latest baseline measured 1/1
+  allclose case with TVM p50 189.0550 us and Torch conv2d p50 36.4800 us;
+  provider performance claim remains false.
+- M11.5 hardening is complete without scope expansion: contract validators
+  reject runtime scope, launch count, performance-claim, and exact
+  byte-accounting regressions; reports include `m11.report_cache_invariants`,
+  `m11.corpus_diff_guard`, and `m11.m10_attention_boundary`.
+- M11.6 is complete as vision runtime/Grid2D readiness. The regenerated corpus
+  keeps 89 captured kernels, 41 translated, and 48 explicit Grid2D blockers,
+  but moves conv provider coverage to the static correctness envelope:
+  65/65 wrapper conv records are runtime-resolved under
+  `python_torch_host_staged`, with `vision_performance_claim=false`.
+- M11.6 adds `pointwise_grid2d_static_v1` and native
+  `native_tvm_grid2d` readiness for Grid2D pointwise/fusion records:
+  48 Grid2D blockers classified, 31 artifact/native runtime-ready, 17
+  concat/split records explicitly unsupported, and zero silent fallback. The
+  separate dashboard reports 5/5 measured native Grid2D allclose cases with no
+  host staging.
+- Full-model closure remains future work: ViT has a full diagnostic readiness
+  smoke, YOLO has a partial smoke but still has 17 concat/split Grid2D runtime
+  blockers, and `full_tvm_runnable` remains 0.
 
 The observed M7.5 `grid` blockers and Pre-M9 deferred convolution/attention
 wrapper calls remain separate deferred debt classes and should not be counted as

@@ -31,6 +31,12 @@ Contract boundary:
   unresolved semantic ``matmul`` block, the M9.3 correctness-first native
   schedule selected after target policy, and the M9.4 explicit wrapper extern
   GEMM packed-call artifact.
+- M11 ``conv2d_*_nchw_static_v1`` contracts validate explicit wrapper
+  convolution packed calls, including the M11.4 opt-in correctness provider for
+  the first ViT patch-embedding convolution and the M11.6 static conv2d
+  correctness envelope.
+- M11.6 ``pointwise_grid2d_static_v1`` validates native static Grid2D
+  pointwise/fusion scaffold artifacts.
 - ``cuda_minimal`` and ``cuda_pointwise_flat`` are deprecated compatibility
   aliases.  They are accepted only at the public boundary and immediately
   canonicalized.
@@ -43,6 +49,28 @@ from dataclasses import dataclass
 
 import tvm
 
+from .attention import (
+    ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL,
+    ATTENTION_CONTRACT_VIT_FULL,
+    ATTENTION_EXTERN_PACKED_FUNC,
+    ATTENTION_EXTERN_SYMBOL,
+    ATTENTION_IMPLEMENTATION_KIND_EXTERN_SDPA,
+    ATTENTION_IMPLEMENTATION_KIND_NATIVE_DECOMPOSED,
+    ATTENTION_NATIVE_DECOMPOSED_PROVIDER_REASON,
+    ATTENTION_PROVIDER_ABI_VERSION,
+    ATTENTION_PROVIDER_NONE,
+    ATTENTION_PROVIDER_NATIVE_DECOMPOSED,
+    ATTENTION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    ATTENTION_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+    ATTENTION_RUNTIME_KIND_ARTIFACT_ONLY,
+    ATTENTION_RUNTIME_KIND_NATIVE_DECOMPOSED,
+    ATTENTION_RUNTIME_KIND_PROVIDER,
+    ATTENTION_RUNTIME_PROVIDER_REASON,
+    ATTENTION_RUNTIME_REPLACEMENT,
+    ATTENTION_RUNTIME_REPLACEMENT_REASON,
+    ATTENTION_RUNTIME_STATUS_ARTIFACT_ONLY,
+    ATTENTION_RUNTIME_STATUS_RUNTIME_RESOLVED,
+)
 from .errors import TritonTVMContractError, UnsupportedContractError
 from .matmul import (
     EXTERN_ADDMM_BIAS_PACKED_FUNC,
@@ -75,6 +103,35 @@ from .matmul import (
     TILED_TIR_MATMUL_TILE_M,
     TILED_TIR_MATMUL_TILE_N,
 )
+from .vision import (
+    VISION_CONTRACT_CONV2D_1X1_NCHW_STATIC,
+    VISION_CONTRACT_CONV2D_NCHW_STATIC,
+    VISION_CONTRACT_DEPTHWISE_CONV2D_NCHW_STATIC,
+    VISION_CONTRACT_GROUPED_CONV2D_NCHW_STATIC,
+    VISION_CONTRACT_POINTWISE_GRID2D_STATIC,
+    VISION_CONTRACT_VERSION,
+    VISION_CONV2D_CONTRACTS,
+    VISION_EXTERN_PACKED_FUNC,
+    VISION_EXTERN_SYMBOL,
+    VISION_GRID2D_CONTRACT_VERSION,
+    M11_GRID2D_IMPLEMENTATION_KIND_NATIVE_TVM,
+    M11_GRID2D_PROVIDER_NATIVE_TVM,
+    M11_GRID2D_RUNTIME_CLAIM,
+    M11_GRID2D_RUNTIME_READY,
+    VISION_IMPLEMENTATION_KIND_EXTERN_CONV2D,
+    VISION_RUNTIME_KIND_ARTIFACT_ONLY,
+    VISION_RUNTIME_KIND_PROVIDER,
+    VISION_PROVIDER_ABI_VERSION,
+    VISION_PROVIDER_NONE,
+    VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+    VISION_RUNTIME_PROVIDER_REASON,
+    VISION_RUNTIME_REPLACEMENT,
+    VISION_RUNTIME_REPLACEMENT_REASON,
+    VISION_RUNTIME_STATUS_ARTIFACT_ONLY,
+    VISION_RUNTIME_STATUS_RUNTIME_RESOLVED,
+    is_m11_6_static_conv2d_runtime_scope,
+)
 
 
 _CONTRACT_ALIASES = {
@@ -87,6 +144,15 @@ _CONTRACT_ALIASES = {
     "softmax_row": "softmax_row",
     "masked_softmax_row": "masked_softmax_row",
     "matmul_minimal": "matmul_minimal",
+    ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL: ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL,
+    ATTENTION_CONTRACT_VIT_FULL: ATTENTION_CONTRACT_VIT_FULL,
+    VISION_CONTRACT_CONV2D_NCHW_STATIC: VISION_CONTRACT_CONV2D_NCHW_STATIC,
+    VISION_CONTRACT_CONV2D_1X1_NCHW_STATIC: VISION_CONTRACT_CONV2D_1X1_NCHW_STATIC,
+    VISION_CONTRACT_DEPTHWISE_CONV2D_NCHW_STATIC: (
+        VISION_CONTRACT_DEPTHWISE_CONV2D_NCHW_STATIC
+    ),
+    VISION_CONTRACT_GROUPED_CONV2D_NCHW_STATIC: VISION_CONTRACT_GROUPED_CONV2D_NCHW_STATIC,
+    VISION_CONTRACT_POINTWISE_GRID2D_STATIC: VISION_CONTRACT_POINTWISE_GRID2D_STATIC,
     "cuda_minimal": "pointwise_minimal",
     "cuda_pointwise_flat": "pointwise_flat",
 }
@@ -230,6 +296,104 @@ _CONTRACTS = {
         axis_policy="spatial_mn_reduce_k",
         layout_policy="rank2_row_major",
     ),
+    ATTENTION_CONTRACT_VIT_FULL: TritonTVMContract(
+        name=ATTENTION_CONTRACT_VIT_FULL,
+        indexing_kind="rank4_sdpa",
+        memory_model="rank4_buffers",
+        requires_extent_param=False,
+        supports_multiple_outputs=False,
+        version="attention_vit_full_m10_v1",
+        execution_kind="extern_attention_sdpa_artifact",
+        accumulator_dtype_policy="torch_sdpa_provider_default",
+        epsilon_policy="not_applicable",
+        mask_policy="none_or_padding",
+        axis_policy="batch_head_sequence_head_dim",
+        layout_policy="rank4_static",
+    ),
+    ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL: TritonTVMContract(
+        name=ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL,
+        indexing_kind="rank4_sdpa",
+        memory_model="rank4_buffers_with_additive_mask",
+        requires_extent_param=False,
+        supports_multiple_outputs=False,
+        version="attention_llama_causal_prefill_m10_v1",
+        execution_kind="native_decomposed_attention_qk_masked_softmax_av",
+        accumulator_dtype_policy="fp32_accumulate",
+        epsilon_policy="not_applicable",
+        mask_policy="causal_additive_mask",
+        axis_policy="batch_head_sequence_head_dim",
+        layout_policy="rank4_static_prefill",
+    ),
+    VISION_CONTRACT_CONV2D_NCHW_STATIC: TritonTVMContract(
+        name=VISION_CONTRACT_CONV2D_NCHW_STATIC,
+        indexing_kind="rank4_conv2d",
+        memory_model="rank4_nchw_oihw_buffers",
+        requires_extent_param=False,
+        supports_multiple_outputs=False,
+        version=VISION_CONTRACT_VERSION,
+        execution_kind="extern_conv2d_artifact_only",
+        accumulator_dtype_policy="provider_default_not_runtime_resolved",
+        epsilon_policy="not_applicable",
+        mask_policy="not_applicable",
+        axis_policy="batch_output_channel_spatial",
+        layout_policy="logical_nchw_oihw_static",
+    ),
+    VISION_CONTRACT_CONV2D_1X1_NCHW_STATIC: TritonTVMContract(
+        name=VISION_CONTRACT_CONV2D_1X1_NCHW_STATIC,
+        indexing_kind="rank4_conv2d_1x1",
+        memory_model="rank4_nchw_oihw_buffers",
+        requires_extent_param=False,
+        supports_multiple_outputs=False,
+        version=VISION_CONTRACT_VERSION,
+        execution_kind="extern_conv2d_artifact_only",
+        accumulator_dtype_policy="provider_default_not_runtime_resolved",
+        epsilon_policy="not_applicable",
+        mask_policy="not_applicable",
+        axis_policy="batch_output_channel_spatial",
+        layout_policy="logical_nchw_oihw_static",
+    ),
+    VISION_CONTRACT_DEPTHWISE_CONV2D_NCHW_STATIC: TritonTVMContract(
+        name=VISION_CONTRACT_DEPTHWISE_CONV2D_NCHW_STATIC,
+        indexing_kind="rank4_depthwise_conv2d",
+        memory_model="rank4_nchw_oihw_buffers",
+        requires_extent_param=False,
+        supports_multiple_outputs=False,
+        version=VISION_CONTRACT_VERSION,
+        execution_kind="extern_conv2d_artifact_only",
+        accumulator_dtype_policy="provider_default_not_runtime_resolved",
+        epsilon_policy="not_applicable",
+        mask_policy="not_applicable",
+        axis_policy="batch_output_channel_spatial",
+        layout_policy="logical_nchw_oihw_static",
+    ),
+    VISION_CONTRACT_GROUPED_CONV2D_NCHW_STATIC: TritonTVMContract(
+        name=VISION_CONTRACT_GROUPED_CONV2D_NCHW_STATIC,
+        indexing_kind="rank4_grouped_conv2d",
+        memory_model="rank4_nchw_oihw_buffers",
+        requires_extent_param=False,
+        supports_multiple_outputs=False,
+        version=VISION_CONTRACT_VERSION,
+        execution_kind="extern_conv2d_artifact_only",
+        accumulator_dtype_policy="provider_default_not_runtime_resolved",
+        epsilon_policy="not_applicable",
+        mask_policy="not_applicable",
+        axis_policy="batch_output_channel_spatial",
+        layout_policy="logical_nchw_oihw_static",
+    ),
+    VISION_CONTRACT_POINTWISE_GRID2D_STATIC: TritonTVMContract(
+        name=VISION_CONTRACT_POINTWISE_GRID2D_STATIC,
+        indexing_kind="grid2d_affine_pointwise",
+        memory_model="rank2_f32_buffers",
+        requires_extent_param=False,
+        supports_multiple_outputs=False,
+        version=VISION_GRID2D_CONTRACT_VERSION,
+        execution_kind="native_tvm_grid2d",
+        accumulator_dtype_policy="fp32_elementwise",
+        epsilon_policy="not_applicable",
+        mask_policy="guarded_x_axis_store",
+        axis_policy="program_id_x_y",
+        layout_policy="rank2_row_major_static",
+    ),
 }
 
 
@@ -321,6 +485,39 @@ def validate_matmul_minimal_contract(irmod: tvm.IRModule) -> None:
         _validate_matmul_minimal_body(gvar.name_hint, func)
 
 
+def validate_attention_vit_full_contract(irmod: tvm.IRModule) -> None:
+    """Validate the M10 wrapper SDPA packed-call artifact contract."""
+    _validate_semantic_common(irmod, ATTENTION_CONTRACT_VIT_FULL)
+    for gvar, func in irmod.functions.items():
+        _validate_attention_vit_full_body(gvar.name_hint, func)
+
+
+def validate_attention_llama_causal_prefill_contract(irmod: tvm.IRModule) -> None:
+    """Validate the M10.5 native decomposed Llama prefill contract."""
+    _validate_semantic_common(irmod, ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL)
+    for gvar, func in irmod.functions.items():
+        _validate_attention_llama_causal_prefill_body(gvar.name_hint, func)
+
+
+def validate_vision_conv2d_contract(irmod: tvm.IRModule) -> None:
+    """Validate the M11 artifact-only wrapper conv2d contracts."""
+    for gvar, func in irmod.functions.items():
+        contract = str((func.attrs or {}).get("triton_tvm.contract", ""))
+        if contract not in VISION_CONV2D_CONTRACTS:
+            raise TritonTVMContractError(
+                f"{gvar.name_hint} vision conv2d artifact has unsupported contract"
+            )
+    for gvar, func in irmod.functions.items():
+        _validate_vision_conv2d_artifact_body(gvar.name_hint, func)
+
+
+def validate_pointwise_grid2d_static_contract(irmod: tvm.IRModule) -> None:
+    """Validate the M11.6 native static Grid2D pointwise/fusion contract."""
+    _validate_common_func_attrs(irmod, VISION_CONTRACT_POINTWISE_GRID2D_STATIC)
+    for gvar, func in irmod.functions.items():
+        _validate_pointwise_grid2d_static_body(gvar.name_hint, func)
+
+
 def validate_cuda_minimal_contract(irmod: tvm.IRModule) -> None:
     """Validate the legacy CUDA single-store alias."""
     _warn_legacy_contract("cuda_minimal", "pointwise_minimal")
@@ -354,6 +551,14 @@ def validate_triton_tvm_contract(irmod: tvm.IRModule, contract: str) -> None:
         validate_masked_softmax_row_contract(irmod)
     elif contract == "matmul_minimal":
         validate_matmul_minimal_contract(irmod)
+    elif contract == ATTENTION_CONTRACT_VIT_FULL:
+        validate_attention_vit_full_contract(irmod)
+    elif contract == ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL:
+        validate_attention_llama_causal_prefill_contract(irmod)
+    elif contract in VISION_CONV2D_CONTRACTS:
+        validate_vision_conv2d_contract(irmod)
+    elif contract == VISION_CONTRACT_POINTWISE_GRID2D_STATIC:
+        validate_pointwise_grid2d_static_contract(irmod)
     else:
         raise UnsupportedContractError(
             f"Contract {contract!r} does not have a validator in this prototype"
@@ -640,6 +845,494 @@ def _validate_matmul_minimal_body(name: str, func: tvm.tirx.PrimFunc) -> None:
     )
 
 
+def _validate_attention_vit_full_body(name: str, func: tvm.tirx.PrimFunc) -> None:
+    attrs = func.attrs or {}
+    if attrs.get("triton_tvm.contract", None) != ATTENTION_CONTRACT_VIT_FULL:
+        raise TritonTVMContractError(
+            f"{name} attention artifact must preserve triton_tvm.contract="
+            f"{ATTENTION_CONTRACT_VIT_FULL}"
+        )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.attention_contract",
+        ATTENTION_CONTRACT_VIT_FULL,
+        "attention artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.attention_phase",
+        "full_attention",
+        "attention artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.attention_mask_kind",
+        "none_or_padding",
+        "attention artifact",
+    )
+    if _bool_attr(attrs, "triton_tvm.attention_causal") is not False:
+        raise TritonTVMContractError(f"{name} attention_vit_full_v1 must be non-causal")
+    implementation_kind = str(attrs.get("triton_tvm.implementation_kind", ""))
+    if implementation_kind not in (
+        ATTENTION_IMPLEMENTATION_KIND_EXTERN_SDPA,
+        ATTENTION_IMPLEMENTATION_KIND_NATIVE_DECOMPOSED,
+    ):
+        raise TritonTVMContractError(
+            f"{name} attention artifact has unsupported implementation_kind"
+        )
+    q_shape = _required_attention_shape(name, attrs, "triton_tvm.q_shape")
+    if len(q_shape) != 4:
+        raise TritonTVMContractError(f"{name} attention_vit_full_v1 requires rank-4 Q")
+    for attr_name in (
+        "triton_tvm.k_shape",
+        "triton_tvm.v_shape",
+        "triton_tvm.output_shape",
+    ):
+        if _required_attention_shape(name, attrs, attr_name) != q_shape:
+            raise TritonTVMContractError(
+                f"{name} attention_vit_full_v1 requires matching Q/K/V/output shapes"
+            )
+    for dtype_attr in (
+        "triton_tvm.q_dtype",
+        "triton_tvm.k_dtype",
+        "triton_tvm.v_dtype",
+        "triton_tvm.output_dtype",
+    ):
+        _require_attr_value(name, attrs, dtype_attr, "float32", "attention artifact")
+    if implementation_kind == ATTENTION_IMPLEMENTATION_KIND_EXTERN_SDPA:
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_symbol",
+            ATTENTION_EXTERN_SYMBOL,
+            "attention artifact",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_packed_func",
+            ATTENTION_EXTERN_PACKED_FUNC,
+            "attention artifact",
+        )
+    else:
+        script = tvm.IRModule({"main": func}).script()
+        if "call_packed" in script:
+            raise TritonTVMContractError(
+                f"{name} native decomposed attention must not call packed externs"
+            )
+        for block_name in (
+            "attention_qk_matmul",
+            "attention_row_softmax",
+            "attention_av_matmul",
+        ):
+            if block_name not in script:
+                raise TritonTVMContractError(
+                    f"{name} native decomposed attention missing {block_name}"
+                )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.qk_matmul_boundary",
+            "matmul_minimal",
+            "native attention",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.softmax_boundary",
+            "softmax_row",
+            "native attention",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.av_matmul_boundary",
+            "matmul_minimal",
+            "native attention",
+        )
+    _validate_attention_runtime_metadata(name, attrs)
+
+
+def _validate_attention_llama_causal_prefill_body(
+    name: str,
+    func: tvm.tirx.PrimFunc,
+) -> None:
+    attrs = func.attrs or {}
+    if attrs.get("triton_tvm.contract", None) != ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL:
+        raise TritonTVMContractError(
+            f"{name} Llama prefill attention must preserve triton_tvm.contract="
+            f"{ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL}"
+        )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.attention_contract",
+        ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL,
+        "Llama prefill attention",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.attention_phase",
+        "causal_prefill",
+        "Llama prefill attention",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.attention_mask_kind",
+        "causal",
+        "Llama prefill attention",
+    )
+    if _bool_attr(attrs, "triton_tvm.attention_causal") is not True:
+        raise TritonTVMContractError(
+            f"{name} attention_llama_causal_prefill_v1 must be causal"
+        )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.implementation_kind",
+        ATTENTION_IMPLEMENTATION_KIND_NATIVE_DECOMPOSED,
+        "Llama prefill attention",
+    )
+    q_shape = _required_attention_shape(name, attrs, "triton_tvm.q_shape")
+    if len(q_shape) != 4:
+        raise TritonTVMContractError(
+            f"{name} attention_llama_causal_prefill_v1 requires rank-4 Q"
+        )
+    for attr_name in (
+        "triton_tvm.k_shape",
+        "triton_tvm.v_shape",
+        "triton_tvm.output_shape",
+    ):
+        if _required_attention_shape(name, attrs, attr_name) != q_shape:
+            raise TritonTVMContractError(
+                f"{name} Llama prefill requires matching Q/K/V/output shapes"
+            )
+    expected_mask_shape = (q_shape[0], q_shape[1], q_shape[2], q_shape[2])
+    if _required_attention_shape(name, attrs, "triton_tvm.mask_shape") != expected_mask_shape:
+        raise TritonTVMContractError(
+            f"{name} Llama prefill requires mask shape B,H,S,S"
+        )
+    mask_stride = _int_tuple_attr(attrs, "triton_tvm.mask_stride")
+    if len(mask_stride) != 4 or any(stride < 0 for stride in mask_stride):
+        raise TritonTVMContractError(
+            f"{name} Llama prefill requires rank-4 non-negative mask stride"
+        )
+    for dtype_attr in (
+        "triton_tvm.q_dtype",
+        "triton_tvm.k_dtype",
+        "triton_tvm.v_dtype",
+        "triton_tvm.output_dtype",
+        "triton_tvm.mask_dtype",
+    ):
+        _require_attr_value(name, attrs, dtype_attr, "float32", "Llama prefill attention")
+    for forbidden_attr in (
+        "triton_tvm.kv_cache_layout",
+        "triton_tvm.kv_cache_update",
+        "triton_tvm.kv_cache_read",
+    ):
+        if attrs.get(forbidden_attr, None) is not None:
+            raise TritonTVMContractError(
+                f"{name} M10.5 Llama prefill must not expose {forbidden_attr}"
+            )
+    script = tvm.IRModule({"main": func}).script()
+    if "call_packed" in script:
+        raise TritonTVMContractError(
+            f"{name} native decomposed Llama prefill must not call packed externs"
+        )
+    for block_name in (
+        "attention_qk_matmul",
+        "attention_mask_add",
+        "attention_row_softmax",
+        "attention_av_matmul",
+    ):
+        if block_name not in script:
+            raise TritonTVMContractError(
+                f"{name} native decomposed Llama prefill missing {block_name}"
+            )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.qk_matmul_boundary",
+        "matmul_minimal",
+        "native Llama prefill",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.softmax_boundary",
+        "masked_softmax_row",
+        "native Llama prefill",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.av_matmul_boundary",
+        "matmul_minimal",
+        "native Llama prefill",
+    )
+    _validate_attention_runtime_metadata(name, attrs)
+
+
+def _validate_vision_conv2d_artifact_body(name: str, func: tvm.tirx.PrimFunc) -> None:
+    attrs = func.attrs or {}
+    contract = str(attrs.get("triton_tvm.contract", ""))
+    if contract not in VISION_CONV2D_CONTRACTS:
+        raise TritonTVMContractError(
+            f"{name} vision conv2d artifact has unsupported contract={contract!r}"
+        )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.vision_contract",
+        contract,
+        "vision conv2d artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.vision_contract_version",
+        VISION_CONTRACT_VERSION,
+        "vision conv2d artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.vision_source_kind",
+        "wrapper_extern_convolution",
+        "vision conv2d artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.implementation_kind",
+        VISION_IMPLEMENTATION_KIND_EXTERN_CONV2D,
+        "vision conv2d artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_symbol",
+        VISION_EXTERN_SYMBOL,
+        "vision conv2d artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_packed_func",
+        VISION_EXTERN_PACKED_FUNC,
+        "vision conv2d artifact",
+    )
+    _validate_vision_conv2d_runtime_metadata(name, attrs)
+
+    input_shape = _required_vision_shape(name, attrs, "triton_tvm.input_shape")
+    weight_shape = _required_vision_shape(name, attrs, "triton_tvm.weight_shape")
+    output_shape = _required_vision_shape(name, attrs, "triton_tvm.output_shape")
+    input_stride = _required_vision_shape(name, attrs, "triton_tvm.input_stride")
+    weight_stride = _required_vision_shape(name, attrs, "triton_tvm.weight_stride")
+    output_stride = _required_vision_shape(name, attrs, "triton_tvm.output_stride")
+    stride = _required_vision_pair(name, attrs, "triton_tvm.stride")
+    padding = _required_vision_pair(name, attrs, "triton_tvm.padding", allow_zero=True)
+    dilation = _required_vision_pair(name, attrs, "triton_tvm.dilation")
+    output_padding = _required_vision_pair(
+        name,
+        attrs,
+        "triton_tvm.output_padding",
+        allow_zero=True,
+    )
+    groups = _int_attr(attrs, "triton_tvm.groups")
+    if groups is None or groups <= 0:
+        raise TritonTVMContractError(f"{name} vision conv2d groups must be positive")
+    if len(input_shape) != 4 or len(weight_shape) != 4 or len(output_shape) != 4:
+        raise TritonTVMContractError(f"{name} vision conv2d requires rank-4 buffers")
+    if len(input_stride) != 4 or len(weight_stride) != 4 or len(output_stride) != 4:
+        raise TritonTVMContractError(f"{name} vision conv2d requires rank-4 strides")
+    for dtype_attr in (
+        "triton_tvm.input_dtype",
+        "triton_tvm.weight_dtype",
+        "triton_tvm.output_dtype",
+    ):
+        _require_attr_value(name, attrs, dtype_attr, "float32", "vision conv2d artifact")
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.bias_policy",
+        "none",
+        "vision conv2d artifact",
+    )
+    if _bool_attr(attrs, "triton_tvm.transposed") is not False:
+        raise TritonTVMContractError(f"{name} vision conv2d artifact must not be transposed")
+    if output_padding != (0, 0):
+        raise TritonTVMContractError(
+            f"{name} vision conv2d artifact must keep output_padding zero"
+        )
+    if weight_shape[1] * groups != input_shape[1]:
+        raise TritonTVMContractError(
+            f"{name} vision conv2d grouped input channels mismatch"
+        )
+    expected_output = _vision_conv2d_output_shape(
+        input_shape,
+        weight_shape,
+        stride,
+        padding,
+        dilation,
+    )
+    if output_shape != expected_output:
+        raise TritonTVMContractError(
+            f"{name} vision conv2d output shape must be {expected_output}"
+        )
+    _validate_vision_conv2d_accounting_metadata(
+        name,
+        attrs,
+        input_shape,
+        weight_shape,
+        output_shape,
+    )
+    if contract == VISION_CONTRACT_CONV2D_1X1_NCHW_STATIC and weight_shape[2:] != (1, 1):
+        raise TritonTVMContractError(f"{name} vision 1x1 conv requires 1x1 weight")
+    if contract == VISION_CONTRACT_DEPTHWISE_CONV2D_NCHW_STATIC:
+        if groups != input_shape[1] or weight_shape[0] != input_shape[1] or weight_shape[1] != 1:
+            raise TritonTVMContractError(f"{name} depthwise conv contract mismatch")
+    if contract == VISION_CONTRACT_GROUPED_CONV2D_NCHW_STATIC:
+        if groups <= 1 or (
+            groups == input_shape[1] and weight_shape[0] == input_shape[1] and weight_shape[1] == 1
+        ):
+            raise TritonTVMContractError(f"{name} grouped conv contract mismatch")
+    if contract == VISION_CONTRACT_CONV2D_NCHW_STATIC and groups != 1:
+        raise TritonTVMContractError(f"{name} regular conv2d contract requires groups=1")
+    if (
+        str(attrs.get("triton_tvm.vision_runtime_status", ""))
+        == VISION_RUNTIME_STATUS_RUNTIME_RESOLVED
+        and not _vision_conv2d_runtime_scope_m11_6(
+            contract,
+            input_shape,
+            weight_shape,
+            output_shape,
+            stride,
+            padding,
+            dilation,
+            groups,
+            attrs,
+        )
+    ):
+        raise TritonTVMContractError(
+            f"{name} M11.6 runtime-resolved conv2d is limited to static NCHW/OIHW "
+            "groups=1 stride/padding envelope"
+        )
+
+    script = _prim_func_script(func)
+    packed_call = f'T.call_packed("{VISION_EXTERN_PACKED_FUNC}"'
+    if script.count(packed_call) != 1:
+        raise TritonTVMContractError(
+            f"{name} vision conv2d artifact must contain exactly one "
+            f"{VISION_EXTERN_PACKED_FUNC} packed call"
+        )
+    if "call_extern" in script:
+        raise TritonTVMContractError(
+            f"{name} vision conv2d artifact must not use T.call_extern"
+        )
+    if 'thread="blockIdx.x"' in script or 'thread="threadIdx.x"' in script:
+        raise TritonTVMContractError(
+            f"{name} vision conv2d artifact must not contain a native CUDA schedule"
+        )
+
+
+def _validate_pointwise_grid2d_static_body(name: str, func: tvm.tirx.PrimFunc) -> None:
+    attrs = func.attrs or {}
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.contract",
+        VISION_CONTRACT_POINTWISE_GRID2D_STATIC,
+        "Grid2D pointwise artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.grid2d_contract",
+        VISION_CONTRACT_POINTWISE_GRID2D_STATIC,
+        "Grid2D pointwise artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.grid2d_contract_version",
+        VISION_GRID2D_CONTRACT_VERSION,
+        "Grid2D pointwise artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.implementation_kind",
+        M11_GRID2D_IMPLEMENTATION_KIND_NATIVE_TVM,
+        "Grid2D pointwise artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.grid2d_runtime_status",
+        M11_GRID2D_RUNTIME_READY,
+        "Grid2D pointwise artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.grid2d_provider_kind",
+        M11_GRID2D_PROVIDER_NATIVE_TVM,
+        "Grid2D pointwise artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.grid2d_runtime_claim",
+        M11_GRID2D_RUNTIME_CLAIM,
+        "Grid2D pointwise artifact",
+    )
+    if _bool_attr(attrs, "triton_tvm.grid2d_performance_claim") is not True:
+        raise TritonTVMContractError(f"{name} Grid2D native artifact must claim performance")
+    if _bool_attr(attrs, "triton_tvm.grid2d_uses_host_staging") is not False:
+        raise TritonTVMContractError(f"{name} Grid2D native artifact must not use host staging")
+    x_extent = _int_attr(attrs, "triton_tvm.grid2d_x_extent")
+    y_extent = _int_attr(attrs, "triton_tvm.grid2d_y_extent")
+    block_size = _int_attr(attrs, "triton_tvm.grid2d_block_size")
+    if x_extent is None or y_extent is None or block_size is None:
+        raise TritonTVMContractError(f"{name} Grid2D native artifact missing static shape attrs")
+    if x_extent <= 0 or y_extent <= 0 or block_size <= 0:
+        raise TritonTVMContractError(f"{name} Grid2D native artifact extents must be positive")
+    if _int_attr(attrs, "triton_tvm.grid2d_runtime_launch_count") != 1:
+        raise TritonTVMContractError(f"{name} Grid2D native artifact must record one launch")
+    if _int_attr(attrs, "triton_tvm.grid2d_artifact_call_count") != 1:
+        raise TritonTVMContractError(f"{name} Grid2D native artifact must record one artifact")
+    expected_io = int(x_extent) * int(y_extent) * 4 * 3
+    if _int_attr(attrs, "triton_tvm.grid2d_total_io_bytes") != expected_io:
+        raise TritonTVMContractError(
+            f"{name} Grid2D native artifact total IO bytes must be {expected_io}"
+        )
+    if _int_attr(attrs, "triton_tvm.grid2d_host_staging_bytes") != 0:
+        raise TritonTVMContractError(f"{name} Grid2D native artifact host staging must be zero")
+
+    script = _prim_func_script(func)
+    for token in ('thread="blockIdx.x"', 'thread="blockIdx.y"', 'thread="threadIdx.x"'):
+        if token not in script:
+            raise TritonTVMContractError(f"{name} Grid2D native artifact missing {token}")
+    if "call_packed" in script or "call_extern" in script:
+        raise TritonTVMContractError(f"{name} Grid2D native artifact must not use extern calls")
+
+    guarded_stores = _store_guard_states(func.body)
+    if not guarded_stores:
+        raise TritonTVMContractError(
+            f"{name} Grid2D native artifact requires at least one guarded store"
+        )
+    if any(not guarded for _, guarded in guarded_stores):
+        raise TritonTVMContractError(
+            f"{name} Grid2D native artifact must guard every store"
+        )
+
+
 def _validate_matmul_extern_gemm_artifact(name: str, func: tvm.tirx.PrimFunc) -> None:
     attrs = func.attrs or {}
     if attrs.get("triton_tvm.contract", None) != "matmul_minimal":
@@ -852,6 +1545,490 @@ def _required_matmul_dims(name: str, attrs, label: str) -> tuple[int, int, int]:
             raise TritonTVMContractError(f"{name} {label} {dim_name} must be positive")
         dims.append(value)
     return tuple(dims)  # type: ignore[return-value]
+
+
+def _required_attention_shape(name: str, attrs, attr_name: str) -> tuple[int, ...]:
+    shape = _int_tuple_attr(attrs, attr_name)
+    if not shape:
+        raise TritonTVMContractError(f"{name} attention artifact missing {attr_name}")
+    if any(extent <= 0 for extent in shape):
+        raise TritonTVMContractError(f"{name} attention artifact {attr_name} must be positive")
+    return shape
+
+
+def _required_vision_shape(name: str, attrs, attr_name: str) -> tuple[int, ...]:
+    shape = _int_tuple_attr(attrs, attr_name)
+    if not shape:
+        raise TritonTVMContractError(f"{name} vision conv2d artifact missing {attr_name}")
+    if any(extent <= 0 for extent in shape):
+        raise TritonTVMContractError(
+            f"{name} vision conv2d artifact {attr_name} must be positive"
+        )
+    return shape
+
+
+def _required_vision_pair(
+    name: str,
+    attrs,
+    attr_name: str,
+    *,
+    allow_zero: bool = False,
+) -> tuple[int, int]:
+    values = _int_tuple_attr(attrs, attr_name)
+    if len(values) != 2:
+        raise TritonTVMContractError(
+            f"{name} vision conv2d artifact {attr_name} must be a pair"
+        )
+    if allow_zero:
+        invalid = any(value < 0 for value in values)
+    else:
+        invalid = any(value <= 0 for value in values)
+    if invalid:
+        raise TritonTVMContractError(
+            f"{name} vision conv2d artifact {attr_name} has invalid values"
+        )
+    return (values[0], values[1])
+
+
+def _vision_conv2d_output_shape(
+    input_shape: tuple[int, ...],
+    weight_shape: tuple[int, ...],
+    stride: tuple[int, int],
+    padding: tuple[int, int],
+    dilation: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    batch, _, input_h, input_w = input_shape
+    output_channels, _, kernel_h, kernel_w = weight_shape
+    output_h = (input_h + 2 * padding[0] - dilation[0] * (kernel_h - 1) - 1) // stride[0] + 1
+    output_w = (input_w + 2 * padding[1] - dilation[1] * (kernel_w - 1) - 1) // stride[1] + 1
+    if output_h <= 0 or output_w <= 0:
+        raise TritonTVMContractError(f"vision conv2d output shape must be positive")
+    return (batch, output_channels, output_h, output_w)
+
+
+def _vision_conv2d_runtime_scope_m11_6(
+    contract: str,
+    input_shape: tuple[int, ...],
+    weight_shape: tuple[int, ...],
+    output_shape: tuple[int, ...],
+    stride: tuple[int, int],
+    padding: tuple[int, int],
+    dilation: tuple[int, int],
+    groups: int,
+    attrs,
+) -> bool:
+    from .vision import VisionConv2DSemantics  # pylint: disable=import-outside-toplevel
+
+    semantics = VisionConv2DSemantics(
+        source_kind="wrapper_extern_convolution",
+        source_name=VISION_EXTERN_SYMBOL,
+        kernel_name="contract_validator",
+        vision_contract=contract,
+        vision_op_family="convolution",
+        input_param="input",
+        weight_param="weight",
+        output_param="output",
+        input_shape=tuple(input_shape),  # type: ignore[arg-type]
+        weight_shape=tuple(weight_shape),  # type: ignore[arg-type]
+        output_shape=tuple(output_shape),  # type: ignore[arg-type]
+        input_stride=_int_tuple_attr(attrs, "triton_tvm.input_stride"),
+        weight_stride=_int_tuple_attr(attrs, "triton_tvm.weight_stride"),
+        output_stride=_int_tuple_attr(attrs, "triton_tvm.output_stride"),
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+        bias_policy=str(attrs.get("triton_tvm.bias_policy", "")),
+        transposed=bool(_bool_attr(attrs, "triton_tvm.transposed")),
+        output_padding=_int_tuple_attr(attrs, "triton_tvm.output_padding"),
+        input_dtype=str(attrs.get("triton_tvm.input_dtype", "")),
+        weight_dtype=str(attrs.get("triton_tvm.weight_dtype", "")),
+        output_dtype=str(attrs.get("triton_tvm.output_dtype", "")),
+    )
+    return is_m11_6_static_conv2d_runtime_scope(semantics)
+
+
+def _validate_vision_conv2d_accounting_metadata(
+    name: str,
+    attrs,
+    input_shape: tuple[int, ...],
+    weight_shape: tuple[int, ...],
+    output_shape: tuple[int, ...],
+) -> None:
+    status = str(attrs.get("triton_tvm.vision_runtime_status", ""))
+    input_bytes = _shape_numel(input_shape) * 4
+    weight_bytes = _shape_numel(weight_shape) * 4
+    output_bytes = _shape_numel(output_shape) * 4
+    total_io_bytes = input_bytes + weight_bytes + output_bytes
+    host_staging_bytes = (
+        total_io_bytes if status == VISION_RUNTIME_STATUS_RUNTIME_RESOLVED else 0
+    )
+    expected = {
+        "triton_tvm.vision_input_bytes": input_bytes,
+        "triton_tvm.vision_weight_bytes": weight_bytes,
+        "triton_tvm.vision_output_bytes": output_bytes,
+        "triton_tvm.vision_total_io_bytes": total_io_bytes,
+        "triton_tvm.vision_host_staging_bytes": host_staging_bytes,
+        "triton_tvm.vision_total_accounted_bytes": total_io_bytes + host_staging_bytes,
+    }
+    for attr_name, expected_value in expected.items():
+        value = _int_attr(attrs, attr_name)
+        if value != expected_value:
+            raise TritonTVMContractError(
+                f"{name} vision conv2d artifact {attr_name} must be {expected_value}"
+            )
+
+
+def _shape_numel(shape: tuple[int, ...]) -> int:
+    result = 1
+    for extent in shape:
+        result *= int(extent)
+    return result
+
+
+def _validate_vision_conv2d_runtime_metadata(name: str, attrs) -> None:
+    status = str(attrs.get("triton_tvm.vision_runtime_status", ""))
+    provider_kind = str(
+        attrs.get("triton_tvm.vision_provider_kind", VISION_PROVIDER_NONE)
+        or VISION_PROVIDER_NONE
+    )
+    provider_abi_version = _int_attr(attrs, "triton_tvm.vision_provider_abi_version") or 0
+    uses_host_staging = _bool_attr(attrs, "triton_tvm.vision_uses_host_staging")
+    if _bool_attr(attrs, "triton_tvm.vision_performance_claim") is not False:
+        raise TritonTVMContractError(
+            f"{name} vision conv2d artifact must not claim performance"
+        )
+    launch_count = _int_attr(attrs, "triton_tvm.vision_runtime_launch_count")
+    artifact_calls = _int_attr(attrs, "triton_tvm.vision_artifact_call_count")
+    if artifact_calls != 1:
+        raise TritonTVMContractError(
+            f"{name} vision conv2d artifact must record one artifact call"
+        )
+    if status == VISION_RUNTIME_STATUS_ARTIFACT_ONLY:
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_kind",
+            VISION_RUNTIME_KIND_ARTIFACT_ONLY,
+            "vision conv2d artifact",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_replacement",
+            VISION_RUNTIME_REPLACEMENT,
+            "vision conv2d artifact",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_replacement_reason",
+            VISION_RUNTIME_REPLACEMENT_REASON,
+            "vision conv2d artifact",
+        )
+        if _bool_attr(attrs, "triton_tvm.extern_runtime_replacement_available") is not False:
+            raise TritonTVMContractError(
+                f"{name} vision conv2d artifact must keep runtime replacement unavailable"
+            )
+        if provider_kind != VISION_PROVIDER_NONE or provider_abi_version != 0:
+            raise TritonTVMContractError(
+                f"{name} artifact-only vision conv2d must not claim a provider"
+            )
+        if uses_host_staging is not False:
+            raise TritonTVMContractError(
+                f"{name} artifact-only vision conv2d must not use host staging"
+            )
+        if launch_count != 0:
+            raise TritonTVMContractError(
+                f"{name} vision conv2d artifact must record zero runtime launches"
+            )
+    elif status == VISION_RUNTIME_STATUS_RUNTIME_RESOLVED:
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_kind",
+            VISION_RUNTIME_KIND_PROVIDER,
+            "vision conv2d runtime provider",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_replacement",
+            VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+            "vision conv2d runtime provider",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_replacement_reason",
+            VISION_RUNTIME_PROVIDER_REASON,
+            "vision conv2d runtime provider",
+        )
+        if _bool_attr(attrs, "triton_tvm.extern_runtime_replacement_available") is not True:
+            raise TritonTVMContractError(
+                f"{name} vision conv2d runtime provider must be replacement-available"
+            )
+        if provider_kind != VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED:
+            raise TritonTVMContractError(
+                f"{name} vision conv2d runtime provider kind mismatch"
+            )
+        if provider_abi_version != VISION_PROVIDER_ABI_VERSION:
+            raise TritonTVMContractError(
+                f"{name} vision conv2d runtime provider ABI mismatch"
+            )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.vision_runtime_claim",
+            VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+            "vision conv2d runtime provider",
+        )
+        if uses_host_staging is not True:
+            raise TritonTVMContractError(
+                f"{name} vision conv2d runtime provider must record host staging"
+            )
+        if launch_count != 1:
+            raise TritonTVMContractError(
+                f"{name} vision conv2d runtime provider must record one runtime launch"
+            )
+    else:
+        raise TritonTVMContractError(
+            f"{name} vision conv2d artifact has unsupported runtime status={status!r}"
+        )
+    for attr_name in (
+        "triton_tvm.vision_input_bytes",
+        "triton_tvm.vision_weight_bytes",
+        "triton_tvm.vision_output_bytes",
+        "triton_tvm.vision_total_io_bytes",
+        "triton_tvm.vision_host_staging_bytes",
+        "triton_tvm.vision_total_accounted_bytes",
+    ):
+        value = _int_attr(attrs, attr_name)
+        if value is None or value < 0:
+            raise TritonTVMContractError(
+                f"{name} vision conv2d artifact {attr_name} must be non-negative"
+            )
+
+
+def _validate_attention_runtime_metadata(name: str, attrs) -> None:
+    status = str(attrs.get("triton_tvm.attention_runtime_status", ""))
+    provider_kind = str(attrs.get("triton_tvm.attention_provider_kind", ""))
+    provider_abi_version = _int_attr(attrs, "triton_tvm.attention_provider_abi_version")
+    performance_claim = _bool_attr(attrs, "triton_tvm.attention_performance_claim")
+    uses_host_staging = _bool_attr(attrs, "triton_tvm.attention_uses_host_staging")
+    replacement_available = _bool_attr(
+        attrs,
+        "triton_tvm.extern_runtime_replacement_available",
+    )
+    _validate_attention_accounting_metadata(name, attrs)
+
+    if status == ATTENTION_RUNTIME_STATUS_ARTIFACT_ONLY:
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_kind",
+            ATTENTION_RUNTIME_KIND_ARTIFACT_ONLY,
+            "attention artifact",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_replacement",
+            ATTENTION_RUNTIME_REPLACEMENT,
+            "attention artifact",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_replacement_reason",
+            ATTENTION_RUNTIME_REPLACEMENT_REASON,
+            "attention artifact",
+        )
+        if replacement_available is not False:
+            raise TritonTVMContractError(
+                f"{name} attention artifact must keep runtime replacement unavailable"
+            )
+        if provider_kind != ATTENTION_PROVIDER_NONE or provider_abi_version != 0:
+            raise TritonTVMContractError(
+                f"{name} artifact-only attention must use provider none"
+            )
+        if performance_claim is not False or uses_host_staging is not False:
+            raise TritonTVMContractError(
+                f"{name} artifact-only attention must not claim provider execution"
+            )
+        return
+
+    if status != ATTENTION_RUNTIME_STATUS_RUNTIME_RESOLVED:
+        raise TritonTVMContractError(
+            f"{name} attention artifact has unsupported runtime status"
+        )
+    implementation_kind = str(attrs.get("triton_tvm.implementation_kind", ""))
+    if implementation_kind == ATTENTION_IMPLEMENTATION_KIND_NATIVE_DECOMPOSED:
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_kind",
+            ATTENTION_RUNTIME_KIND_NATIVE_DECOMPOSED,
+            "native attention provider",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_replacement",
+            ATTENTION_PROVIDER_NATIVE_DECOMPOSED,
+            "native attention provider",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_runtime_replacement_reason",
+            ATTENTION_NATIVE_DECOMPOSED_PROVIDER_REASON,
+            "native attention provider",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.attention_runtime_claim",
+            ATTENTION_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+            "native attention provider",
+        )
+        if replacement_available is not True:
+            raise TritonTVMContractError(
+                f"{name} native attention must mark replacement available"
+            )
+        if provider_kind != ATTENTION_PROVIDER_NATIVE_DECOMPOSED:
+            raise TritonTVMContractError(
+                f"{name} native attention must name native_decomposed provider"
+            )
+        if provider_abi_version != ATTENTION_PROVIDER_ABI_VERSION:
+            raise TritonTVMContractError(
+                f"{name} native attention must preserve provider ABI v1"
+            )
+        if performance_claim is not False or uses_host_staging is not False:
+            raise TritonTVMContractError(
+                f"{name} native attention must be correctness-only without host staging"
+            )
+        return
+
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_runtime_kind",
+        ATTENTION_RUNTIME_KIND_PROVIDER,
+        "attention runtime provider",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_runtime_replacement",
+        ATTENTION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+        "attention runtime provider",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_runtime_replacement_reason",
+        ATTENTION_RUNTIME_PROVIDER_REASON,
+        "attention runtime provider",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.attention_runtime_claim",
+        ATTENTION_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+        "attention runtime provider",
+    )
+    if replacement_available is not True:
+        raise TritonTVMContractError(
+            f"{name} runtime-resolved attention must mark replacement available"
+        )
+    if provider_kind != ATTENTION_PROVIDER_PYTHON_TORCH_HOST_STAGED:
+        raise TritonTVMContractError(
+            f"{name} runtime-resolved attention must name python_torch_host_staged"
+        )
+    if provider_abi_version != ATTENTION_PROVIDER_ABI_VERSION:
+        raise TritonTVMContractError(
+            f"{name} runtime-resolved attention must preserve provider ABI v1"
+        )
+    if performance_claim is not False or uses_host_staging is not True:
+        raise TritonTVMContractError(
+            f"{name} runtime-resolved attention must be correctness-only host staged"
+        )
+
+
+def _validate_attention_accounting_metadata(name: str, attrs) -> None:
+    int_attrs = {
+        attr_name: _int_attr(attrs, f"triton_tvm.{attr_name}")
+        for attr_name in (
+            "attention_runtime_launch_count",
+            "attention_artifact_call_count",
+            "attention_qkv_bytes",
+            "attention_mask_bytes",
+            "attention_output_bytes",
+            "attention_total_io_bytes",
+            "attention_intermediate_buffer_bytes",
+            "attention_host_staging_bytes",
+            "attention_total_accounted_bytes",
+        )
+    }
+    missing = [attr_name for attr_name, value in int_attrs.items() if value is None]
+    if missing:
+        raise TritonTVMContractError(
+            f"{name} attention artifact missing hardening accounting attrs: "
+            + ", ".join(missing)
+        )
+    negative = [attr_name for attr_name, value in int_attrs.items() if int(value or 0) < 0]
+    if negative:
+        raise TritonTVMContractError(
+            f"{name} attention hardening accounting attrs must be non-negative: "
+            + ", ".join(negative)
+        )
+
+    qkv = int_attrs["attention_qkv_bytes"] or 0
+    mask = int_attrs["attention_mask_bytes"] or 0
+    output = int_attrs["attention_output_bytes"] or 0
+    total_io = int_attrs["attention_total_io_bytes"] or 0
+    intermediate = int_attrs["attention_intermediate_buffer_bytes"] or 0
+    host_staging = int_attrs["attention_host_staging_bytes"] or 0
+    total_accounted = int_attrs["attention_total_accounted_bytes"] or 0
+    launch_count = int_attrs["attention_runtime_launch_count"] or 0
+    artifact_calls = int_attrs["attention_artifact_call_count"] or 0
+    status = str(attrs.get("triton_tvm.attention_runtime_status", ""))
+    implementation_kind = str(attrs.get("triton_tvm.implementation_kind", ""))
+
+    if total_io != qkv + mask + output:
+        raise TritonTVMContractError(
+            f"{name} attention total IO bytes must equal QKV + mask + output bytes"
+        )
+    if total_accounted != total_io + intermediate:
+        raise TritonTVMContractError(
+            f"{name} attention total accounted bytes must include intermediate bytes"
+        )
+    if artifact_calls != 1:
+        raise TritonTVMContractError(
+            f"{name} attention artifact must record exactly one artifact call"
+        )
+    if status == ATTENTION_RUNTIME_STATUS_RUNTIME_RESOLVED and launch_count != 1:
+        raise TritonTVMContractError(
+            f"{name} runtime-resolved attention must record one runtime launch"
+        )
+    if status == ATTENTION_RUNTIME_STATUS_ARTIFACT_ONLY and launch_count != 0:
+        raise TritonTVMContractError(
+            f"{name} artifact-only attention must record zero runtime launches"
+        )
+    if implementation_kind == ATTENTION_IMPLEMENTATION_KIND_NATIVE_DECOMPOSED:
+        if intermediate <= 0:
+            raise TritonTVMContractError(
+                f"{name} native attention must account intermediate buffers"
+            )
+        if host_staging != 0:
+            raise TritonTVMContractError(
+                f"{name} native attention must not account host staging"
+            )
+    elif host_staging not in (0, total_io):
+        raise TritonTVMContractError(
+            f"{name} host-staged attention must account host staging as IO bytes"
+        )
 
 
 def _int_attr(attrs, attr_name: str) -> int | None:

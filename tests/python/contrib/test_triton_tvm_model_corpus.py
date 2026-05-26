@@ -29,7 +29,14 @@ from tvm.contrib.triton_tvm.attention import (
     ATTENTION_CONTRACT_LLAMA_DECODE,
     ATTENTION_CONTRACT_UNCLASSIFIED,
     ATTENTION_CONTRACT_VIT_FULL,
+    ATTENTION_IMPLEMENTATION_KIND_NATIVE_DECOMPOSED,
+    ATTENTION_PROVIDER_NATIVE_DECOMPOSED,
+    ATTENTION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    ATTENTION_SEMANTICS_STATUS_ACCEPTED,
+    ATTENTION_RUNTIME_KIND_NATIVE_DECOMPOSED,
+    ATTENTION_RUNTIME_STATUS_ARTIFACT_ONLY,
     ATTENTION_RUNTIME_STATUS_DEFERRED,
+    ATTENTION_RUNTIME_STATUS_RUNTIME_RESOLVED,
 )
 from tvm.contrib.triton_tvm.model_corpus import (
     TritonTVMModelAuditConfig,
@@ -180,11 +187,11 @@ def call(arg0, arg1):
 
 def test_pre_m10_multiline_sdpa_extraction_preserves_source_and_classifies_vit():
     wrapper_source = """
-def call(q, k, v):
+def call(buf_q, buf_k, buf_v):
     out = torch.ops.aten._scaled_dot_product_efficient_attention.default(
-        q,
-        k,
-        v,
+        reinterpret_tensor(buf_q, (1, 4, 5, 16), (320, 16, 64, 1), 0),
+        reinterpret_tensor(buf_k, (1, 4, 5, 16), (320, 16, 64, 1), 0),
+        reinterpret_tensor(buf_v, (1, 4, 5, 16), (320, 16, 64, 1), 0),
         None,
         False,
         scale=0.125,
@@ -206,14 +213,28 @@ def call(q, k, v):
     assert calls[0].attention_abi_version == ATTENTION_ABI_VERSION
     assert calls[0].attention_causal is False
     assert calls[0].attention_mask_kind == "none_or_padding"
-    assert calls[0].attention_runtime_status == ATTENTION_RUNTIME_STATUS_DEFERRED
+    assert calls[0].attention_runtime_status == ATTENTION_RUNTIME_STATUS_ARTIFACT_ONLY
+    assert calls[0].attention_semantics_status == "attention_semantics_accepted"
+    assert calls[0].attention_q_shape == "1, 4, 5, 16"
+    assert calls[0].attention_q_stride == "320, 16, 64, 1"
+    assert calls[0].attention_scale == 0.125
+    assert calls[0].attention_performance_claim is False
+    assert calls[0].attention_runtime_launch_count == 0
+    assert calls[0].attention_artifact_call_count == 1
+    assert calls[0].attention_total_io_bytes == 5120
+    assert calls[0].attention_total_accounted_bytes == 5120
 
 
 def test_pre_m10_llama_prefill_and_decode_attention_classification():
     prefill_source = """
-def call(q, k, v):
+def call(q, k, v, mask):
     return torch.ops.aten._scaled_dot_product_efficient_attention.default(
-        q, k, v, None, True, scale=0.125
+        q,
+        k,
+        reinterpret_tensor(v, (1, 4, 16, 16), (1024, 16, 64, 1), 0),
+        reinterpret_tensor(mask, (1, 4, 16, 16), (256, 0, 16, 1), 0),
+        False,
+        scale=0.25,
     )
 """
     decode_source = """
@@ -238,6 +259,16 @@ def call(q, k, v, past_key_values):
     assert prefill.attention_phase == "causal_prefill"
     assert prefill.attention_causal is True
     assert prefill.attention_kv_cache_policy == "prefill_no_cache_update"
+    assert prefill.attention_runtime_status == ATTENTION_RUNTIME_STATUS_DEFERRED
+    assert prefill.attention_semantics_status == "attention_semantics_accepted"
+    assert prefill.attention_q_shape == "1, 4, 16, 16"
+    assert prefill.attention_mask_shape == "1, 4, 16, 16"
+    assert prefill.attention_mask_stride == "256, 0, 16, 1"
+    assert prefill.attention_runtime_launch_count == 0
+    assert prefill.attention_total_io_bytes == 20480
+    assert prefill.unsupported_attention_runtime_reason == (
+        "attention_llama_prefill_native_decomposed_provider_required_m10_5"
+    )
     assert decode.attention_contract == ATTENTION_CONTRACT_LLAMA_DECODE
     assert decode.attention_phase == "decode"
     assert decode.attention_kv_cache_policy == "kv_cache_layout_deferred"
@@ -273,7 +304,13 @@ def test_pre_m10_report_section_splits_attention_abi_without_changing_pre_m9():
                     "vit_tiny",
                     sdpa_op,
                     "deferred_attention",
-                    source=f"{sdpa_op}(q, k, v, None, False, scale=0.125)",
+                    source=(
+                        f"{sdpa_op}("
+                        "reinterpret_tensor(buf_q, (1, 4, 5, 16), (320, 16, 64, 1), 0), "
+                        "reinterpret_tensor(buf_k, (1, 4, 5, 16), (320, 16, 64, 1), 0), "
+                        "reinterpret_tensor(buf_v, (1, 4, 5, 16), (320, 16, 64, 1), 0), "
+                        "None, False, scale=0.125)"
+                    ),
                 )
             ],
         ),
@@ -289,7 +326,15 @@ def test_pre_m10_report_section_splits_attention_abi_without_changing_pre_m9():
                     "llama_tiny",
                     sdpa_op,
                     "deferred_attention",
-                    source=f"{sdpa_op}(q, k, v, None, True, scale=0.125)",
+                    source=(
+                        f"{sdpa_op}("
+                        "q, k, "
+                        "reinterpret_tensor(buf_v, (1, 4, 16, 16), "
+                        "(1024, 16, 64, 1), 0), "
+                        "reinterpret_tensor(buf_mask, (1, 4, 16, 16), "
+                        "(256, 0, 16, 1), 0), "
+                        "False, scale=0.25)"
+                    ),
                 )
             ],
         ),
@@ -311,8 +356,11 @@ def test_pre_m10_report_section_splits_attention_abi_without_changing_pre_m9():
     pre_m10 = report["pre_m10"]
     assert pre_m10["taxonomy_version"] == 1
     assert pre_m10["observed_attention_call_count"] == 2
-    assert pre_m10["attention_runtime_deferred_count"] == 2
+    assert pre_m10["attention_runtime_deferred_count"] == 1
     assert pre_m10["contract_classes"][ATTENTION_CONTRACT_VIT_FULL]["call_count"] == 1
+    assert pre_m10["contract_classes"][ATTENTION_CONTRACT_VIT_FULL]["runtime_status"] == {
+        ATTENTION_RUNTIME_STATUS_ARTIFACT_ONLY: 1
+    }
     assert (
         pre_m10["contract_classes"][ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL][
             "call_count"
@@ -322,11 +370,260 @@ def test_pre_m10_report_section_splits_attention_abi_without_changing_pre_m9():
     assert pre_m10["contract_classes"][ATTENTION_CONTRACT_LLAMA_DECODE]["call_count"] == 0
     assert len(pre_m10["runtime_deferred_debt"]) == 2
 
+    m10 = report["m10"]
+    assert m10["artifact_count"] == 1
+    assert m10["artifact_only_count"] == 1
+    assert m10["runtime_resolved_count"] == 0
+    assert m10["hardening_status"] == "m10_runtime_hardened_v1"
+    assert m10["runtime_launch_count"] == 0
+    assert m10["artifact_call_count"] == 1
+    assert m10["total_io_bytes"] == 25600
+    assert m10["intermediate_buffer_bytes"] == 0
+    assert m10["host_staging_bytes"] == 0
+    assert m10["unsupported_runtime_reasons"] == {
+        "attention_llama_prefill_native_decomposed_provider_required_m10_5": 1
+    }
+    assert m10["status_counts"] == {
+        ATTENTION_RUNTIME_STATUS_ARTIFACT_ONLY: 1,
+        ATTENTION_RUNTIME_STATUS_DEFERRED: 1,
+    }
+
     markdown = render_capability_markdown(report, title="Pre-M10 Snapshot")
     assert "## Pre-M10 Gate" in markdown
+    assert "## M10 Attention Runtime Entry" in markdown
     assert ATTENTION_CONTRACT_VIT_FULL in markdown
     assert ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL in markdown
     assert ATTENTION_CONTRACT_LLAMA_DECODE in markdown
+
+
+def test_m103_attention_provider_marks_only_vit_runtime_resolved():
+    sdpa_op = "torch.ops.aten._scaled_dot_product_efficient_attention.default"
+    wrapper_source = f"""
+def call(buf_q, buf_k, buf_v):
+    out0 = {sdpa_op}(
+        reinterpret_tensor(buf_q, (1, 4, 5, 16), (320, 16, 64, 1), 0),
+        reinterpret_tensor(buf_k, (1, 4, 5, 16), (320, 16, 64, 1), 0),
+        reinterpret_tensor(buf_v, (1, 4, 5, 16), (320, 16, 64, 1), 0),
+        None,
+        False,
+        scale=0.125,
+    )
+    out1 = {sdpa_op}(buf_q, buf_k, buf_v, None, True, scale=0.125)
+    return out0, out1
+"""
+
+    calls = extract_inductor_wrapper_extern_calls(
+        wrapper_source,
+        case_name="vit_tiny_random",
+        attention_runtime_provider=ATTENTION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    )
+
+    assert calls[0].attention_contract == ATTENTION_CONTRACT_VIT_FULL
+    assert calls[0].attention_runtime_status == ATTENTION_RUNTIME_STATUS_RUNTIME_RESOLVED
+    assert calls[0].attention_provider_kind == ATTENTION_PROVIDER_PYTHON_TORCH_HOST_STAGED
+    assert calls[0].attention_runtime_claim == "correctness_only"
+    assert calls[0].attention_performance_claim is False
+    assert calls[0].attention_uses_host_staging is True
+    assert calls[0].attention_runtime_launch_count == 1
+    assert calls[0].attention_host_staging_bytes == 5120
+    assert calls[1].attention_runtime_status == ATTENTION_RUNTIME_STATUS_DEFERRED
+
+
+def test_m104_native_decomposed_provider_marks_only_vit_runtime_resolved():
+    sdpa_op = "torch.ops.aten._scaled_dot_product_efficient_attention.default"
+    wrapper_source = f"""
+def call(buf_q, buf_k, buf_v):
+    out0 = {sdpa_op}(
+        reinterpret_tensor(buf_q, (1, 4, 5, 16), (320, 16, 64, 1), 0),
+        reinterpret_tensor(buf_k, (1, 4, 5, 16), (320, 16, 64, 1), 0),
+        reinterpret_tensor(buf_v, (1, 4, 5, 16), (320, 16, 64, 1), 0),
+        None,
+        False,
+        scale=0.25,
+    )
+    out1 = {sdpa_op}(buf_q, buf_k, buf_v, None, True, scale=0.125)
+    return out0, out1
+"""
+
+    calls = extract_inductor_wrapper_extern_calls(
+        wrapper_source,
+        case_name="vit_tiny_random",
+        attention_runtime_provider=ATTENTION_PROVIDER_NATIVE_DECOMPOSED,
+    )
+
+    assert calls[0].attention_contract == ATTENTION_CONTRACT_VIT_FULL
+    assert calls[0].attention_runtime_status == ATTENTION_RUNTIME_STATUS_RUNTIME_RESOLVED
+    assert calls[0].attention_provider_kind == ATTENTION_PROVIDER_NATIVE_DECOMPOSED
+    assert calls[0].attention_runtime_kind == ATTENTION_RUNTIME_KIND_NATIVE_DECOMPOSED
+    assert calls[0].attention_runtime_claim == "correctness_only"
+    assert calls[0].attention_performance_claim is False
+    assert calls[0].attention_uses_host_staging is False
+    assert calls[0].attention_runtime_launch_count == 1
+    assert calls[0].attention_intermediate_buffer_bytes == 15360
+    assert calls[1].attention_runtime_status == ATTENTION_RUNTIME_STATUS_DEFERRED
+
+    llama_calls = extract_inductor_wrapper_extern_calls(
+        f"def call(q, k, v):\n    return {sdpa_op}(q, k, v, None, True, scale=0.125)\n",
+        case_name="llama_tiny_random",
+        attention_runtime_provider=ATTENTION_PROVIDER_NATIVE_DECOMPOSED,
+    )
+    assert llama_calls[0].attention_contract == ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL
+    assert llama_calls[0].attention_runtime_status == ATTENTION_RUNTIME_STATUS_DEFERRED
+
+    report = build_model_corpus_report(
+        [
+            _kernel_record(
+                "vit",
+                "vit_tiny_random",
+                "triton_vit_0",
+                make_report_status(ok=True, bucket="translated"),
+            )
+        ],
+        [
+            _model_record(
+                "vit",
+                "vit_tiny_random",
+                kernel_count=1,
+                translated=1,
+                fallback=0,
+                extern_calls=[dict(vars(call)) for call in calls],
+            ),
+            _model_record(
+                "llama",
+                "llama_tiny_random",
+                kernel_count=1,
+                translated=1,
+                fallback=0,
+                extern_calls=[dict(vars(call)) for call in llama_calls],
+            )
+        ],
+        generated_at="2026-05-26T00:00:00+00:00",
+    )
+
+    assert report["m10"]["runtime_resolved_count"] == 1
+    assert report["m10"]["artifact_only_count"] == 0
+    assert report["m10"]["performance_claim"] is False
+    assert report["m10"]["runtime_launch_count"] == 1
+    assert report["m10"]["intermediate_buffer_bytes"] == 15360
+    assert sum(report["m10"]["unsupported_runtime_reasons"].values()) == 2
+    assert report["model_summary"]["full_tvm_runnable_models"] == 0
+
+
+def test_m105_native_decomposed_provider_resolves_vit_and_llama_prefill():
+    sdpa_op = "torch.ops.aten._scaled_dot_product_efficient_attention.default"
+    vit_calls = extract_inductor_wrapper_extern_calls(
+        f"""
+def call(buf_q, buf_k, buf_v):
+    return {sdpa_op}(
+        reinterpret_tensor(buf_q, (1, 4, 5, 16), (320, 16, 64, 1), 0),
+        reinterpret_tensor(buf_k, (1, 4, 5, 16), (320, 16, 64, 1), 0),
+        reinterpret_tensor(buf_v, (1, 4, 5, 16), (320, 16, 64, 1), 0),
+        None,
+        False,
+        scale=0.25,
+    )
+""",
+        case_name="vit_tiny_random",
+        attention_runtime_provider=ATTENTION_PROVIDER_NATIVE_DECOMPOSED,
+    )
+    llama_calls = extract_inductor_wrapper_extern_calls(
+        f"""
+def call(q, k, v, mask):
+    return {sdpa_op}(
+        q,
+        k,
+        reinterpret_tensor(v, (1, 4, 16, 16), (1024, 16, 64, 1), 0),
+        reinterpret_tensor(mask, (1, 4, 16, 16), (256, 0, 16, 1), 0),
+        False,
+        scale=0.25,
+    )
+""",
+        case_name="llama_tiny_random",
+        attention_runtime_provider=ATTENTION_PROVIDER_NATIVE_DECOMPOSED,
+    )
+    decode_calls = extract_inductor_wrapper_extern_calls(
+        f"""
+def call(q, k, v, past_key_values):
+    return {sdpa_op}(q, k, v, past_key_values, True, scale=0.125)
+""",
+        case_name="llama_decode_single_token_cache",
+        attention_runtime_provider=ATTENTION_PROVIDER_NATIVE_DECOMPOSED,
+    )
+
+    assert vit_calls[0].attention_runtime_status == ATTENTION_RUNTIME_STATUS_RUNTIME_RESOLVED
+    assert llama_calls[0].attention_contract == ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL
+    assert llama_calls[0].attention_runtime_status == ATTENTION_RUNTIME_STATUS_RUNTIME_RESOLVED
+    assert llama_calls[0].attention_runtime_kind == ATTENTION_RUNTIME_KIND_NATIVE_DECOMPOSED
+    assert llama_calls[0].attention_provider_kind == ATTENTION_PROVIDER_NATIVE_DECOMPOSED
+    assert llama_calls[0].attention_uses_host_staging is False
+    assert llama_calls[0].attention_performance_claim is False
+    assert llama_calls[0].attention_mask_shape == "1, 4, 16, 16"
+    assert llama_calls[0].attention_runtime_launch_count == 1
+    assert llama_calls[0].attention_mask_bytes == 4096
+    assert llama_calls[0].attention_intermediate_buffer_bytes == 139264
+    assert decode_calls[0].attention_contract == ATTENTION_CONTRACT_LLAMA_DECODE
+    assert decode_calls[0].attention_runtime_status == ATTENTION_RUNTIME_STATUS_DEFERRED
+    assert decode_calls[0].unsupported_attention_runtime_reason == (
+        "attention_llama_decode_synthetic_only_m10_6"
+    )
+
+    report = build_model_corpus_report(
+        [
+            _kernel_record(
+                "vit",
+                "vit_tiny_random",
+                "triton_vit_0",
+                make_report_status(ok=True, bucket="translated"),
+            ),
+            _kernel_record(
+                "llama",
+                "llama_tiny_random",
+                "triton_llama_0",
+                make_report_status(ok=True, bucket="translated"),
+            ),
+        ],
+        [
+            _model_record(
+                "vit",
+                "vit_tiny_random",
+                kernel_count=1,
+                translated=1,
+                fallback=0,
+                extern_calls=[dict(vars(call)) for call in vit_calls],
+            ),
+            _model_record(
+                "llama",
+                "llama_tiny_random",
+                kernel_count=1,
+                translated=1,
+                fallback=0,
+                extern_calls=[dict(vars(call)) for call in llama_calls],
+            ),
+            _model_record(
+                "llama",
+                "llama_decode_single_token_cache",
+                kernel_count=0,
+                translated=0,
+                fallback=0,
+                extern_calls=[dict(vars(call)) for call in decode_calls],
+            ),
+        ],
+        generated_at="2026-05-26T00:00:00+00:00",
+    )
+
+    assert report["m10"]["runtime_resolved_count"] == 2
+    assert report["m10"]["artifact_only_count"] == 0
+    assert report["m10"]["performance_claim"] is False
+    assert report["m10"]["runtime_launch_count"] == 2
+    assert report["m10"]["total_io_bytes"] == 25600
+    assert report["m10"]["intermediate_buffer_bytes"] == 154624
+    assert report["m10"]["unsupported_runtime_reasons"] == {
+        "attention_llama_decode_synthetic_only_m10_6": 1
+    }
+    assert report["pre_m10"]["contract_classes"][ATTENTION_CONTRACT_LLAMA_DECODE][
+        "runtime_status"
+    ] == {ATTENTION_RUNTIME_STATUS_DEFERRED: 1}
+    assert report["model_summary"]["full_tvm_runnable_models"] == 0
 
 
 def test_m6_model_report_groups_models_and_ranks_blockers(tmp_path):
@@ -821,6 +1118,126 @@ def test_pre_m9_report_section_splits_extern_gemm_from_deferred_grid_conv_attent
     assert "## Pre-M9 Gate" in markdown
     assert "extern_gemm" in markdown
     assert "deferred_convolution" in markdown
+
+
+def test_pre_m11_report_section_classifies_vision_debt_and_attention_boundary():
+    sdpa_op = "torch.ops.aten._scaled_dot_product_efficient_attention.default"
+    records = [
+        _kernel_record(
+            "vit",
+            "vit_tiny",
+            "triton_vit_grid_0",
+            make_report_status(
+                ok=False,
+                bucket="contract_error",
+                fallback_reason="unsupported_inductor_kernel",
+            ),
+            grid_type="Grid2D",
+        ),
+        _kernel_record(
+            "yolo",
+            "yolo_tiny",
+            "triton_yolo_grid_0",
+            make_report_status(
+                ok=False,
+                bucket="contract_error",
+                fallback_reason="unsupported_inductor_kernel",
+            ),
+            grid_type="Grid2D",
+        ),
+        _kernel_record(
+            "llama",
+            "llama_tiny",
+            "triton_llama_0",
+            make_report_status(ok=True, bucket="translated"),
+        ),
+    ]
+    models = [
+        _model_record(
+            "vit",
+            "vit_tiny",
+            kernel_count=1,
+            translated=0,
+            fallback=1,
+            extern_calls=[
+                _extern_call(
+                    "vit",
+                    "vit_tiny",
+                    "extern_kernels.convolution",
+                    "deferred_convolution",
+                ),
+                _extern_call(
+                    "vit",
+                    "vit_tiny",
+                    sdpa_op,
+                    "deferred_attention",
+                    attention_contract=ATTENTION_CONTRACT_VIT_FULL,
+                    attention_semantics_status=ATTENTION_SEMANTICS_STATUS_ACCEPTED,
+                    attention_implementation_kind=(
+                        ATTENTION_IMPLEMENTATION_KIND_NATIVE_DECOMPOSED
+                    ),
+                    attention_runtime_kind=ATTENTION_RUNTIME_KIND_NATIVE_DECOMPOSED,
+                    attention_provider_kind=ATTENTION_PROVIDER_NATIVE_DECOMPOSED,
+                    attention_runtime_status=ATTENTION_RUNTIME_STATUS_RUNTIME_RESOLVED,
+                    attention_performance_claim=False,
+                    attention_uses_host_staging=False,
+                ),
+            ],
+        ),
+        _model_record(
+            "yolo",
+            "yolo_tiny",
+            kernel_count=1,
+            translated=0,
+            fallback=1,
+            extern_calls=[
+                _extern_call(
+                    "yolo",
+                    "yolo_tiny",
+                    "extern_kernels.convolution",
+                    "deferred_convolution",
+                )
+            ],
+        ),
+        _model_record("llama", "llama_tiny", kernel_count=1, translated=1, fallback=0),
+    ]
+
+    report = build_model_corpus_report(
+        records,
+        models,
+        generated_at="2026-05-26T00:00:00+00:00",
+    )
+
+    pre_m11 = report["pre_m11"]
+    assert pre_m11["taxonomy_version"] == 1
+    assert pre_m11["gate_status"] == "pre_m11_debt_classified_v1"
+    assert pre_m11["primary_debt_counts"] == {
+        "captured_grid": 2,
+        "deferred_convolution": 2,
+    }
+    debt_by_kind = {entry["debt_kind"]: entry for entry in pre_m11["entry_debt"]}
+    assert debt_by_kind["wrapper_convolution"]["op_family"] == "deferred_convolution"
+    assert debt_by_kind["wrapper_convolution"]["call_count"] == 2
+    assert debt_by_kind["captured_grid"]["pre_m11_family"] == "captured_grid"
+    assert debt_by_kind["captured_grid"]["kernel_count"] == 2
+    assert debt_by_kind["captured_grid"]["models"] == ["vit_tiny", "yolo_tiny"]
+    assert (
+        pre_m11["vision_op_policy"]["implementation_policy"]["implicit_pytorch_fallback"]
+        == "disallowed"
+    )
+    assert "nms" in pre_m11["vision_op_policy"]["operator_families"]["yolo_postprocess"]
+    attention_boundary = pre_m11["attention_boundary"]
+    assert attention_boundary["m11_entry_debt"] is False
+    assert attention_boundary["historical_deferred_attention_family_count"] == 1
+    assert attention_boundary["runtime_resolved_attention_count"] == 1
+    assert attention_boundary["runtime_deferred_attention_count"] == 0
+    assert attention_boundary["boundary_status"] == "m10_runtime_closed"
+    assert "rope_runtime" in pre_m11["still_deferred_elsewhere"]
+
+    markdown = render_capability_markdown(report, title="Pre-M11 Snapshot")
+    assert "## Pre-M11 Gate" in markdown
+    assert "deferred_convolution" in markdown
+    assert "captured_grid" in markdown
 
 
 def test_m96_provider_enabled_report_keeps_captured_kernel_counts_stable():

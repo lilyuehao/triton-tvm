@@ -37,6 +37,9 @@ import pytest
 import tvm
 import tvm.testing
 from tvm.contrib.triton_tvm import build_triton_tvm, lower_to_ttir, translate_ttir
+from tvm.contrib.triton_tvm.m10_attention_baseline import run_attention_baseline
+from tvm.contrib.triton_tvm.m11_vision_baseline import run_vision_baseline
+from tvm.contrib.triton_tvm.m116_vision_dashboard import run_vision_grid2d_dashboard
 from tvm.contrib.triton_tvm.m9p_matmul_dashboard import run_dashboard
 from tvm.contrib.triton_tvm.matmul import NATIVE_TIR_MATMUL_SCHEDULE_ID
 
@@ -51,6 +54,9 @@ except ImportError:
 _RUN_PERF = os.environ.get("TRITON_TVM_RUN_PERF_BASELINE") == "1"
 _RUN_M9_MATMUL_PERF = os.environ.get("TRITON_TVM_RUN_M9_MATMUL_PERF_GUARD") == "1"
 _RUN_M9P_MATMUL_DASHBOARD = os.environ.get("TRITON_TVM_RUN_M9P_MATMUL_DASHBOARD") == "1"
+_RUN_M10_ATTENTION_BASELINE = os.environ.get("TRITON_TVM_RUN_M10_ATTENTION_BASELINE") == "1"
+_RUN_M11_VISION_BASELINE = os.environ.get("TRITON_TVM_RUN_M11_VISION_BASELINE") == "1"
+_RUN_M11_6_GRID2D_DASHBOARD = os.environ.get("TRITON_TVM_RUN_M11_6_GRID2D_DASHBOARD") == "1"
 _DEFAULT_N = int(os.environ.get("TRITON_TVM_PERF_N", str(2**22)))
 _DEFAULT_BLOCK = int(os.environ.get("TRITON_TVM_PERF_BLOCK", "256"))
 _TVM_NUMBER = int(os.environ.get("TRITON_TVM_PERF_TVM_NUMBER", "20"))
@@ -313,6 +319,75 @@ def test_m9p_matmul_dashboard_perf(tmp_path):
         assert case["baseline_triton_us"] > 0.0
         assert case["triton_tvm_us"] > 0.0
         assert case["tflops"] > 0.0
+        assert case["correctness_allclose"] is True
+
+
+@pytest.mark.skipif(
+    not _RUN_M10_ATTENTION_BASELINE,
+    reason="Set TRITON_TVM_RUN_M10_ATTENTION_BASELINE=1 to run the M10 attention baseline",
+)
+@tvm.testing.requires_cuda
+def test_m10_attention_baseline_perf(tmp_path):
+    report = run_attention_baseline(out_dir=tmp_path, warmup=2, repeat=5, run_benchmarks=True)
+    print("TRITON_TVM_M10_ATTENTION_BASELINE " + json.dumps(report, indent=2, sort_keys=True))
+
+    assert report["report_kind"] == "triton_tvm_m10_attention_performance_baseline"
+    assert report["summary"]["measured_cases"] == 2
+    assert report["summary"]["allclose_cases"] == 2
+    assert report["attention_runtime_provider_performance_claim"] is False
+    for case in report["cases"]:
+        assert case["torch_sdpa_us"] > 0.0
+        assert case["triton_tvm_us"] > 0.0
+        assert case["qk_av_gflops"] > 0.0
+        assert case["correctness_allclose"] is True
+
+
+@pytest.mark.skipif(
+    not _RUN_M11_VISION_BASELINE,
+    reason="Set TRITON_TVM_RUN_M11_VISION_BASELINE=1 to run the M11 vision baseline",
+)
+@tvm.testing.requires_cuda
+def test_m11_vision_baseline_perf(tmp_path):
+    report = run_vision_baseline(out_dir=tmp_path, warmup=2, repeat=5, run_benchmarks=True)
+    print("TRITON_TVM_M11_VISION_BASELINE " + json.dumps(report, indent=2, sort_keys=True))
+
+    assert report["report_kind"] == "triton_tvm_m11_vision_performance_baseline"
+    assert report["summary"]["measured_cases"] == 1
+    assert report["summary"]["allclose_cases"] == 1
+    assert report["vision_runtime_provider_performance_claim"] is False
+    case = report["cases"][0]
+    assert case["torch_conv2d_us"] > 0.0
+    assert case["triton_tvm_us"] > 0.0
+    assert case["conv_gflops"] > 0.0
+    assert case["correctness_allclose"] is True
+
+
+@pytest.mark.skipif(
+    not _RUN_M11_6_GRID2D_DASHBOARD,
+    reason="Set TRITON_TVM_RUN_M11_6_GRID2D_DASHBOARD=1 to run the M11.6 Grid2D dashboard",
+)
+@tvm.testing.requires_cuda
+def test_m11_6_grid2d_dashboard_perf(tmp_path):
+    report = run_vision_grid2d_dashboard(
+        out_dir=tmp_path,
+        warmup=2,
+        repeat=5,
+        run_benchmarks=True,
+    )
+    print("TRITON_TVM_M11_6_GRID2D_DASHBOARD " + json.dumps(report, indent=2, sort_keys=True))
+
+    assert report["report_kind"] == "triton_tvm_m11_6_vision_perf_dashboard"
+    assert report["summary"]["measured_cases"] == 5
+    assert report["summary"]["allclose_cases"] == 5
+    assert report["summary"]["host_staged_cases"] == 0
+    assert report["invariants"]["status"] == "passed"
+    for case in report["cases"]:
+        assert case["provider_kind"] == "native_tvm_grid2d"
+        assert case["host_staging_bytes"] == 0
+        assert case["performance_claim"] is True
+        assert case["native_inductor_us"] > 0.0
+        assert case["triton_tvm_us"] > 0.0
+        assert case["gbps_or_effective_bandwidth"] > 0.0
         assert case["correctness_allclose"] is True
 
 

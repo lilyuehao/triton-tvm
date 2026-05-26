@@ -42,7 +42,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .attention import ATTENTION_REPORT_FIELDS, classify_wrapper_sdpa_attention
+from .attention import (
+    ATTENTION_PROVIDER_NONE,
+    ATTENTION_REPORT_FIELDS,
+    wrapper_sdpa_attention_report_fields,
+)
 from .errors import (
     TritonTVMContractError,
     UnsupportedContractError,
@@ -77,6 +81,11 @@ from .reporting import (
 from .runtime import TritonTVMArtifact, build_triton_tvm
 from .translator import translate_ttir
 from .ttir import TTIRReader
+from .vision import (
+    VISION_PROVIDER_NONE,
+    VISION_REPORT_FIELDS,
+    wrapper_conv2d_vision_report_fields,
+)
 
 
 _HOOK_LOCK = threading.RLock()
@@ -148,6 +157,91 @@ class InductorWrapperExternCall:
     attention_sequence_policy: str = ""
     attention_runtime_status: str = ""
     unsupported_attention_reason: str = ""
+    attention_semantics_status: str = ""
+    attention_q_shape: str = ""
+    attention_k_shape: str = ""
+    attention_v_shape: str = ""
+    attention_output_shape: str = ""
+    attention_q_stride: str = ""
+    attention_k_stride: str = ""
+    attention_v_stride: str = ""
+    attention_output_stride: str = ""
+    attention_mask_param: str = ""
+    attention_mask_shape: str = ""
+    attention_mask_stride: str = ""
+    attention_mask_dtype: str = ""
+    attention_q_dtype: str = ""
+    attention_k_dtype: str = ""
+    attention_v_dtype: str = ""
+    attention_output_dtype: str = ""
+    attention_scale: float | None = None
+    attention_implementation_kind: str = ""
+    attention_extern_symbol: str = ""
+    attention_extern_packed_func: str = ""
+    attention_runtime_kind: str = ""
+    attention_runtime_replacement: str = ""
+    attention_runtime_replacement_available: bool = False
+    attention_runtime_replacement_reason: str = ""
+    attention_provider_kind: str = ""
+    attention_provider_abi_version: int = 0
+    attention_runtime_claim: str = ""
+    attention_performance_claim: bool = False
+    attention_uses_host_staging: bool = False
+    attention_runtime_launch_count: int = 0
+    attention_artifact_call_count: int = 0
+    attention_qkv_bytes: int = 0
+    attention_mask_bytes: int = 0
+    attention_output_bytes: int = 0
+    attention_total_io_bytes: int = 0
+    attention_intermediate_buffer_bytes: int = 0
+    attention_host_staging_bytes: int = 0
+    attention_total_accounted_bytes: int = 0
+    unsupported_attention_runtime_reason: str = ""
+    vision_source_kind: str = ""
+    vision_contract: str = ""
+    vision_contract_version: str = ""
+    vision_op_family: str = ""
+    vision_semantics_status: str = ""
+    vision_layout: str = ""
+    vision_input_shape: str = ""
+    vision_weight_shape: str = ""
+    vision_output_shape: str = ""
+    vision_input_stride: str = ""
+    vision_weight_stride: str = ""
+    vision_output_stride: str = ""
+    vision_stride: str = ""
+    vision_padding: str = ""
+    vision_dilation: str = ""
+    vision_groups: int = 0
+    vision_bias_policy: str = ""
+    vision_transposed: bool = False
+    vision_output_padding: str = ""
+    vision_input_dtype: str = ""
+    vision_weight_dtype: str = ""
+    vision_output_dtype: str = ""
+    vision_implementation_kind: str = ""
+    vision_extern_symbol: str = ""
+    vision_extern_packed_func: str = ""
+    vision_runtime_kind: str = ""
+    vision_runtime_replacement: str = ""
+    vision_runtime_replacement_available: bool = False
+    vision_runtime_replacement_reason: str = ""
+    vision_runtime_status: str = ""
+    vision_provider_kind: str = ""
+    vision_provider_abi_version: int = 0
+    vision_runtime_claim: str = ""
+    vision_performance_claim: bool = False
+    vision_uses_host_staging: bool = False
+    vision_runtime_launch_count: int = 0
+    vision_artifact_call_count: int = 0
+    vision_input_bytes: int = 0
+    vision_weight_bytes: int = 0
+    vision_output_bytes: int = 0
+    vision_total_io_bytes: int = 0
+    vision_host_staging_bytes: int = 0
+    vision_total_accounted_bytes: int = 0
+    unsupported_vision_reason: str = ""
+    unsupported_vision_runtime_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -695,6 +789,8 @@ def extract_inductor_wrapper_extern_calls(
     case_name: str = "",
     wrapper_path: str = "",
     extern_gemm_runtime_provider: str = EXTERN_GEMM_PROVIDER_NONE,
+    attention_runtime_provider: str = ATTENTION_PROVIDER_NONE,
+    vision_runtime_provider: str = VISION_PROVIDER_NONE,
 ) -> list[InductorWrapperExternCall]:
     """Extract wrapper-level extern/ATen calls that are not Triton kernels."""
     tree = ast.parse(wrapper_source)
@@ -731,6 +827,16 @@ def extract_inductor_wrapper_extern_calls(
                     op_family,
                     source,
                     case_name=case_name,
+                    attention_runtime_provider=attention_runtime_provider,
+                ),
+                **_wrapper_extern_vision_fields(
+                    op_name,
+                    op_family,
+                    source,
+                    full_source=wrapper_source,
+                    line_no=line_no,
+                    case_name=case_name,
+                    vision_runtime_provider=vision_runtime_provider,
                 ),
             )
         )
@@ -937,24 +1043,97 @@ def _wrapper_extern_attention_fields(
     source: str,
     *,
     case_name: str,
+    attention_runtime_provider: str = ATTENTION_PROVIDER_NONE,
 ) -> dict[str, Any]:
     if op_family != "deferred_attention":
         return {
             field_name: (
                 0
-                if field_name == "attention_abi_version"
+                if field_name
+                in {
+                    "attention_abi_version",
+                    "attention_provider_abi_version",
+                    "attention_runtime_launch_count",
+                    "attention_artifact_call_count",
+                    "attention_qkv_bytes",
+                    "attention_mask_bytes",
+                    "attention_output_bytes",
+                    "attention_total_io_bytes",
+                    "attention_intermediate_buffer_bytes",
+                    "attention_host_staging_bytes",
+                    "attention_total_accounted_bytes",
+                }
                 else False
-                if field_name == "attention_causal"
+                if field_name
+                in {
+                    "attention_causal",
+                    "attention_runtime_replacement_available",
+                    "attention_performance_claim",
+                    "attention_uses_host_staging",
+                }
+                else None
+                if field_name == "attention_scale"
                 else ""
             )
             for field_name in ATTENTION_REPORT_FIELDS
         }
-    return classify_wrapper_sdpa_attention(
+    return wrapper_sdpa_attention_report_fields(
         op_name=op_name,
         op_family=op_family,
         source=source,
         case_name=case_name,
-    ).as_report_fields()
+        attention_runtime_provider=attention_runtime_provider,
+    )
+
+
+def _wrapper_extern_vision_fields(
+    op_name: str,
+    op_family: str,
+    source: str,
+    *,
+    full_source: str,
+    line_no: int,
+    case_name: str,
+    vision_runtime_provider: str = VISION_PROVIDER_NONE,
+) -> dict[str, Any]:
+    if op_family != "deferred_convolution":
+        return {
+            field_name: (
+                0
+                if field_name
+                in {
+                    "vision_groups",
+                    "vision_provider_abi_version",
+                    "vision_runtime_launch_count",
+                    "vision_artifact_call_count",
+                    "vision_input_bytes",
+                    "vision_weight_bytes",
+                    "vision_output_bytes",
+                    "vision_total_io_bytes",
+                    "vision_host_staging_bytes",
+                    "vision_total_accounted_bytes",
+                }
+                else False
+                if field_name
+                in {
+                    "vision_transposed",
+                    "vision_runtime_replacement_available",
+                    "vision_performance_claim",
+                    "vision_uses_host_staging",
+                }
+                else ""
+            )
+            for field_name in VISION_REPORT_FIELDS
+        }
+    return wrapper_conv2d_vision_report_fields(
+        op_name=op_name,
+        op_family=op_family,
+        source=source,
+        full_source=full_source,
+        line_no=line_no,
+        case_name=case_name,
+        vision_runtime_provider=vision_runtime_provider,
+    )
 
 
 def _attribute_chain(node: ast.AST) -> str:
