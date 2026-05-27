@@ -205,6 +205,8 @@ class TTIRReader:
                 attrs.update(self._parse_attr_dict(raw_attrs))
         elif name == "tt.dot":
             raw_attrs = _extract_first_attr_dict(rest)
+            if not raw_attrs:
+                raw_attrs = _extract_bare_attrs_after_operands(rest)
             if raw_attrs:
                 attrs["raw_attrs"] = raw_attrs
                 attrs.update(self._parse_attr_dict(raw_attrs))
@@ -219,7 +221,7 @@ class TTIRReader:
         if name in ("tt.load", "tt.store"):
             raw_attrs = _extract_first_attr_dict(rest)
             if not raw_attrs:
-                raw_attrs = _extract_bare_load_store_attrs(rest)
+                raw_attrs = _extract_bare_attrs_after_operands(rest)
             if raw_attrs:
                 attrs["raw_attrs"] = raw_attrs
                 attrs["unknown_attrs"] = self._parse_attr_dict(raw_attrs)
@@ -429,8 +431,8 @@ def _extract_first_attr_dict(text: str) -> str:
     return ""
 
 
-def _extract_bare_load_store_attrs(text: str) -> str:
-    """Extract unbraced load/store attrs such as ``evictionPolicy = evict_last``."""
+def _extract_bare_attrs_after_operands(text: str) -> str:
+    """Extract unbraced attrs after SSA operands and before the type separator."""
     prefix = text.rsplit(":", 1)[0].strip() if ":" in text else text.strip()
     operand_matches = list(re.finditer(r"%[\w$.]+", prefix))
     if not operand_matches:

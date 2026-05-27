@@ -60,6 +60,7 @@ from .matmul import (
     EXTERN_ADDMM_BIAS_RUNTIME_REPLACEMENT_REASON,
     EXTERN_ADDMM_BIAS_SYMBOL,
     EXTERN_GEMM_PACKED_FUNC,
+    EXTERN_GEMM_PROVIDER_NATIVE_TVM,
     EXTERN_GEMM_PROVIDER_NONE,
     EXTERN_GEMM_RUNTIME_KIND,
     EXTERN_GEMM_RUNTIME_REPLACEMENT,
@@ -789,6 +790,7 @@ def extract_inductor_wrapper_extern_calls(
     case_name: str = "",
     wrapper_path: str = "",
     extern_gemm_runtime_provider: str = EXTERN_GEMM_PROVIDER_NONE,
+    extern_gemm_runtime_model_case: str = "",
     attention_runtime_provider: str = ATTENTION_PROVIDER_NONE,
     vision_runtime_provider: str = VISION_PROVIDER_NONE,
 ) -> list[InductorWrapperExternCall]:
@@ -821,6 +823,7 @@ def extract_inductor_wrapper_extern_calls(
                     source,
                     case_name=case_name,
                     extern_gemm_runtime_provider=extern_gemm_runtime_provider,
+                    extern_gemm_runtime_model_case=extern_gemm_runtime_model_case,
                 ),
                 **_wrapper_extern_attention_fields(
                     op_name,
@@ -850,6 +853,7 @@ def _wrapper_extern_matmul_fields(
     *,
     case_name: str,
     extern_gemm_runtime_provider: str = EXTERN_GEMM_PROVIDER_NONE,
+    extern_gemm_runtime_model_case: str = "",
 ) -> dict[str, Any]:
     empty = {
         "matmul_source_kind": "",
@@ -885,6 +889,11 @@ def _wrapper_extern_matmul_fields(
         "matmul_b_stride": None,
         "matmul_c_stride": None,
     }
+    effective_extern_gemm_runtime_provider = _effective_extern_gemm_runtime_provider(
+        extern_gemm_runtime_provider,
+        case_name=case_name,
+        model_case_scope=extern_gemm_runtime_model_case,
+    )
     if op_family == "extern_addmm_bias":
         try:
             semantics = extract_matmul_semantics_from_wrapper_extern_addmm(
@@ -897,7 +906,7 @@ def _wrapper_extern_matmul_fields(
             )
             decision = TargetMatmulPolicy(
                 target_kind="cuda",
-                extern_gemm_runtime_provider=extern_gemm_runtime_provider,
+                extern_gemm_runtime_provider=effective_extern_gemm_runtime_provider,
             ).decide(
                 semantics,
                 matmul_contract_ok=True,
@@ -919,7 +928,7 @@ def _wrapper_extern_matmul_fields(
             "matmul_k": semantics.k,
             "matmul_contract": "matmul_minimal",
             "matmul_contract_ok": decision.matmul_contract_ok
-            and decision.implementation_kind == "extern_addmm_bias",
+            and decision.implementation_kind in {"extern_addmm_bias", "native_tir_schedule"},
             "matmul_a_dtype": semantics.a_dtype,
             "matmul_b_dtype": semantics.b_dtype,
             "matmul_accumulator_dtype": semantics.accumulator_dtype,
@@ -928,7 +937,11 @@ def _wrapper_extern_matmul_fields(
             "implementation_kind": decision.implementation_kind,
             "schedule_id": decision.schedule_id,
             "extern_symbol": decision.extern_symbol or EXTERN_ADDMM_BIAS_SYMBOL,
-            "extern_packed_func": decision.extern_packed_func or EXTERN_ADDMM_BIAS_PACKED_FUNC,
+            "extern_packed_func": _extern_packed_func_for_decision(
+                decision.extern_packed_func,
+                decision.implementation_kind,
+                EXTERN_ADDMM_BIAS_PACKED_FUNC,
+            ),
             "extern_runtime_kind": decision.extern_runtime_kind or EXTERN_GEMM_RUNTIME_KIND,
             "extern_runtime_replacement": (
                 decision.extern_runtime_replacement or EXTERN_GEMM_RUNTIME_REPLACEMENT
@@ -973,7 +986,7 @@ def _wrapper_extern_matmul_fields(
         )
         decision = TargetMatmulPolicy(
             target_kind="cuda",
-            extern_gemm_runtime_provider=extern_gemm_runtime_provider,
+            extern_gemm_runtime_provider=effective_extern_gemm_runtime_provider,
         ).decide(
             semantics,
             matmul_contract_ok=True,
@@ -995,7 +1008,7 @@ def _wrapper_extern_matmul_fields(
         "matmul_k": semantics.k,
         "matmul_contract": "matmul_minimal",
         "matmul_contract_ok": decision.matmul_contract_ok
-        and decision.implementation_kind == "extern_gemm",
+        and decision.implementation_kind in {"extern_gemm", "native_tir_schedule"},
         "matmul_a_dtype": semantics.a_dtype,
         "matmul_b_dtype": semantics.b_dtype,
         "matmul_accumulator_dtype": semantics.accumulator_dtype,
@@ -1004,7 +1017,11 @@ def _wrapper_extern_matmul_fields(
         "implementation_kind": decision.implementation_kind,
         "schedule_id": decision.schedule_id,
         "extern_symbol": decision.extern_symbol,
-        "extern_packed_func": decision.extern_packed_func or EXTERN_GEMM_PACKED_FUNC,
+        "extern_packed_func": _extern_packed_func_for_decision(
+            decision.extern_packed_func,
+            decision.implementation_kind,
+            EXTERN_GEMM_PACKED_FUNC,
+        ),
         "extern_runtime_kind": decision.extern_runtime_kind or EXTERN_GEMM_RUNTIME_KIND,
         "extern_runtime_replacement": (
             decision.extern_runtime_replacement or EXTERN_GEMM_RUNTIME_REPLACEMENT
@@ -1035,6 +1052,31 @@ def _wrapper_extern_matmul_fields(
         "matmul_b_stride": semantics.b_stride,
         "matmul_c_stride": semantics.c_stride,
     }
+
+
+def _effective_extern_gemm_runtime_provider(
+    provider: str,
+    *,
+    case_name: str,
+    model_case_scope: str,
+) -> str:
+    if not model_case_scope:
+        return provider
+    if case_name == model_case_scope:
+        return provider
+    if provider == EXTERN_GEMM_PROVIDER_NATIVE_TVM:
+        return EXTERN_GEMM_PROVIDER_NONE
+    return provider
+
+
+def _extern_packed_func_for_decision(
+    packed_func: str,
+    implementation_kind: str,
+    artifact_packed_func: str,
+) -> str:
+    if implementation_kind == "native_tir_schedule":
+        return packed_func
+    return packed_func or artifact_packed_func
 
 
 def _wrapper_extern_attention_fields(

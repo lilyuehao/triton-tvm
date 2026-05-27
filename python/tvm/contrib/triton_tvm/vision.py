@@ -56,12 +56,19 @@ VISION_RUNTIME_STATUS_UNSUPPORTED = "unsupported"
 VISION_RUNTIME_KIND_PROVIDER = "runtime_provider"
 VISION_PROVIDER_NONE = "none"
 VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED = "python_torch_host_staged"
+VISION_PROVIDER_DEVICE_TORCH_CUDA = "device_torch_cuda"
+VISION_PROVIDER_NATIVE_TVM_CONV2D = "native_tvm_conv2d"
 VISION_PROVIDER_ABI_VERSION = 1
 VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY = "correctness_only"
+VISION_RUNTIME_CLAIM_PERFORMANCE_ELIGIBLE = "performance_eligible"
 VISION_RUNTIME_PROVIDER_REASON = "extern_conv2d_python_torch_host_staged_provider_enabled"
+VISION_RUNTIME_DEVICE_PROVIDER_REASON = "extern_conv2d_device_torch_cuda_provider_enabled"
 VISION_RUNTIME_PROVIDER_UNKNOWN_REASON = "vision_conv2d_runtime_provider_unknown_m11_4"
 VISION_M11_4_RUNTIME_PROVIDER_SCOPE_REASON = "vision_conv2d_provider_scope_m11_4_vit_patch_only"
 VISION_RUNTIME_PROVIDER_SCOPE_REASON = "vision_conv2d_provider_scope_m11_6_static_conv2d_only"
+VISION_M11_7_DEVICE_PROVIDER_SCOPE_REASON = (
+    "vision_conv2d_device_provider_scope_m11_7_static_conv2d_only"
+)
 VISION_M11_4_INTERFACE_STATUS = "m11_4_runtime_resolved_vit_patch_conv_v1"
 VISION_M11_5_HARDENING_STATUS = "m11_5_vision_runtime_hardened_v1"
 VISION_M11_5_RUNTIME_SCOPE_STATUS = "m11_5_exact_vit_patch_runtime_scope_v1"
@@ -71,6 +78,9 @@ VISION_M11_6_RUNTIME_SCOPE_STATUS = "m11_6_static_conv2d_runtime_scope_v1"
 VISION_M11_6_CORPUS_DIFF_BASELINE_ID = (
     "m11_6_vision_runtime_grid2d_readiness_baseline_v1"
 )
+VISION_M11_7_INTERFACE_STATUS = "m11_7_vision_native_hotpath_runtime_closure_v1"
+VISION_M11_7_RUNTIME_SCOPE_STATUS = "m11_7_device_static_conv2d_hotpath_scope_v1"
+VISION_M11_7_CORPUS_DIFF_BASELINE_ID = "m11_7_vision_native_hotpath_baseline_v1"
 VISION_M11_4_VIT_PATCH_INPUT_SHAPE = (1, 3, 32, 32)
 VISION_M11_4_VIT_PATCH_WEIGHT_SHAPE = (64, 3, 16, 16)
 VISION_M11_4_VIT_PATCH_OUTPUT_SHAPE = (1, 64, 2, 2)
@@ -341,6 +351,7 @@ class TargetVisionPolicy:
         if self.vision_runtime_provider not in {
             VISION_PROVIDER_NONE,
             VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+            VISION_PROVIDER_DEVICE_TORCH_CUDA,
         }:
             return TargetVisionDecision(
                 vision_contract_ok=True,
@@ -386,6 +397,43 @@ class TargetVisionPolicy:
                 vision_uses_host_staging=False,
                 vision_artifact_call_count=1,
                 unsupported_vision_runtime_reason=VISION_RUNTIME_PROVIDER_SCOPE_REASON,
+            ).with_accounting(semantics)
+        if self.vision_runtime_provider == VISION_PROVIDER_DEVICE_TORCH_CUDA:
+            if is_m11_7_device_conv2d_runtime_scope(semantics):
+                return TargetVisionDecision(
+                    vision_contract_ok=True,
+                    implementation_kind=VISION_IMPLEMENTATION_KIND_EXTERN_CONV2D,
+                    extern_symbol=VISION_EXTERN_SYMBOL,
+                    extern_packed_func=VISION_EXTERN_PACKED_FUNC,
+                    vision_runtime_kind=VISION_RUNTIME_KIND_PROVIDER,
+                    vision_runtime_replacement=VISION_PROVIDER_DEVICE_TORCH_CUDA,
+                    vision_runtime_replacement_available=True,
+                    vision_runtime_replacement_reason=VISION_RUNTIME_DEVICE_PROVIDER_REASON,
+                    vision_runtime_status=VISION_RUNTIME_STATUS_RUNTIME_RESOLVED,
+                    vision_provider_kind=VISION_PROVIDER_DEVICE_TORCH_CUDA,
+                    vision_provider_abi_version=VISION_PROVIDER_ABI_VERSION,
+                    vision_runtime_claim=VISION_RUNTIME_CLAIM_PERFORMANCE_ELIGIBLE,
+                    vision_performance_claim=True,
+                    vision_uses_host_staging=False,
+                    vision_artifact_call_count=1,
+                ).with_accounting(semantics)
+            return TargetVisionDecision(
+                vision_contract_ok=True,
+                implementation_kind=VISION_IMPLEMENTATION_KIND_EXTERN_CONV2D,
+                extern_symbol=VISION_EXTERN_SYMBOL,
+                extern_packed_func=VISION_EXTERN_PACKED_FUNC,
+                vision_runtime_kind=VISION_RUNTIME_KIND_ARTIFACT_ONLY,
+                vision_runtime_replacement=VISION_RUNTIME_REPLACEMENT,
+                vision_runtime_replacement_available=False,
+                vision_runtime_replacement_reason=VISION_RUNTIME_REPLACEMENT_REASON,
+                vision_runtime_status=VISION_RUNTIME_STATUS_ARTIFACT_ONLY,
+                vision_provider_kind=VISION_PROVIDER_NONE,
+                vision_provider_abi_version=0,
+                vision_runtime_claim="",
+                vision_performance_claim=False,
+                vision_uses_host_staging=False,
+                vision_artifact_call_count=1,
+                unsupported_vision_runtime_reason=VISION_M11_7_DEVICE_PROVIDER_SCOPE_REASON,
             ).with_accounting(semantics)
         return TargetVisionDecision(
             vision_contract_ok=True,
@@ -1341,6 +1389,11 @@ def is_m11_6_static_conv2d_runtime_scope(semantics: VisionConv2DSemantics) -> bo
     return semantics.stride[0] in {1, 2, 16} and semantics.padding[0] in {0, 1}
 
 
+def is_m11_7_device_conv2d_runtime_scope(semantics: VisionConv2DSemantics) -> bool:
+    """Return whether M11.7 admits a conv2d record to the device-side provider."""
+    return is_m11_6_static_conv2d_runtime_scope(semantics)
+
+
 def _vision_runtime_accounting_fields(
     semantics: VisionConv2DSemantics,
     decision: TargetVisionDecision,
@@ -1527,6 +1580,71 @@ def register_python_torch_extern_conv2d() -> _VisionProviderRegistration:
 
     tvm.register_global_func(VISION_EXTERN_PACKED_FUNC, _extern_conv2d, override=True)
     return _VisionProviderRegistration(VISION_EXTERN_PACKED_FUNC, previous)
+
+
+def register_device_torch_cuda_extern_conv2d() -> _VisionProviderRegistration:
+    """Register the M11.7 explicit device-side Torch CUDA conv2d provider."""
+    import tvm  # pylint: disable=import-outside-toplevel
+
+    previous = tvm.get_global_func(VISION_EXTERN_PACKED_FUNC, allow_missing=True)
+
+    def _extern_conv2d(
+        input_tensor,
+        weight_tensor,
+        output_tensor,
+        stride_h,
+        stride_w,
+        padding_h,
+        padding_w,
+        dilation_h,
+        dilation_w,
+        groups,
+    ):
+        import torch  # pylint: disable=import-outside-toplevel
+        import torch.nn.functional as torch_functional  # pylint: disable=import-outside-toplevel
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("device_torch_cuda extern_conv2d requires Torch CUDA")
+        input_shape = _tensor_shape(input_tensor)
+        weight_shape = _tensor_shape(weight_tensor)
+        output_shape = _tensor_shape(output_tensor)
+        _validate_python_torch_conv_tensor("input", input_tensor, "float32", input_shape)
+        _validate_python_torch_conv_tensor("weight", weight_tensor, "float32", weight_shape)
+        _validate_python_torch_conv_tensor("output", output_tensor, "float32", output_shape)
+
+        input_cuda = _torch_cuda_tensor_from_tvm(input_tensor, "input")
+        weight_cuda = _torch_cuda_tensor_from_tvm(weight_tensor, "weight")
+        output_cuda = _torch_cuda_tensor_from_tvm(output_tensor, "output")
+        result = torch_functional.conv2d(
+            input_cuda,
+            weight_cuda,
+            bias=None,
+            stride=(int(stride_h), int(stride_w)),
+            padding=(int(padding_h), int(padding_w)),
+            dilation=(int(dilation_h), int(dilation_w)),
+            groups=int(groups),
+        )
+        if tuple(int(dim) for dim in result.shape) != output_shape:
+            raise ValueError(
+                f"extern_conv2d output shape must be {output_shape}, got "
+                f"{tuple(int(dim) for dim in result.shape)}"
+            )
+        output_cuda.copy_(result)
+        torch.cuda.synchronize(output_cuda.device)
+
+    tvm.register_global_func(VISION_EXTERN_PACKED_FUNC, _extern_conv2d, override=True)
+    return _VisionProviderRegistration(VISION_EXTERN_PACKED_FUNC, previous)
+
+
+def _torch_cuda_tensor_from_tvm(tensor: Any, role: str):
+    import torch  # pylint: disable=import-outside-toplevel
+
+    torch_tensor = torch.utils.dlpack.from_dlpack(tensor)
+    if torch_tensor.device.type != "cuda":
+        raise RuntimeError(f"device_torch_cuda extern_conv2d requires CUDA {role} tensor")
+    if not torch_tensor.is_contiguous():
+        raise RuntimeError(f"device_torch_cuda extern_conv2d requires contiguous {role} tensor")
+    return torch_tensor
 
 
 def _validate_python_torch_conv_tensor(

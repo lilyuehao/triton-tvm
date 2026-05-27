@@ -27,11 +27,15 @@ from tvm.contrib.triton_tvm import (
     VISION_M11_5_RUNTIME_SCOPE_STATUS,
     VISION_M11_6_INTERFACE_STATUS,
     VISION_M11_6_RUNTIME_SCOPE_STATUS,
+    VISION_M11_7_INTERFACE_STATUS,
+    VISION_M11_7_RUNTIME_SCOPE_STATUS,
+    VISION_PROVIDER_DEVICE_TORCH_CUDA,
     VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
     TritonTVMContractError,
     build_extern_conv2d_tirx_source,
     build_native_grid2d_pointwise_tirx_source,
     build_triton_tvm,
+    register_device_torch_cuda_extern_conv2d,
     register_python_torch_extern_conv2d,
     validate_pointwise_grid2d_static_contract,
     validate_triton_tvm_contract,
@@ -79,6 +83,7 @@ from tvm.contrib.triton_tvm.vision import (
 )
 from tvm.contrib.triton_tvm.m11_vision_baseline import run_vision_baseline
 from tvm.contrib.triton_tvm.m116_vision_dashboard import run_vision_grid2d_dashboard
+from tvm.contrib.triton_tvm.m117_vision_hotpath_dashboard import run_vision_hotpath_dashboard
 from tvm.contrib.triton_tvm.translator import TritonTVMMeta
 
 
@@ -230,6 +235,34 @@ def test_m116_out_of_scope_conv_remains_artifact_only_under_provider_scope():
     assert decision.unsupported_vision_runtime_reason == VISION_RUNTIME_PROVIDER_SCOPE_REASON
 
 
+def test_m117_device_conv_provider_is_performance_eligible_without_host_staging():
+    semantics = _extract_semantics(
+        _conv_wrapper_source(
+            input_shape=(1, 32, 16, 16),
+            weight_shape=(64, 32, 1, 1),
+            output_shape=(1, 64, 16, 16),
+            stride=(1, 1),
+            padding=(0, 0),
+        ),
+        case_name="yolov8n_yaml_random",
+    )
+    decision = TargetVisionPolicy(
+        vision_runtime_provider=VISION_PROVIDER_DEVICE_TORCH_CUDA
+    ).decide(semantics, vision_contract_ok=True)
+    irmod = tvm.script.from_source(build_extern_conv2d_tirx_source(semantics, decision))
+
+    assert semantics.vision_contract == VISION_CONTRACT_CONV2D_1X1_NCHW_STATIC
+    assert decision.vision_runtime_status == VISION_RUNTIME_STATUS_RUNTIME_RESOLVED
+    assert decision.vision_provider_kind == VISION_PROVIDER_DEVICE_TORCH_CUDA
+    assert decision.vision_runtime_claim == "performance_eligible"
+    assert decision.vision_performance_claim is True
+    assert decision.vision_uses_host_staging is False
+    assert decision.vision_host_staging_bytes == 0
+    assert decision.vision_runtime_launch_count == 1
+    assert decision.vision_artifact_call_count == 1
+    validate_vision_conv2d_contract(irmod)
+
+
 def test_m115_contract_hardening_rejects_runtime_scope_and_accounting_regressions():
     vit_semantics = _extract_semantics(
         _conv_wrapper_source(
@@ -300,7 +333,7 @@ def test_m115_contract_hardening_rejects_runtime_scope_and_accounting_regression
         vision_uses_host_staging=True,
         vision_artifact_call_count=1,
     ).with_accounting(yolo_semantics)
-    with pytest.raises(TritonTVMContractError, match="M11.6 runtime-resolved conv2d"):
+    with pytest.raises(TritonTVMContractError, match="M11.6/M11.7 runtime-resolved conv2d"):
         validate_vision_conv2d_contract(
             tvm.script.from_source(
                 build_extern_conv2d_tirx_source(yolo_semantics, out_of_scope_decision)
@@ -718,6 +751,66 @@ def test_m114_model_corpus_section_reports_single_runtime_resolved_vit_conv():
     assert VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED in markdown
 
 
+def test_m117_model_corpus_section_reports_device_hotpath_support():
+    vit_call = _extract_single_conv(
+        _conv_wrapper_source(
+            input_shape=(1, 3, 32, 32),
+            weight_shape=(64, 3, 16, 16),
+            output_shape=(1, 64, 2, 2),
+            stride=(16, 16),
+            padding=(0, 0),
+        ),
+        case_name="vit_tiny_random",
+        vision_runtime_provider=VISION_PROVIDER_DEVICE_TORCH_CUDA,
+    )
+    yolo_1x1_call = _extract_single_conv(
+        _conv_wrapper_source(
+            input_shape=(1, 32, 16, 16),
+            weight_shape=(64, 32, 1, 1),
+            output_shape=(1, 64, 16, 16),
+            stride=(1, 1),
+            padding=(0, 0),
+        ),
+        case_name="yolov8n_yaml_random",
+        vision_runtime_provider=VISION_PROVIDER_DEVICE_TORCH_CUDA,
+    )
+    report = build_model_corpus_report(
+        [
+            _grid_record(
+                kernel_name="triton_poi_fused_convolution_0",
+                model_family="yolo",
+            )
+        ],
+        [
+            _model_record_with_call("vit", "vit_tiny_random", vit_call),
+            _model_record_with_call("yolo", "yolov8n_yaml_random", yolo_1x1_call),
+        ],
+        generated_at="2026-05-26T00:00:00+00:00",
+    )
+
+    m11 = report["m11"]
+    assert m11["interface_status"] == VISION_M11_7_INTERFACE_STATUS
+    assert m11["runtime_scope_status"] == VISION_M11_7_RUNTIME_SCOPE_STATUS
+    assert m11["provider_policy"] == "opt_in_device_torch_cuda_performance_eligible"
+    assert m11["performance_claim"] is True
+    assert m11["runtime_resolved_count"] == 2
+    assert m11["artifact_only_count"] == 0
+    assert m11["host_staging_bytes"] == 0
+    assert m11["provider_counts"] == {VISION_PROVIDER_DEVICE_TORCH_CUDA: 2}
+    assert m11["report_cache_invariants"]["status"] == "passed"
+    assert m11["report_cache_invariants"]["runtime_provider_performance_claim"] is True
+    assert m11["corpus_diff_guard"]["baseline_id"] == (
+        "m11_7_vision_native_hotpath_baseline_v1"
+    )
+    hotpath = m11["m11_7_hotpath"]
+    assert hotpath["status"] == VISION_M11_7_INTERFACE_STATUS
+    assert hotpath["device_provider_runtime_resolved_count"] == 2
+    assert hotpath["device_provider_performance_claim_count"] == 2
+    assert hotpath["conv1x1_runtime_resolved_count"] == 1
+    assert hotpath["grid_conv_adjacent_pointwise_runtime_ready_count"] == 1
+    assert hotpath["host_staged_provider_excluded_from_perf_claims"] is True
+
+
 def test_m11p_vision_baseline_schema_without_benchmarks(tmp_path):
     report = run_vision_baseline(out_dir=tmp_path, warmup=1, repeat=1, run_benchmarks=False)
 
@@ -777,6 +870,31 @@ def test_m116_grid2d_native_artifact_contract_and_dashboard_schema(tmp_path):
     assert report["cases"][0]["availability_reason"] == "benchmarks_disabled"
     assert (tmp_path / "report.json").exists()
     assert "M11.6 Vision Grid2D Performance Dashboard" in (tmp_path / "report.md").read_text()
+
+
+def test_m117_hotpath_dashboard_schema_without_benchmarks(tmp_path):
+    report = run_vision_hotpath_dashboard(
+        out_dir=tmp_path,
+        warmup=1,
+        repeat=1,
+        run_benchmarks=False,
+    )
+
+    assert report["report_kind"] == "triton_tvm_m11_7_vision_hotpath_dashboard"
+    assert report["hotpath_status"] == VISION_M11_7_INTERFACE_STATUS
+    assert report["summary"]["total_cases"] == 10
+    assert report["summary"]["conv1x1_as_matmul_cases"] == 3
+    assert report["summary"]["device_conv2d_provider_cases"] == 6
+    assert report["summary"]["native_tvm_grid2d_cases"] == 4
+    assert report["summary"]["host_staged_cases"] == 0
+    assert report["summary"]["performance_claim_cases"] == 10
+    assert report["invariants"]["status"] == "passed"
+    assert report["cases"][0]["provider_kind"] == VISION_PROVIDER_DEVICE_TORCH_CUDA
+    assert report["cases"][0]["host_staging_bytes"] == 0
+    assert report["cases"][0]["performance_claim"] is True
+    assert report["cases"][0]["availability_reason"] == "benchmarks_disabled"
+    assert (tmp_path / "report.json").exists()
+    assert "M11.7 Vision Hotpath Dashboard" in (tmp_path / "report.md").read_text()
 
 
 @tvm.testing.requires_cuda

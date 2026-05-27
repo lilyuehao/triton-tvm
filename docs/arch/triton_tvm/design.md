@@ -123,9 +123,9 @@ ReLU artifact. It keeps `extern_gemm_performance_claim=false`; autotune,
 algorithm selection, and performance closure remain later work.
 
 These follow-ons should not change the captured Triton-kernel accounting by
-themselves. The current `89/41/48` corpus metric counts captured Triton
-kernels. Runtime-resolved wrapper `extern_gemm` calls should be reported as
-wrapper extern runtime coverage unless a later report ADR explicitly changes
+themselves. The historical M9/M10 `89/41/48` corpus metric counts captured
+Triton kernels. Runtime-resolved wrapper `extern_gemm` calls should be reported
+as wrapper extern runtime coverage unless a later report ADR explicitly changes
 the model-level counting policy.
 
 M9.P is the post-M9.8 Matmul Performance Track / Horizontal CUDA Matmul
@@ -166,6 +166,65 @@ alpha=1, beta=1, out=C)` as `source_kind="wrapper_extern_addmm_bias"` with
 and optional correctness-only host-staged provider metadata. The native
 `matmul_perf_core_v1` envelope still rejects epilogues, so this semantic
 breadth does not become a hidden performance-schedule expansion.
+
+M12.2 adds a fixed-shape ViT wrapper matmul runtime closure without changing
+the M9.P performance envelope. When explicitly scoped to
+`vit_tiny_random`, `extern_kernels.mm` and the observed addmm+bias records may
+select `provider_kind="native_tvm_matmul"` and
+`implementation_kind="native_tir_schedule"`, using the serial-K
+`cuda_block_per_output_serial_k_v1` schedule. This is correctness-first Native
+TVM TIR for the observed fp32 ViT shapes only, with zero host staging and
+`extern_gemm_performance_claim=false`; it is not Llama GEMM closure, arbitrary
+epilogue support, TensorCore parity, or model-level performance readiness.
+
+M12.3 introduces the fixed-shape ViT E2E correctness runner. It executes the
+Inductor wrapper under explicit provider patches: wrapper GEMM/addmm calls run
+through the M12.2 Native TVM matmul artifacts, the conv wrapper stays on the
+explicit zero-host-staged `device_torch_cuda` provider, and SDPA is replayed by
+the M10 native-decomposed primitive sequence. Captured Inductor kernels remain
+an explicit harness execution kind in this runner, so P0 correctness can pass
+without promoting strict full-native TVM or `performance_ready_e2e`.
+
+M12.4-M12.P keep that boundary honest through fixed-shape ViT P2 closure.
+M12.4
+measures the fixed-shape E2E path and passes P1 but misses P2 versus
+`torch.compile`.
+M12.5/M12.5.5 identify `native_tvm_matmul_provider_cost` as the primary P2
+recovery target and freeze the current P2 gap. M12.6 hardens the report and
+provider surface without changing hot-path performance: unknown extern GEMM
+provider ids fail explicitly, runtime-resolved nodes cannot retain stale
+fallback reasons, hidden host staging fails the surface, and strict/full-native
+claims remain false until P2 evidence exists. M12.9 improves the dashboard but
+still misses P2; M12.10 labels fixed-shape fused QKV as
+`model_specific_diagnostic_only` and keeps model-specific artifacts out of
+backend progress accounting. M12.11 freezes the backend-general route as
+`real_tl_dot_bridge`, then reusable runtime overhead measurement, then
+real-`tt.dot` schedule handoff. M12.12 proves the real `tl.dot` bridge into
+`matmul_minimal`, and M12.13 measures reusable runtime overhead with a
+standalone `pointwise_flat` artifact without claiming P2, performance, or
+schedule handoff. M12.14 completes real `tt.dot` schedule handoff: real JIT
+16x16x16 fp16 selects TensorCore schedule, real JIT 8x8x16 fp16 selects
+reusable tiled schedule, and the M12.9 wrapper-specific schedule is excluded
+from handoff readiness. M12.15 re-enters the P2 gate and still misses; M12.16
+attributes the first measured recovery bucket to `native_tvm_matmul_provider`;
+M12.P iteration `provider_runtime_glue_prebound_packed_call_v1` adds
+backend-general prebound packed-call dispatch and passes the unchanged
+fixed-shape ViT P2 gate. Post-closure iteration
+`provider_runtime_glue_minimal_record_v1` keeps the same route and reduces
+runtime-glue overhead further without expanding claims. This creates M12
+`performance_ready_e2e` evidence for the explicit provider mix without
+promoting strict full-native TVM, fused-QKV P2 credit, or native TVM conv
+scheduling.
+
+The follow-on branch `m12p-real-ttdot-native-matmul-provider` is closed
+without implementation. The proposed chain remains valid as future
+contract-expansion work: real Triton JIT `tl.dot` -> textual `tt.dot` ->
+`TTIRReader` -> `MatmulSemantics(source_kind=real_jit_tt_dot)` ->
+`TargetMatmulPolicy` -> provider artifact. It was not implemented for the
+current fixed-shape ViT path because the measured provider calls are wrapper
+fp32 `extern_gemm`/`extern_addmm_bias` shapes with small-M and bias-epilogue
+cases outside the current real-`tt.dot` TensorCore envelope. Wrapper-buffer
+replay or a hand-written ViT executor remains out of bounds.
 
 Pre-M10 is now the attention ABI/report cleanup gate before M10 runtime work.
 It adds `python/tvm/contrib/triton_tvm/attention.py` and classifies wrapper
@@ -282,3 +341,18 @@ dashboard; concat/split Grid2D blockers remain explicit unsupported runtime
 records. The regenerated corpus reports 31 Grid2D artifact/native
 runtime-ready records, 17 concat/split blockers, zero silent fallback, and
 `full_tvm_runnable=0`.
+
+M11.7 adds a device hotpath layer without weakening the strict full-model
+runnable definition. The new opt-in `device_torch_cuda` provider registers the
+same explicit packed function, consumes CUDA TVM tensors through DLPack, and
+records zero host-staging bytes with `vision_runtime_claim="performance_eligible"`.
+The regenerated M11.7 corpus reports 89 captured kernels, 72 translated
+kernels, and 17 explicit Grid2D fallbacks: the 31 Grid2D-ready pointwise/BN-SiLU
+records are now validated `pointwise_grid2d_static_v1` native TVM artifacts in
+the captured-kernel translated accounting, and only concat/split Grid2D remains
+as `contract_error`. The same corpus resolves 65/65 wrapper conv records
+through `device_torch_cuda`, resolves 25/25 observed 1x1 conv records under
+the M11.7 hotpath classification, and keeps 17/17 conv-adjacent Grid2D records
+runtime-ready. `vit_tiny_random` now has a runtime-resolved smoke record, but
+`full_tvm_runnable` remains 0 because strict model closure is still separate
+from mixed provider readiness.

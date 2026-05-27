@@ -39,6 +39,7 @@ from .indexing import TTIRIndexClassifier, TTIRIndexInfo
 from .matmul import (
     MATMUL_PERF_ENVELOPE_ID,
     NATIVE_TIR_MATMUL_SCHEDULE_ID,
+    REAL_JIT_TT_DOT_SOURCE_KIND,
     SIMT_TIR_MATMUL_SCHEDULE_ID,
     SIMT_TIR_MATMUL_TILE_M,
     SIMT_TIR_MATMUL_TILE_N,
@@ -157,10 +158,15 @@ _SUPPORTED_OPS_BY_CONTRACT["softmax_row"] = _M8_RANK2_OPS
 _SUPPORTED_OPS_BY_CONTRACT["masked_softmax_row"] = _M8_RANK2_OPS
 _SUPPORTED_OPS_BY_CONTRACT["matmul_minimal"] = frozenset(
     {
+        "arith.addf",
         "arith.addi",
+        "arith.andi",
+        "arith.cmpi",
         "arith.constant",
         "arith.extsi",
+        "arith.mulf",
         "arith.muli",
+        "arith.subf",
         "tt.addptr",
         "tt.broadcast",
         "tt.dot",
@@ -322,7 +328,10 @@ def translate_ttir(
     _validate_supported_subset(graph, canonical_contract)
 
     if canonical_contract in _M9_MATMUL_CONTRACTS:
-        builder = _TIRXMatmulSemanticBuilder(graph, target_policy)
+        matmul_source_kind = REAL_JIT_TT_DOT_SOURCE_KIND if artifact is not None else "tt_dot"
+        builder = _TIRXMatmulSemanticBuilder(
+            graph, target_policy, matmul_source_kind=matmul_source_kind
+        )
     elif canonical_contract in _M8_ROW_CONTRACTS:
         builder = _TIRXRank2RowBuilder(graph, target_policy, canonical_contract)
     elif canonical_contract in ("reduction_minimal", "norm_single_row"):
@@ -480,10 +489,14 @@ class _TIRXMatmulSemanticBuilder:
         self,
         graph: NormalizedTTIROpGraph,
         target_policy: _PointwiseTargetPolicy,
+        *,
+        matmul_source_kind: str = "tt_dot",
     ):
         self.graph = graph
         self.target_policy = target_policy
-        self.matmul_semantics = extract_matmul_semantics_from_ttir(graph)
+        self.matmul_semantics = extract_matmul_semantics_from_ttir(
+            graph, source_kind=matmul_source_kind
+        )
         self.params = graph.param_by_name()
         self.names = {param.name: _sanitize_identifier(param.name) for param in graph.params}
         self.ptr_params = [param for param in graph.params if param.type.is_pointer]

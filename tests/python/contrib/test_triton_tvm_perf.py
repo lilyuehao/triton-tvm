@@ -40,6 +40,8 @@ from tvm.contrib.triton_tvm import build_triton_tvm, lower_to_ttir, translate_tt
 from tvm.contrib.triton_tvm.m10_attention_baseline import run_attention_baseline
 from tvm.contrib.triton_tvm.m11_vision_baseline import run_vision_baseline
 from tvm.contrib.triton_tvm.m116_vision_dashboard import run_vision_grid2d_dashboard
+from tvm.contrib.triton_tvm.m117_vision_hotpath_dashboard import run_vision_hotpath_dashboard
+from tvm.contrib.triton_tvm.m124_vit_e2e_dashboard import run_vit_e2e_dashboard
 from tvm.contrib.triton_tvm.m9p_matmul_dashboard import run_dashboard
 from tvm.contrib.triton_tvm.matmul import NATIVE_TIR_MATMUL_SCHEDULE_ID
 
@@ -57,6 +59,8 @@ _RUN_M9P_MATMUL_DASHBOARD = os.environ.get("TRITON_TVM_RUN_M9P_MATMUL_DASHBOARD"
 _RUN_M10_ATTENTION_BASELINE = os.environ.get("TRITON_TVM_RUN_M10_ATTENTION_BASELINE") == "1"
 _RUN_M11_VISION_BASELINE = os.environ.get("TRITON_TVM_RUN_M11_VISION_BASELINE") == "1"
 _RUN_M11_6_GRID2D_DASHBOARD = os.environ.get("TRITON_TVM_RUN_M11_6_GRID2D_DASHBOARD") == "1"
+_RUN_M11_7_HOTPATH_DASHBOARD = os.environ.get("TRITON_TVM_RUN_M11_7_HOTPATH_DASHBOARD") == "1"
+_RUN_M12_4_E2E_DASHBOARD = os.environ.get("TRITON_TVM_RUN_M12_4_E2E_DASHBOARD") == "1"
 _DEFAULT_N = int(os.environ.get("TRITON_TVM_PERF_N", str(2**22)))
 _DEFAULT_BLOCK = int(os.environ.get("TRITON_TVM_PERF_BLOCK", "256"))
 _TVM_NUMBER = int(os.environ.get("TRITON_TVM_PERF_TVM_NUMBER", "20"))
@@ -389,6 +393,60 @@ def test_m11_6_grid2d_dashboard_perf(tmp_path):
         assert case["triton_tvm_us"] > 0.0
         assert case["gbps_or_effective_bandwidth"] > 0.0
         assert case["correctness_allclose"] is True
+
+
+@pytest.mark.skipif(
+    not _RUN_M11_7_HOTPATH_DASHBOARD,
+    reason="Set TRITON_TVM_RUN_M11_7_HOTPATH_DASHBOARD=1 to run the M11.7 hotpath dashboard",
+)
+@tvm.testing.requires_cuda
+def test_m11_7_hotpath_dashboard_perf(tmp_path):
+    report = run_vision_hotpath_dashboard(
+        out_dir=tmp_path,
+        warmup=2,
+        repeat=5,
+        run_benchmarks=True,
+    )
+    print("TRITON_TVM_M11_7_HOTPATH_DASHBOARD " + json.dumps(report, indent=2, sort_keys=True))
+
+    assert report["report_kind"] == "triton_tvm_m11_7_vision_hotpath_dashboard"
+    assert report["summary"]["measured_cases"] == 10
+    assert report["summary"]["allclose_cases"] == 10
+    assert report["summary"]["host_staged_cases"] == 0
+    assert report["invariants"]["status"] == "passed"
+    for case in report["cases"]:
+        assert case["host_staging_bytes"] == 0
+        assert case["performance_claim"] is True
+        assert case["triton_tvm_us"] > 0.0
+        assert case["torch_or_inductor_us"] > 0.0
+        assert case["correctness_allclose"] is True
+
+
+@pytest.mark.skipif(
+    not _RUN_M12_4_E2E_DASHBOARD,
+    reason="Set TRITON_TVM_RUN_M12_4_E2E_DASHBOARD=1 to run the M12.4 E2E dashboard",
+)
+@tvm.testing.requires_cuda
+def test_m12_4_vit_e2e_dashboard_perf(tmp_path):
+    report = run_vit_e2e_dashboard(
+        out_dir=tmp_path,
+        warmup=2,
+        repeat=5,
+        run_benchmarks=True,
+    )
+    print("TRITON_TVM_M12_4_E2E_DASHBOARD " + json.dumps(report, indent=2, sort_keys=True))
+
+    assert report["report_kind"] == "triton_tvm_m12_4_vit_fixed_shape_e2e_dashboard"
+    assert report["status"] == "measured"
+    assert report["p0"]["passed"] is True
+    assert report["correctness"]["allclose"] is True
+    assert report["host_staging_bytes"] == 0
+    assert report["strict_full_tvm_native"] is False
+    assert report["full_tvm_runnable_models"] == 0
+    assert report["invariants"]["status"] == "passed"
+    for baseline in ("torch_eager_cuda", "torch_compile_inductor", "triton_tvm_e2e"):
+        assert report["latency_ms"][baseline]["p50_ms"] > 0.0
+        assert report["latency_ms"][baseline]["p95_ms"] > 0.0
 
 
 def _run_perf_baseline() -> dict[str, Any]:

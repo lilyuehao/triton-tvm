@@ -32,6 +32,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import tvm
+
 from .attention import (
     ATTENTION_CONTRACT_LLAMA_CAUSAL_PREFILL,
     ATTENTION_CONTRACT_VIT_FULL,
@@ -62,14 +64,18 @@ from .inductor import (
     is_inductor_pointwise_kernel,
     load_inductor_kernel,
 )
+from .contracts import validate_pointwise_grid2d_static_contract
 from .matmul import (
     EXTERN_ADDMM_BIAS_PACKED_FUNC,
     EXTERN_ADDMM_BIAS_SYMBOL,
+    EXTERN_GEMM_PROVIDER_NATIVE_TVM,
     EXTERN_GEMM_PROVIDER_NONE,
     EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    EXTERN_GEMM_RUNTIME_CLAIM_NATIVE_TVM_FIXED_SHAPE,
     EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY,
     EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED,
     EXTERN_GEMM_SYMBOL,
+    NATIVE_TIR_MATMUL_SCHEDULE_ID,
 )
 from .reporting import (
     build_capability_report,
@@ -83,8 +89,12 @@ from .vision import (
     M11_GRID2D_PROVIDER_NATIVE_TVM,
     M11_GRID2D_READINESS_VERSION,
     M11_GRID2D_RUNTIME_READY,
+    M11_GRID_FAMILY_BN_SILU_FUSION,
+    M11_GRID_FAMILY_CONCAT_SPLIT,
+    M11_GRID_FAMILY_CONV_ADJACENT_POINTWISE,
     M11_GRID_REPORT_FIELDS,
     M11_GRID_TAXONOMY_VERSION,
+    VisionGrid2DPointwiseSemantics,
     VISION_CONTRACT_CONV2D_NCHW_STATIC,
     VISION_CONTRACT_POINTWISE_GRID2D_STATIC,
     VISION_CONTRACT_VERSION,
@@ -104,8 +114,13 @@ from .vision import (
     VISION_M11_6_CORPUS_DIFF_BASELINE_ID,
     VISION_M11_6_INTERFACE_STATUS,
     VISION_M11_6_RUNTIME_SCOPE_STATUS,
+    VISION_M11_7_CORPUS_DIFF_BASELINE_ID,
+    VISION_M11_7_INTERFACE_STATUS,
+    VISION_M11_7_RUNTIME_SCOPE_STATUS,
+    VISION_PROVIDER_DEVICE_TORCH_CUDA,
     VISION_PROVIDER_NONE,
     VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    VISION_RUNTIME_CLAIM_PERFORMANCE_ELIGIBLE,
     VISION_REPORT_FIELDS,
     VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY,
     VISION_RUNTIME_KIND_ARTIFACT_ONLY,
@@ -115,6 +130,7 @@ from .vision import (
     VISION_RUNTIME_STATUS_ARTIFACT_ONLY,
     VISION_RUNTIME_STATUS_RUNTIME_RESOLVED,
     VISION_SEMANTICS_STATUS_ACCEPTED,
+    build_native_grid2d_pointwise_tirx_source,
     classify_m11_captured_grid_record,
     wrapper_conv2d_vision_report_fields,
 )
@@ -127,6 +143,7 @@ PRE_M8_TAXONOMY_VERSION = 1
 PRE_M9_TAXONOMY_VERSION = 1
 PRE_M10_TAXONOMY_VERSION = 1
 PRE_M11_TAXONOMY_VERSION = 1
+PRE_M12_TAXONOMY_VERSION = 1
 _PRE_M7_READER_CLASSES = (
     "pointwise",
     "broadcast_view_index",
@@ -164,6 +181,7 @@ class TritonTVMModelAuditConfig:
     target: str = "cuda"
     min_models: int = 1
     extern_gemm_runtime_provider: str = EXTERN_GEMM_PROVIDER_NONE
+    extern_gemm_runtime_model_case: str = ""
     attention_runtime_provider: str = ATTENTION_PROVIDER_NONE
     vision_runtime_provider: str = VISION_PROVIDER_NONE
 
@@ -296,6 +314,20 @@ def build_model_corpus_report(
         extern_records,
         normalized_models,
         normalized_kernels,
+    )
+    report["pre_m12"] = _pre_m12_report_section(
+        normalized_kernels,
+        normalized_models,
+        extern_records,
+        summary=report["summary"],
+        model_summary=report["model_summary"],
+        m11=report["m11"],
+    )
+    report["m12"] = _m12_report_section(
+        normalized_kernels,
+        normalized_models,
+        extern_records,
+        model_summary=report["model_summary"],
     )
     report["extern_ops"] = extern_records
     report["full_tvm_runnable"] = (
@@ -430,9 +462,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-models", type=int, default=1)
     parser.add_argument(
         "--extern-gemm-runtime-provider",
-        choices=[EXTERN_GEMM_PROVIDER_NONE, EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED],
+        choices=[
+            EXTERN_GEMM_PROVIDER_NONE,
+            EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+            EXTERN_GEMM_PROVIDER_NATIVE_TVM,
+        ],
         default=EXTERN_GEMM_PROVIDER_NONE,
     )
+    parser.add_argument("--extern-gemm-runtime-model-case", default="")
     parser.add_argument(
         "--attention-runtime-provider",
         choices=[
@@ -444,7 +481,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--vision-runtime-provider",
-        choices=[VISION_PROVIDER_NONE, VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED],
+        choices=[
+            VISION_PROVIDER_NONE,
+            VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+            VISION_PROVIDER_DEVICE_TORCH_CUDA,
+        ],
         default=VISION_PROVIDER_NONE,
     )
     args = parser.parse_args(argv)
@@ -459,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
             contract=args.contract,
             min_models=args.min_models,
             extern_gemm_runtime_provider=args.extern_gemm_runtime_provider,
+            extern_gemm_runtime_model_case=args.extern_gemm_runtime_model_case,
             attention_runtime_provider=args.attention_runtime_provider,
             vision_runtime_provider=args.vision_runtime_provider,
         ),
@@ -510,6 +552,7 @@ def _run_one_model_case(
                 case_name=case.case_name,
                 wrapper_path=str(wrapper_path),
                 extern_gemm_runtime_provider=cfg.extern_gemm_runtime_provider,
+                extern_gemm_runtime_model_case=cfg.extern_gemm_runtime_model_case,
                 attention_runtime_provider=cfg.attention_runtime_provider,
                 vision_runtime_provider=cfg.vision_runtime_provider,
             )
@@ -650,6 +693,8 @@ def _audit_one_model_kernel(
                     "approved reduction-family Inductor kernels as TVM-replaceable"
                 ),
             )
+        record["blocker_class"] = _blocker_class(record)
+        _maybe_materialize_m11_grid2d_artifact(record, kernel)
     else:
         record.setdefault("grid_type", "")
         record.setdefault("num_reduction", 0)
@@ -688,6 +733,133 @@ def _is_model_kernel_replaceable(kernel: InductorKernel, contract: str) -> bool:
     if contract in {"row_reduction", "norm_row", "softmax_row", "masked_softmax_row"}:
         return num_reduction > 0
     return False
+
+
+def _maybe_materialize_m11_grid2d_artifact(
+    record: dict[str, Any],
+    kernel: InductorKernel,
+) -> None:
+    meta = kernel.inductor_meta
+    if meta.get("grid_type") != "Grid2D" or bool(meta.get("atomic_add_found", False)):
+        return
+
+    grid_fields = classify_m11_captured_grid_record(record)
+    if not str(grid_fields.get("m11_grid_status", "")):
+        return
+    record.update(grid_fields)
+
+    if str(grid_fields.get("m11_grid_artifact_status", "")) != M11_GRID2D_ARTIFACT_READY:
+        reason = str(grid_fields.get("unsupported_m11_grid_runtime_reason", ""))
+        if reason:
+            record["translate_status"] = make_report_status(
+                ok=False,
+                bucket="contract_error",
+                fallback_reason=reason,
+                message=f"M11 Grid2D native artifact not materialized: {reason}",
+            )
+        return
+    semantics = _m11_grid2d_semantics_from_record(record, kernel)
+    if semantics is None:
+        return
+
+    try:
+        source = build_native_grid2d_pointwise_tirx_source(semantics)
+        irmod = tvm.script.from_source(source)
+        validate_pointwise_grid2d_static_contract(irmod)
+    except Exception as err:  # pylint: disable=broad-except
+        record["m11_grid_native_artifact_status"] = "validation_failed"
+        record["m11_grid_native_artifact_error"] = f"{type(err).__name__}: {err}"
+        return
+
+    record.setdefault("candidate_translate_status", dict(record["translate_status"]))
+    record["m11_grid_captured_translate_status"] = dict(record["translate_status"])
+    record["m11_grid_native_artifact_status"] = "translated"
+    record["m11_grid_native_artifact_op_kind"] = semantics.op_kind
+    record["contract"] = VISION_CONTRACT_POINTWISE_GRID2D_STATIC
+    record["translate_status"] = make_report_status(ok=True, bucket="translated")
+
+
+def _m11_grid2d_semantics_from_record(
+    record: dict[str, Any],
+    kernel: InductorKernel,
+) -> VisionGrid2DPointwiseSemantics | None:
+    size_hints = _m11_grid_size_hint_dict(record.get("size_hints", {}))
+    if not size_hints:
+        size_hints = _parse_m11_grid_size_hints(str(record.get("m11_grid_size_hints", "")))
+    x_extent = int(size_hints.get("x", 0) or 0)
+    y_extent = int(size_hints.get("y", 0) or 0)
+    if x_extent <= 0 or y_extent <= 0:
+        return None
+    family = str(record.get("m11_grid_family", ""))
+    op_kind = _m11_grid2d_op_kind(record, kernel)
+    if not op_kind:
+        return None
+    return VisionGrid2DPointwiseSemantics(
+        case_name=_safe_name(
+            "m11_7_grid2d_" + str(record.get("model_case", "")) + "_" + kernel.kernel_name
+        ),
+        model=str(record.get("model_case", "")),
+        grid_family=family,
+        x_extent=x_extent,
+        y_extent=y_extent,
+        op_kind=op_kind,
+    )
+
+
+def _m11_grid_size_hint_dict(raw: Any) -> dict[str, int]:
+    if not isinstance(raw, dict):
+        return {}
+    size_hints: dict[str, int] = {}
+    for key in ("x", "y"):
+        try:
+            value = int(raw.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            size_hints[key] = value
+    return size_hints
+
+
+def _parse_m11_grid_size_hints(text: str) -> dict[str, int]:
+    size_hints: dict[str, int] = {}
+    for part in text.split(","):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        if key not in {"x", "y"}:
+            continue
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            size_hints[key] = parsed
+    return size_hints
+
+
+def _m11_grid2d_op_kind(record: dict[str, Any], kernel: InductorKernel) -> str:
+    family = str(record.get("m11_grid_family", ""))
+    text = " ".join(
+        [
+            kernel.kernel_name,
+            kernel.source,
+            str(record.get("m11_grid_operator_tags", "")),
+        ]
+    ).lower()
+    if family == M11_GRID_FAMILY_BN_SILU_FUSION:
+        return "bn_affine_silu"
+    if family != M11_GRID_FAMILY_CONV_ADJACENT_POINTWISE:
+        return ""
+    if "silu" in text:
+        return "silu"
+    if "relu" in text or "maximum" in text:
+        return "select_relu"
+    if "sub" in text:
+        return "sub"
+    if "mul" in text:
+        return "mul"
+    return "add"
 
 
 def _attach_inductor_metadata(record: dict[str, Any], kernel: InductorKernel) -> None:
@@ -1695,9 +1867,17 @@ def _m11_vision_runtime_section(
         int(record.get("vision_artifact_call_count", 0) or 0)
         for record in conv_records
     )
-    provider_enabled = any(
+    host_staged_provider_enabled = any(
         str(record.get("vision_provider_kind", "")) == VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED
         for record in runtime_resolved
+    )
+    device_provider_enabled = any(
+        str(record.get("vision_provider_kind", "")) == VISION_PROVIDER_DEVICE_TORCH_CUDA
+        for record in runtime_resolved
+    )
+    provider_enabled = bool(runtime_resolved)
+    performance_claim = any(
+        bool(record.get("vision_performance_claim", False)) for record in runtime_resolved
     )
     hardening = _m11_vision_hardening_section(
         conv_records,
@@ -1707,6 +1887,8 @@ def _m11_vision_runtime_section(
         model_records,
         kernel_records,
         provider_enabled=provider_enabled,
+        host_staged_provider_enabled=host_staged_provider_enabled,
+        device_provider_enabled=device_provider_enabled,
     )
     grid_readiness = _m11_grid2d_readiness_section(kernel_records)
     model_smoke = _m11_runtime_resolved_model_smoke_section(
@@ -1714,26 +1896,43 @@ def _m11_vision_runtime_section(
         kernel_records,
         extern_records,
     )
+    hotpath = _m11_7_hotpath_section(conv_records, kernel_records, model_smoke)
     m11_6_enabled = provider_enabled or int(grid_readiness.get("native_runtime_ready_count", 0))
+    m11_7_enabled = device_provider_enabled
+    interface_status = (
+        VISION_M11_7_INTERFACE_STATUS
+        if m11_7_enabled
+        else VISION_M11_6_INTERFACE_STATUS
+        if m11_6_enabled
+        else M11_GRID_TAXONOMY_VERSION
+    )
     return {
         "taxonomy_version": 1,
-        "interface_status": (
-            VISION_M11_6_INTERFACE_STATUS
-            if m11_6_enabled
-            else M11_GRID_TAXONOMY_VERSION
-        ),
+        "interface_status": interface_status,
         "convolution_interface_status": "m11_2_artifact_only_convolution_boundary_v1",
         "runtime_interface_status": (
-            VISION_M11_6_INTERFACE_STATUS if m11_6_enabled else ""
+            VISION_M11_7_INTERFACE_STATUS
+            if m11_7_enabled
+            else VISION_M11_6_INTERFACE_STATUS
+            if m11_6_enabled
+            else ""
         ),
         "hardening_status": VISION_M11_5_HARDENING_STATUS if provider_enabled else "",
-        "runtime_scope_status": VISION_M11_6_RUNTIME_SCOPE_STATUS if provider_enabled else "",
-        "provider_policy": (
-            "opt_in_python_torch_host_staged_correctness_only"
+        "runtime_scope_status": (
+            VISION_M11_7_RUNTIME_SCOPE_STATUS
+            if m11_7_enabled
+            else VISION_M11_6_RUNTIME_SCOPE_STATUS
             if provider_enabled
+            else ""
+        ),
+        "provider_policy": (
+            "opt_in_device_torch_cuda_performance_eligible"
+            if device_provider_enabled
+            else "opt_in_python_torch_host_staged_correctness_only"
+            if host_staged_provider_enabled
             else "artifact_only_no_runtime_provider"
         ),
-        "performance_claim": False,
+        "performance_claim": performance_claim,
         "vision_contract_version": VISION_CONTRACT_VERSION,
         "detail_fields": list(VISION_REPORT_FIELDS) + list(M11_GRID_REPORT_FIELDS),
         "observed_convolution_call_count": len(conv_records),
@@ -1827,17 +2026,27 @@ def _m11_vision_runtime_section(
                 "target_min_runtime_resolved": 10,
                 "observed_runtime_resolved": len(runtime_resolved),
                 "runtime_scope_status": (
-                    VISION_M11_6_RUNTIME_SCOPE_STATUS if provider_enabled else ""
+                    VISION_M11_7_RUNTIME_SCOPE_STATUS
+                    if device_provider_enabled
+                    else VISION_M11_6_RUNTIME_SCOPE_STATUS
+                    if provider_enabled
+                    else ""
                 ),
                 "provider_kind": (
-                    VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED
-                    if provider_enabled
+                    VISION_PROVIDER_DEVICE_TORCH_CUDA
+                    if device_provider_enabled
+                    else VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED
+                    if host_staged_provider_enabled
                     else VISION_PROVIDER_NONE
                 ),
                 "runtime_claim": (
-                    VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY if provider_enabled else ""
+                    VISION_RUNTIME_CLAIM_PERFORMANCE_ELIGIBLE
+                    if device_provider_enabled
+                    else VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY
+                    if host_staged_provider_enabled
+                    else ""
                 ),
-                "performance_claim": False,
+                "performance_claim": performance_claim,
             },
             "grid2d_target": {
                 "target_classified": 48,
@@ -1851,6 +2060,7 @@ def _m11_vision_runtime_section(
                 "silent_fallback_count": grid_readiness.get("silent_fallback_count", 0),
             },
         },
+        "m11_7_hotpath": hotpath,
         "runtime_resolved_model_smoke": model_smoke["runtime_resolved_model_smoke"],
         "runtime_resolved_model_provider_mix": model_smoke[
             "runtime_resolved_model_provider_mix"
@@ -1866,6 +2076,71 @@ def _m11_vision_runtime_section(
         "model_full_tvm_runnable_after_m11_4_gate": runnable_models,
         "model_full_tvm_runnable_after_m11_5_gate": runnable_models,
         "model_full_tvm_runnable_after_m11_6_gate": runnable_models,
+        "model_full_tvm_runnable_after_m11_7_gate": runnable_models,
+    }
+
+
+def _m11_7_hotpath_section(
+    conv_records: list[dict[str, Any]],
+    kernel_records: list[dict[str, Any]],
+    model_smoke: dict[str, Any],
+) -> dict[str, Any]:
+    runtime_records = [
+        record for record in conv_records if _is_runtime_resolved_vision_record(record)
+    ]
+    conv1x1_runtime = [
+        record
+        for record in runtime_records
+        if str(record.get("vision_contract", "")) == "conv2d_1x1_nchw_static_v1"
+    ]
+    device_runtime = [
+        record
+        for record in runtime_records
+        if str(record.get("vision_provider_kind", "")) == VISION_PROVIDER_DEVICE_TORCH_CUDA
+    ]
+    grid_conv_adjacent = [
+        record
+        for record in kernel_records
+        if str(record.get("m11_grid_family", "")) == M11_GRID_FAMILY_CONV_ADJACENT_POINTWISE
+    ]
+    grid_conv_adjacent_ready = [
+        record
+        for record in grid_conv_adjacent
+        if str(record.get("m11_grid_runtime_status", "")) == M11_GRID2D_RUNTIME_READY
+    ]
+    model_records = (
+        (model_smoke.get("runtime_resolved_model_smoke") or {}).get("records") or []
+    )
+    vit_smoke = next(
+        (
+            record
+            for record in model_records
+            if str(record.get("model_case", "")) == "vit_tiny_random"
+        ),
+        {},
+    )
+    return {
+        "status": (
+            VISION_M11_7_INTERFACE_STATUS if device_runtime else "not_enabled"
+        ),
+        "goal": "vision_native_hotpath_and_fixed_model_runtime_closure",
+        "device_provider_kind": VISION_PROVIDER_DEVICE_TORCH_CUDA,
+        "device_provider_runtime_resolved_count": len(device_runtime),
+        "device_provider_performance_claim_count": sum(
+            1 for record in device_runtime if bool(record.get("vision_performance_claim", False))
+        ),
+        "conv1x1_runtime_resolved_count": len(conv1x1_runtime),
+        "conv1x1_runtime_resolved_target_min": 10,
+        "conv_runtime_resolved_target_min": 25,
+        "grid_conv_adjacent_pointwise_count": len(grid_conv_adjacent),
+        "grid_conv_adjacent_pointwise_runtime_ready_count": len(grid_conv_adjacent_ready),
+        "grid_conv_adjacent_pointwise_runtime_target_min": 12,
+        "vit_tiny_random_runtime_resolved_smoke": bool(
+            vit_smoke.get("runtime_resolved_model_smoke", False)
+        ),
+        "vit_tiny_random_full_tvm_native": bool(vit_smoke.get("full_tvm_native_model", False)),
+        "full_tvm_runnable_models_remain_conservative": True,
+        "host_staged_provider_excluded_from_perf_claims": True,
     }
 
 
@@ -1878,6 +2153,8 @@ def _m11_vision_hardening_section(
     kernel_records: list[dict[str, Any]],
     *,
     provider_enabled: bool,
+    host_staged_provider_enabled: bool,
+    device_provider_enabled: bool,
 ) -> dict[str, Any]:
     attention_records = [
         record
@@ -1897,6 +2174,8 @@ def _m11_vision_hardening_section(
         runtime_attention,
         runnable_models,
         provider_enabled=provider_enabled,
+        host_staged_provider_enabled=host_staged_provider_enabled,
+        device_provider_enabled=device_provider_enabled,
     )
     invariant_status = (
         "passed"
@@ -1918,6 +2197,18 @@ def _m11_vision_hardening_section(
         for record in kernel_records
         if str(record.get("m11_grid_status", "")) == "m11_grid_classified"
     )
+    captured_grid_fallback_count = sum(
+        1
+        for record in kernel_records
+        if str(record.get("m11_grid_status", "")) == "m11_grid_classified"
+        and not (record.get("translate_status") or {}).get("ok")
+    )
+    native_grid2d_translated_count = sum(
+        1
+        for record in kernel_records
+        if str(record.get("m11_grid_status", "")) == "m11_grid_classified"
+        and (record.get("translate_status") or {}).get("ok")
+    )
     return {
         "report_cache_invariants": {
             "status": invariant_status,
@@ -1930,8 +2221,10 @@ def _m11_vision_hardening_section(
             "implicit_pytorch_fallback_allowed": False,
             "runtime_provider_opt_in": provider_enabled,
             "runtime_provider": (
-                VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED
-                if provider_enabled
+                VISION_PROVIDER_DEVICE_TORCH_CUDA
+                if device_provider_enabled
+                else VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED
+                if host_staged_provider_enabled
                 else VISION_PROVIDER_NONE
             ),
             "artifact_call_count_matches_materialized": sum(
@@ -1944,13 +2237,15 @@ def _m11_vision_hardening_section(
                 for record in conv_records
             )
             == len(runtime_resolved),
-            "runtime_provider_performance_claim": False,
+            "runtime_provider_performance_claim": bool(device_provider_enabled),
             "full_model_runnable_claim": False,
             "invariant_failures": failures,
         },
         "corpus_diff_guard": {
             "baseline_id": (
-                VISION_M11_6_CORPUS_DIFF_BASELINE_ID
+                VISION_M11_7_CORPUS_DIFF_BASELINE_ID
+                if device_provider_enabled
+                else VISION_M11_6_CORPUS_DIFF_BASELINE_ID
                 if provider_enabled
                 else VISION_M11_5_CORPUS_DIFF_BASELINE_ID
             ),
@@ -1959,7 +2254,9 @@ def _m11_vision_hardening_section(
             "status_buckets": dict(sorted(status_buckets.items())),
             "captured_kernel_count": len(kernel_records),
             "translated_kernel_count": translated_kernel_count,
-            "captured_grid_fallback_count": captured_grid_count,
+            "captured_grid_count": captured_grid_count,
+            "captured_grid_fallback_count": captured_grid_fallback_count,
+            "native_grid2d_translated_count": native_grid2d_translated_count,
             "observed_convolution_call_count": len(conv_records),
             "vision_artifact_count": len(materialized_records),
             "vision_artifact_only_count": len(artifact_only_records),
@@ -1988,16 +2285,28 @@ def _m11_vision_hardening_section(
             "boundary_policy": "do_not_reopen_m10_attention_in_m11_5",
         },
         "runtime_scope": {
-            "status": VISION_M11_6_RUNTIME_SCOPE_STATUS if provider_enabled else "",
-            "provider": (
-                VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED
+            "status": (
+                VISION_M11_7_RUNTIME_SCOPE_STATUS
+                if device_provider_enabled
+                else VISION_M11_6_RUNTIME_SCOPE_STATUS
                 if provider_enabled
+                else ""
+            ),
+            "provider": (
+                VISION_PROVIDER_DEVICE_TORCH_CUDA
+                if device_provider_enabled
+                else VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED
+                if host_staged_provider_enabled
                 else VISION_PROVIDER_NONE
             ),
             "runtime_claim": (
-                VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY if provider_enabled else ""
+                VISION_RUNTIME_CLAIM_PERFORMANCE_ELIGIBLE
+                if device_provider_enabled
+                else VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY
+                if host_staged_provider_enabled
+                else ""
             ),
-            "performance_claim": False,
+            "performance_claim": bool(device_provider_enabled),
             "supported_contracts": [
                 VISION_CONTRACT_CONV2D_NCHW_STATIC,
                 "conv2d_1x1_nchw_static_v1",
@@ -2008,7 +2317,11 @@ def _m11_vision_hardening_section(
             "supported_dilation": "1, 1",
             "supported_groups": 1,
             "unsupported_runtime_reason_for_other_convs": (
-                VISION_RUNTIME_PROVIDER_SCOPE_REASON if provider_enabled else ""
+                "vision_conv2d_device_provider_scope_m11_7_static_conv2d_only"
+                if device_provider_enabled
+                else VISION_RUNTIME_PROVIDER_SCOPE_REASON
+                if provider_enabled
+                else ""
             ),
             "observed_runtime_records": len(runtime_resolved),
         },
@@ -2025,6 +2338,8 @@ def _m11_vision_hardening_failures(
     runnable_models: int,
     *,
     provider_enabled: bool,
+    host_staged_provider_enabled: bool,
+    device_provider_enabled: bool,
 ) -> list[str]:
     failures: list[str] = []
     artifact_call_count = sum(
@@ -2044,20 +2359,38 @@ def _m11_vision_hardening_failures(
 
     for record in runtime_resolved:
         if not _m11_record_is_static_conv_runtime_scope(record):
-            failures.append("vision_runtime_scope_not_m11_6_static_conv2d")
+            failures.append("vision_runtime_scope_not_m11_6_or_m11_7_static_conv2d")
             break
-        if str(record.get("vision_provider_kind", "")) != VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED:
+        provider_kind = str(record.get("vision_provider_kind", ""))
+        if provider_kind not in {
+            VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+            VISION_PROVIDER_DEVICE_TORCH_CUDA,
+        }:
             failures.append("vision_runtime_provider_kind_mismatch")
             break
-        if str(record.get("vision_runtime_claim", "")) != VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY:
-            failures.append("vision_runtime_claim_not_correctness_only")
-            break
-        if bool(record.get("vision_performance_claim", False)):
-            failures.append("vision_runtime_performance_claim_not_allowed")
-            break
-        if not bool(record.get("vision_uses_host_staging", False)):
-            failures.append("vision_runtime_host_staging_not_recorded")
-            break
+        if provider_kind == VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED:
+            if str(record.get("vision_runtime_claim", "")) != VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY:
+                failures.append("vision_runtime_claim_not_correctness_only")
+                break
+            if bool(record.get("vision_performance_claim", False)):
+                failures.append("vision_runtime_performance_claim_not_allowed")
+                break
+            if not bool(record.get("vision_uses_host_staging", False)):
+                failures.append("vision_runtime_host_staging_not_recorded")
+                break
+        if provider_kind == VISION_PROVIDER_DEVICE_TORCH_CUDA:
+            if (
+                str(record.get("vision_runtime_claim", ""))
+                != VISION_RUNTIME_CLAIM_PERFORMANCE_ELIGIBLE
+            ):
+                failures.append("vision_device_runtime_claim_not_performance_eligible")
+                break
+            if not bool(record.get("vision_performance_claim", False)):
+                failures.append("vision_device_runtime_performance_claim_missing")
+                break
+            if bool(record.get("vision_uses_host_staging", False)):
+                failures.append("vision_device_runtime_host_staging_not_allowed")
+                break
         if not _m11_record_accounting_is_consistent(record, runtime_resolved=True):
             failures.append("vision_runtime_byte_accounting_mismatch")
             break
@@ -2129,7 +2462,11 @@ def _m11_record_accounting_is_consistent(
     weight_bytes = _m11_numel(weight_shape) * 4
     output_bytes = _m11_numel(output_shape) * 4
     total_io_bytes = input_bytes + weight_bytes + output_bytes
-    host_staging_bytes = total_io_bytes if runtime_resolved else 0
+    host_staging_bytes = (
+        total_io_bytes
+        if runtime_resolved and bool(record.get("vision_uses_host_staging", False))
+        else 0
+    )
     return (
         int(record.get("vision_input_bytes", 0) or 0) == input_bytes
         and int(record.get("vision_weight_bytes", 0) or 0) == weight_bytes
@@ -2470,8 +2807,9 @@ def _pre_m11_report_section(
                 "Triton grid blockers before M11 implementation."
             ),
             "schema_policy": (
-                "Schema-v1 top-level buckets and captured-kernel accounting remain "
-                "stable; Pre-M11 details are additive report fields."
+                "Schema-v1 top-level bucket names remain stable; captured-kernel "
+                "accounting changes only when a captured kernel materializes a "
+                "validated TVM artifact. Pre-M11 details are additive report fields."
             ),
             "fallback_policy": (
                 "Implicit PyTorch fallback is disallowed. TVM externs are allowed "
@@ -2553,6 +2891,553 @@ def _pre_m11_report_section(
     }
 
 
+def _pre_m12_report_section(
+    kernel_records: list[dict[str, Any]],
+    model_records: list[dict[str, Any]],
+    extern_records: list[dict[str, Any]],
+    *,
+    summary: dict[str, Any],
+    model_summary: dict[str, Any],
+    m11: dict[str, Any],
+) -> dict[str, Any]:
+    captured_fallbacks = [
+        record
+        for record in kernel_records
+        if not (record.get("translate_status") or {}).get("ok", False)
+    ]
+    concat_split_blockers = [
+        record
+        for record in captured_fallbacks
+        if str(record.get("m11_grid_family", "")) == M11_GRID_FAMILY_CONCAT_SPLIT
+    ]
+    captured_fallback_reasons = Counter(
+        str((record.get("translate_status") or {}).get("fallback_reason", ""))
+        or str(record.get("unsupported_m11_grid_runtime_reason", ""))
+        or str((record.get("translate_status") or {}).get("bucket", "unknown"))
+        for record in captured_fallbacks
+    )
+    artifact_only_gemm = [
+        record
+        for record in extern_records
+        if str(record.get("op_family", "")) == "extern_gemm"
+        and str(
+            record.get("extern_gemm_runtime_status", "")
+            or EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+        )
+        == EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+    ]
+    artifact_only_addmm = [
+        record
+        for record in extern_records
+        if str(record.get("op_family", "")) == "extern_addmm_bias"
+        and str(
+            record.get("extern_gemm_runtime_status", "")
+            or EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+        )
+        == EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+    ]
+    runtime_attention = [
+        record for record in extern_records if _is_runtime_resolved_attention_record(record)
+    ]
+    runtime_conv = [
+        record for record in extern_records if _is_runtime_resolved_vision_record(record)
+    ]
+    device_conv = [
+        record
+        for record in runtime_conv
+        if str(record.get("vision_provider_kind", "")) == VISION_PROVIDER_DEVICE_TORCH_CUDA
+    ]
+    grid_readiness = m11.get("captured_grid_readiness") or {}
+    hotpath = m11.get("m11_7_hotpath") or {}
+    model_entries = _pre_m12_model_entries(model_records, kernel_records)
+
+    residual_debt = []
+    if concat_split_blockers:
+        residual_debt.append(
+            {
+                "debt_kind": "captured_grid_concat_split",
+                "count": len(concat_split_blockers),
+                "models": sorted(
+                    {
+                        str(record.get("model_case", ""))
+                        for record in concat_split_blockers
+                        if record.get("model_case")
+                    }
+                ),
+                "blocker_reason": "grid2d_concat_split_multi_output_layout_deferred_m11_6",
+                "m12_disposition": "primary_yolo_structural_grid2d_closure_target",
+            }
+        )
+    if artifact_only_gemm or artifact_only_addmm:
+        residual_debt.append(
+            {
+                "debt_kind": "wrapper_matmul_artifact_only",
+                "count": len(artifact_only_gemm) + len(artifact_only_addmm),
+                "extern_gemm": len(artifact_only_gemm),
+                "extern_addmm_bias": len(artifact_only_addmm),
+                "models": sorted(
+                    {
+                        str(record.get("model_case", ""))
+                        for record in artifact_only_gemm + artifact_only_addmm
+                        if record.get("model_case")
+                    }
+                ),
+                "m12_disposition": (
+                    "vit_tiny_random is the only M12.2 native matmul closure target; "
+                    "remaining Llama GEMM debt stays out of scope"
+                ),
+            }
+        )
+    if device_conv:
+        residual_debt.append(
+            {
+                "debt_kind": "native_tvm_conv_schedule",
+                "count": len(device_conv),
+                "provider_kind": VISION_PROVIDER_DEVICE_TORCH_CUDA,
+                "m12_disposition": (
+                    "strict_native_debt_only; not a current runtime blocker because "
+                    "device provider records are explicit and zero-host-staged"
+                ),
+            }
+        )
+
+    return {
+        "taxonomy_version": PRE_M12_TAXONOMY_VERSION,
+        "gate_status": "pre_m12_debt_cleaned_v1",
+        "report_policy": {
+            "scope": (
+                "Pre-M12 separates frozen historical entry debt from current residual "
+                "M12 blockers after M11.7 hotpath support."
+            ),
+            "pre_m11_policy": (
+                "Pre-M11 primary debt counts are historical M11 entry counts; current "
+                "remaining blockers are reported in Pre-M12."
+            ),
+            "full_tvm_runnable": (
+                "Strict full_tvm_runnable remains false until captured fallbacks and "
+                "wrapper artifact-only calls are actually closed."
+            ),
+        },
+        "entry_baseline": {
+            "captured_kernel_count": int(summary.get("total_kernels", 0) or 0),
+            "translated_kernel_count": int(summary.get("translated_kernels", 0) or 0),
+            "captured_fallback_count": len(captured_fallbacks),
+            "status_buckets": dict(sorted((summary.get("status_buckets") or {}).items())),
+            "full_tvm_runnable_models": int(
+                model_summary.get("full_tvm_runnable_models", 0) or 0
+            ),
+            "triton_kernel_runnable_models": int(
+                model_summary.get("triton_kernel_runnable_models", 0) or 0
+            ),
+        },
+        "residual_debt_counts": {
+            "captured_grid_concat_split": len(concat_split_blockers),
+            "wrapper_extern_gemm_artifact_only": len(artifact_only_gemm),
+            "wrapper_extern_addmm_bias_artifact_only": len(artifact_only_addmm),
+            "device_provider_conv_not_native_schedule": len(device_conv),
+            "runtime_resolved_attention": len(runtime_attention),
+            "runtime_resolved_convolution": len(runtime_conv),
+            "native_grid2d_ready": int(grid_readiness.get("native_runtime_ready_count", 0) or 0),
+        },
+        "captured_fallback_reasons": dict(sorted(captured_fallback_reasons.items())),
+        "m11_7_hotpath_baseline": {
+            "device_provider_runtime_resolved_count": int(
+                hotpath.get("device_provider_runtime_resolved_count", 0) or 0
+            ),
+            "conv1x1_runtime_resolved_count": int(
+                hotpath.get("conv1x1_runtime_resolved_count", 0) or 0
+            ),
+            "grid_conv_adjacent_pointwise_runtime_ready_count": int(
+                hotpath.get("grid_conv_adjacent_pointwise_runtime_ready_count", 0) or 0
+            ),
+            "vit_tiny_random_runtime_resolved_smoke": bool(
+                hotpath.get("vit_tiny_random_runtime_resolved_smoke", False)
+            ),
+            "full_tvm_runnable_models_remain_conservative": bool(
+                hotpath.get("full_tvm_runnable_models_remain_conservative", True)
+            ),
+        },
+        "residual_debt": residual_debt,
+        "model_entry": model_entries,
+        "m12_recommended_entry": {
+            "default_slice": "m12_vit_fixed_shape_native_matmul_closure",
+            "ordered_targets": [
+                "freeze P0/P1/P2/P3 closure vocabulary and keep full_tvm_runnable strict",
+                "close ViT-only wrapper extern_gemm and extern_addmm_bias artifact-only calls through correctness-first Native TVM",
+                "build M12.3/M12.4 E2E runner/dashboard before setting performance_ready_e2e",
+                "close the 17 YOLO concat/split Grid2D structural blockers",
+                "keep Llama GEMM, dynamic shapes, and strict full-native claims outside M12.2",
+                "treat native TVM conv scheduling as a separate strict-native milestone",
+            ],
+            "do_not_reopen_without_adr": [
+                "M10 attention provider performance claims",
+                "RoPE runtime",
+                "KV-cache runtime",
+                "decode runtime",
+                "hidden PyTorch fallback",
+                "native TVM conv schedule claims",
+            ],
+        },
+    }
+
+
+def _m12_report_section(
+    kernel_records: list[dict[str, Any]],
+    model_records: list[dict[str, Any]],
+    extern_records: list[dict[str, Any]],
+    *,
+    model_summary: dict[str, Any],
+) -> dict[str, Any]:
+    vit_model = next(
+        (model for model in model_records if str(model.get("model_case", "")) == "vit_tiny_random"),
+        {},
+    )
+    vit_kernels = [
+        record for record in kernel_records if str(record.get("model_case", "")) == "vit_tiny_random"
+    ]
+    vit_wrappers = [
+        record for record in extern_records if str(record.get("model_case", "")) == "vit_tiny_random"
+    ]
+    vit_matmul = [
+        record
+        for record in vit_wrappers
+        if str(record.get("op_family", "")) in {"extern_gemm", "extern_addmm_bias"}
+    ]
+    native_matmul = [
+        record for record in vit_matmul if _is_runtime_resolved_native_extern_matmul_record(record)
+    ]
+    artifact_only_matmul = [
+        record
+        for record in vit_matmul
+        if str(
+            record.get("extern_gemm_runtime_status", "")
+            or EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+        )
+        == EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+    ]
+    host_staging_bytes = _m12_matmul_host_staging_bytes(native_matmul)
+    performance_claim_count = sum(
+        1 for record in native_matmul if bool(record.get("extern_gemm_performance_claim", False))
+    )
+    native_provider_counts = Counter(
+        str(record.get("extern_gemm_provider_kind", "")) or EXTERN_GEMM_PROVIDER_NONE
+        for record in native_matmul
+    )
+    wrapper_nodes = [_m12_wrapper_plan_node(record) for record in vit_wrappers]
+    captured_nodes = [_m12_captured_plan_node(record) for record in vit_kernels]
+    execution_plan = {
+        "target_model": "vit_tiny_random",
+        "fixed_shape": True,
+        "captured_kernel_count": len(vit_kernels),
+        "translated_captured_kernel_count": sum(
+            1 for record in vit_kernels if (record.get("translate_status") or {}).get("ok", False)
+        ),
+        "captured_fallback_count": sum(
+            1
+            for record in vit_kernels
+            if not (record.get("translate_status") or {}).get("ok", False)
+        ),
+        "wrapper_call_count": len(vit_wrappers),
+        "wrapper_matmul_call_count": len(vit_matmul),
+        "artifact_only_matmul_blockers": len(artifact_only_matmul),
+        "native_runtime_resolved_matmul_count": len(native_matmul),
+        "host_staging_bytes": host_staging_bytes,
+        "launch_count_estimate": len(vit_kernels)
+        + sum(1 for record in vit_wrappers if _m12_wrapper_runtime_status(record)),
+        "nodes": captured_nodes + wrapper_nodes,
+        "no_hidden_fallback": _m12_no_hidden_fallback(vit_kernels, vit_wrappers),
+    }
+    closure = {
+        "status": (
+            "passed"
+            if len(vit_matmul) == 7
+            and len(native_matmul) == 7
+            and host_staging_bytes == 0
+            and performance_claim_count == 0
+            else "blocked"
+        ),
+        "target_model": "vit_tiny_random",
+        "provider_kind": EXTERN_GEMM_PROVIDER_NATIVE_TVM,
+        "runtime_claim": EXTERN_GEMM_RUNTIME_CLAIM_NATIVE_TVM_FIXED_SHAPE,
+        "schedule_id": NATIVE_TIR_MATMUL_SCHEDULE_ID,
+        "wrapper_matmul_total": len(vit_matmul),
+        "extern_gemm_total": sum(1 for record in vit_matmul if record.get("op_family") == "extern_gemm"),
+        "extern_addmm_bias_total": sum(
+            1 for record in vit_matmul if record.get("op_family") == "extern_addmm_bias"
+        ),
+        "runtime_resolved_total": len(native_matmul),
+        "runtime_resolved_extern_gemm": sum(
+            1 for record in native_matmul if record.get("op_family") == "extern_gemm"
+        ),
+        "runtime_resolved_extern_addmm_bias": sum(
+            1 for record in native_matmul if record.get("op_family") == "extern_addmm_bias"
+        ),
+        "artifact_only_remaining": len(artifact_only_matmul),
+        "host_staging_bytes": host_staging_bytes,
+        "performance_claim": False,
+        "performance_claim_count": performance_claim_count,
+        "provider_counts": dict(sorted(native_provider_counts.items())),
+        "records": [_m12_matmul_closure_record(record) for record in vit_matmul],
+    }
+    return {
+        "taxonomy_version": 1,
+        "milestone": "M12",
+        "status": _m12_status(closure),
+        "policy": _m12_policy_section(model_summary),
+        "vit_fixed_shape_execution_plan": execution_plan,
+        "m12_2_native_matmul_closure": closure,
+    }
+
+
+def _m12_policy_section(model_summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "closure_levels": {
+            "runtime_resolved_smoke": (
+                "single-model smoke evidence with explicit providers; not E2E performance-ready"
+            ),
+            "performance_ready_e2e": (
+                "all required fixed-shape ViT captured and wrapper calls have explicit "
+                "admitted runtime paths, zero host staging, complete provider mix, "
+                "strict correctness, and P2 dashboard evidence"
+            ),
+            "strict_full_tvm_native": (
+                "no provider fallback and no wrapper artifact/runtime provider remains"
+            ),
+        },
+        "performance_tiers": {
+            "P0": "correctness, no silent fallback, complete provider report",
+            "P1": "p50/p95 <= 3x eager or torch.compile with zero host staging",
+            "P2": "fixed ViT p50/p95 <= 2x torch.compile, warmed cache, zero host staging",
+            "P3": "optional hotpath optimization after P2",
+        },
+        "full_tvm_runnable_remains_strict": True,
+        "full_tvm_runnable_models": int(model_summary.get("full_tvm_runnable_models", 0) or 0),
+        "performance_ready_e2e": False,
+        "strict_full_tvm_native": False,
+    }
+
+
+def _m12_status(closure: dict[str, Any]) -> str:
+    if closure.get("status") == "passed":
+        return "m12_2_native_vit_matmul_closed"
+    return "m12_planned_or_blocked"
+
+
+def _m12_captured_plan_node(record: dict[str, Any]) -> dict[str, Any]:
+    status = record.get("translate_status") or {}
+    return {
+        "node_kind": "captured_kernel",
+        "kernel_name": record.get("kernel_name", ""),
+        "contract": record.get("contract", ""),
+        "translate_ok": bool(status.get("ok", False)),
+        "bucket": status.get("bucket", ""),
+        "fallback_reason": status.get("fallback_reason", ""),
+        "provider_kind": "native_tvm_tirx" if status.get("ok", False) else "",
+        "host_staging_bytes": 0,
+        "performance_claim": False,
+    }
+
+
+def _m12_wrapper_plan_node(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "node_kind": "wrapper_call",
+        "op_family": record.get("op_family", ""),
+        "op_name": record.get("op_name", ""),
+        "line_no": int(record.get("line_no", 0) or 0),
+        "implementation_kind": _m12_wrapper_implementation_kind(record),
+        "runtime_status": _m12_wrapper_runtime_status(record),
+        "provider_kind": _m12_wrapper_provider_kind(record),
+        "schedule_id": record.get("schedule_id", ""),
+        "host_staging_bytes": _m12_wrapper_host_staging_bytes(record),
+        "performance_claim": _m12_wrapper_performance_claim(record),
+    }
+
+
+def _m12_matmul_closure_record(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "op_family": record.get("op_family", ""),
+        "op_name": record.get("op_name", ""),
+        "line_no": int(record.get("line_no", 0) or 0),
+        "matmul_m": int(record.get("matmul_m", 0) or 0),
+        "matmul_n": int(record.get("matmul_n", 0) or 0),
+        "matmul_k": int(record.get("matmul_k", 0) or 0),
+        "implementation_kind": record.get("implementation_kind", ""),
+        "schedule_id": record.get("schedule_id", ""),
+        "runtime_status": record.get("extern_gemm_runtime_status", ""),
+        "provider_kind": record.get("extern_gemm_provider_kind", ""),
+        "runtime_claim": record.get("extern_gemm_runtime_claim", ""),
+        "uses_host_staging": bool(record.get("extern_gemm_uses_host_staging", False)),
+        "performance_claim": bool(record.get("extern_gemm_performance_claim", False)),
+        "unsupported_matmul_reason": record.get("unsupported_matmul_reason", ""),
+    }
+
+
+def _m12_wrapper_runtime_status(record: dict[str, Any]) -> str:
+    family = str(record.get("op_family", ""))
+    if family in {"extern_gemm", "extern_addmm_bias"}:
+        return str(record.get("extern_gemm_runtime_status", ""))
+    if family == "deferred_convolution":
+        return str(record.get("vision_runtime_status", ""))
+    if family == "deferred_attention":
+        return str(record.get("attention_runtime_status", ""))
+    return ""
+
+
+def _m12_wrapper_provider_kind(record: dict[str, Any]) -> str:
+    family = str(record.get("op_family", ""))
+    if family in {"extern_gemm", "extern_addmm_bias"}:
+        return str(record.get("extern_gemm_provider_kind", ""))
+    if family == "deferred_convolution":
+        return str(record.get("vision_provider_kind", ""))
+    if family == "deferred_attention":
+        return str(record.get("attention_provider_kind", ""))
+    return ""
+
+
+def _m12_wrapper_implementation_kind(record: dict[str, Any]) -> str:
+    family = str(record.get("op_family", ""))
+    if family in {"extern_gemm", "extern_addmm_bias"}:
+        return str(record.get("implementation_kind", ""))
+    if family == "deferred_convolution":
+        return str(record.get("vision_implementation_kind", ""))
+    if family == "deferred_attention":
+        return str(record.get("attention_implementation_kind", ""))
+    return ""
+
+
+def _m12_wrapper_host_staging_bytes(record: dict[str, Any]) -> int:
+    family = str(record.get("op_family", ""))
+    if family in {"extern_gemm", "extern_addmm_bias"}:
+        return _m12_matmul_host_staging_bytes([record])
+    if family == "deferred_convolution":
+        return int(record.get("vision_host_staging_bytes", 0) or 0)
+    if family == "deferred_attention":
+        return int(record.get("attention_host_staging_bytes", 0) or 0)
+    return 0
+
+
+def _m12_wrapper_performance_claim(record: dict[str, Any]) -> bool:
+    family = str(record.get("op_family", ""))
+    if family in {"extern_gemm", "extern_addmm_bias"}:
+        return bool(record.get("extern_gemm_performance_claim", False))
+    if family == "deferred_convolution":
+        return bool(record.get("vision_performance_claim", False))
+    if family == "deferred_attention":
+        return bool(record.get("attention_performance_claim", False))
+    return False
+
+
+def _m12_matmul_host_staging_bytes(records: list[dict[str, Any]]) -> int:
+    total = 0
+    for record in records:
+        if bool(record.get("extern_gemm_uses_host_staging", False)):
+            total += (
+                int(record.get("matmul_m", 0) or 0) * int(record.get("matmul_k", 0) or 0)
+                + int(record.get("matmul_k", 0) or 0) * int(record.get("matmul_n", 0) or 0)
+                + int(record.get("matmul_m", 0) or 0) * int(record.get("matmul_n", 0) or 0)
+            ) * 4
+    return total
+
+
+def _m12_no_hidden_fallback(
+    kernel_records: list[dict[str, Any]],
+    extern_records: list[dict[str, Any]],
+) -> bool:
+    captured_ok = all(
+        bool((record.get("translate_status") or {}).get("ok", False)) for record in kernel_records
+    )
+    wrappers_explicit = all(bool(_m12_wrapper_runtime_status(record)) for record in extern_records)
+    return captured_ok and wrappers_explicit
+
+
+def _pre_m12_model_entries(
+    model_records: list[dict[str, Any]],
+    kernel_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    entries = []
+    kernels_by_model: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in kernel_records:
+        kernels_by_model[str(record.get("model_case", ""))].append(record)
+    for model in model_records:
+        model_case = str(model.get("model_case", ""))
+        kernels = kernels_by_model.get(model_case, [])
+        captured_fallbacks = [
+            record
+            for record in kernels
+            if not (record.get("translate_status") or {}).get("ok", False)
+        ]
+        extern_calls = list(model.get("extern_calls", []) or [])
+        family_counts = Counter(str(record.get("op_family", "")) for record in extern_calls)
+        artifact_only_gemm = sum(
+            1
+            for record in extern_calls
+            if str(record.get("op_family", "")) == "extern_gemm"
+            and str(
+                record.get("extern_gemm_runtime_status", "")
+                or EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+            )
+            == EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+        )
+        artifact_only_addmm = sum(
+            1
+            for record in extern_calls
+            if str(record.get("op_family", "")) == "extern_addmm_bias"
+            and str(
+                record.get("extern_gemm_runtime_status", "")
+                or EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+            )
+            == EXTERN_GEMM_RUNTIME_STATUS_ARTIFACT_ONLY
+        )
+        runtime_conv = sum(
+            1 for record in extern_calls if _is_runtime_resolved_vision_record(record)
+        )
+        runtime_attention = sum(
+            1 for record in extern_calls if _is_runtime_resolved_attention_record(record)
+        )
+        concat_split_blockers = sum(
+            1
+            for record in captured_fallbacks
+            if str(record.get("m11_grid_family", "")) == M11_GRID_FAMILY_CONCAT_SPLIT
+        )
+        entries.append(
+            {
+                "model_case": model_case,
+                "model_family": model.get("model_family", ""),
+                "captured_kernels": int(model.get("kernel_count", 0) or len(kernels)),
+                "translated_kernels": int(model.get("translated_kernels", 0) or 0),
+                "captured_fallbacks": len(captured_fallbacks),
+                "triton_kernel_runnable": bool(model.get("triton_kernel_runnable", False)),
+                "full_tvm_runnable": bool(model.get("full_tvm_runnable", False)),
+                "extern_family_counts": dict(sorted(family_counts.items())),
+                "runtime_resolved_convolution": runtime_conv,
+                "runtime_resolved_attention": runtime_attention,
+                "artifact_only_extern_gemm": artifact_only_gemm,
+                "artifact_only_extern_addmm_bias": artifact_only_addmm,
+                "concat_split_grid2d_blockers": concat_split_blockers,
+                "m12_entry_role": _pre_m12_model_entry_role(
+                    model_case,
+                    artifact_only_gemm + artifact_only_addmm,
+                    concat_split_blockers,
+                ),
+            }
+        )
+    return sorted(entries, key=lambda item: str(item.get("model_case", "")))
+
+
+def _pre_m12_model_entry_role(
+    model_case: str,
+    artifact_only_matmul_calls: int,
+    concat_split_blockers: int,
+) -> str:
+    if concat_split_blockers:
+        return "primary_yolo_concat_split_grid2d_closure_target"
+    if artifact_only_matmul_calls:
+        return "captured_clean_but_wrapper_matmul_artifact_only"
+    if model_case == "vit_tiny_random":
+        return "runtime_resolved_smoke_reference"
+    return "captured_clean_reference"
+
+
 def _pre_m11_vision_op_policy() -> dict[str, Any]:
     return {
         "operator_families": {
@@ -2583,35 +3468,68 @@ def _pre_m11_vision_op_policy() -> dict[str, Any]:
 def _pre_m11_grid_debt_entry(
     kernel_records: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    grid_records = [
+    current_grid_blockers = [
         record
         for record in kernel_records
         if not record.get("translate_status", {}).get("ok", False)
         and record.get("blocker_class") == "grid"
     ]
+    classified_grid_records = [
+        record
+        for record in kernel_records
+        if str(record.get("m11_grid_status", "")) == "m11_grid_classified"
+    ]
+    grid_records = classified_grid_records or current_grid_blockers
+    use_frozen_m11_entry = bool(classified_grid_records)
     buckets: Counter = Counter()
     blocker_classes: Counter = Counter()
     grid_types: Counter = Counter()
+    current_remaining_reasons: Counter = Counter()
     models: set[str] = set()
     families: set[str] = set()
     example_kernel = ""
     example_message = ""
     for record in grid_records:
         status = record.get("translate_status", {})
-        buckets[str(status.get("bucket", "unknown"))] += 1
-        blocker_classes[str(record.get("blocker_class", "unknown"))] += 1
-        grid_types[str(record.get("grid_type", "unknown"))] += 1
+        bucket = "contract_error" if use_frozen_m11_entry else str(
+            status.get("bucket", "unknown")
+        )
+        buckets[bucket] += 1
+        blocker_classes["grid"] += 1
+        grid_types[
+            str(record.get("m11_grid_launch_kind", ""))
+            or str(record.get("grid_type", "unknown"))
+        ] += 1
         if record.get("model_case"):
             models.add(str(record.get("model_case", "")))
         if record.get("model_family"):
             families.add(str(record.get("model_family", "")))
         if not example_kernel:
             example_kernel = str(record.get("kernel_name", ""))
-            example_message = str(status.get("message", ""))
+            example_message = (
+                str(status.get("message", ""))
+                or str(record.get("unsupported_m11_grid_runtime_reason", ""))
+                or str(record.get("unsupported_m11_grid_reason", ""))
+            )
+    for record in current_grid_blockers:
+        status = record.get("translate_status", {})
+        reason = (
+            str(record.get("unsupported_m11_grid_runtime_reason", ""))
+            or str(status.get("fallback_reason", ""))
+            or str(status.get("bucket", "unknown"))
+        )
+        current_remaining_reasons[reason] += 1
 
     return {
         "pre_m11_family": "captured_grid",
         "kernel_count": len(grid_records),
+        "entry_count_policy": (
+            "frozen_m11_entry_count_from_classified_grid_records"
+            if use_frozen_m11_entry
+            else "current_fallback_grid_count_before_m11_classification"
+        ),
+        "current_remaining_kernel_count": len(current_grid_blockers),
+        "current_remaining_reasons": dict(sorted(current_remaining_reasons.items())),
         "buckets": dict(sorted(buckets.items())),
         "blocker_classes": dict(sorted(blocker_classes.items())),
         "grid_types": dict(sorted(grid_types.items())),
@@ -2719,11 +3637,15 @@ def _is_pre_m9_entry_debt_record(record: dict[str, Any]) -> bool:
         str(record.get("op_name", ""))
     )
     if family == "extern_addmm_bias":
-        return not _is_materialized_extern_addmm_bias_record(record)
+        return not (
+            _is_materialized_extern_addmm_bias_record(record)
+            or _is_runtime_resolved_native_extern_matmul_record(record)
+        )
     if family == "extern_gemm":
         return not (
             _is_materialized_extern_gemm_record(record)
             or _is_runtime_resolved_extern_gemm_record(record)
+            or _is_runtime_resolved_native_extern_matmul_record(record)
         )
     return False
 
@@ -2778,7 +3700,6 @@ def _is_materialized_vision_conv_record(record: dict[str, Any]) -> bool:
         == VISION_IMPLEMENTATION_KIND_EXTERN_CONV2D
         and str(record.get("vision_extern_symbol", "")) == VISION_EXTERN_SYMBOL
         and str(record.get("vision_extern_packed_func", "")) == VISION_EXTERN_PACKED_FUNC
-        and not bool(record.get("vision_performance_claim", False))
     )
 
 
@@ -2866,12 +3787,31 @@ def _is_runtime_resolved_extern_gemm_record(record: dict[str, Any]) -> bool:
         str(record.get("op_family", "")) == "extern_gemm"
         and str(record.get("matmul_source_kind", "")) == "wrapper_extern_gemm"
         and bool(record.get("matmul_contract_ok", False))
-        and str(record.get("implementation_kind", "")) == "extern_gemm"
+        and str(record.get("implementation_kind", "")) in {"extern_gemm", "native_tir_schedule"}
         and str(record.get("extern_symbol", "")) == "extern_kernels.mm"
         and str(record.get("extern_gemm_runtime_status", ""))
         == EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED
         and str(record.get("extern_gemm_provider_kind", ""))
-        == EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED
+        in {EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED, EXTERN_GEMM_PROVIDER_NATIVE_TVM}
+    )
+
+
+def _is_runtime_resolved_native_extern_matmul_record(record: dict[str, Any]) -> bool:
+    return (
+        str(record.get("op_family", "")) in {"extern_gemm", "extern_addmm_bias"}
+        and str(record.get("matmul_source_kind", ""))
+        in {"wrapper_extern_gemm", "wrapper_extern_addmm_bias"}
+        and bool(record.get("matmul_contract_ok", False))
+        and str(record.get("implementation_kind", "")) == "native_tir_schedule"
+        and str(record.get("schedule_id", "")) == NATIVE_TIR_MATMUL_SCHEDULE_ID
+        and str(record.get("extern_gemm_runtime_status", ""))
+        == EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED
+        and str(record.get("extern_gemm_provider_kind", ""))
+        == EXTERN_GEMM_PROVIDER_NATIVE_TVM
+        and str(record.get("extern_gemm_runtime_claim", ""))
+        == EXTERN_GEMM_RUNTIME_CLAIM_NATIVE_TVM_FIXED_SHAPE
+        and not bool(record.get("extern_gemm_uses_host_staging", False))
+        and not bool(record.get("extern_gemm_performance_claim", False))
     )
 
 

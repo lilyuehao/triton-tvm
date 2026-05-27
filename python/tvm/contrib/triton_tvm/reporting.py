@@ -572,6 +572,135 @@ def render_capability_markdown(
                     )
                 )
             lines.append("")
+    if "pre_m12" in report:
+        pre_m12 = report.get("pre_m12") or {}
+        entry = pre_m12.get("entry_baseline") or {}
+        residual_counts = pre_m12.get("residual_debt_counts") or {}
+        hotpath = pre_m12.get("m11_7_hotpath_baseline") or {}
+        lines.extend(
+            [
+                "## Pre-M12 Debt Gate",
+                "",
+                f"- Taxonomy version: {pre_m12.get('taxonomy_version', '')}",
+                f"- Gate status: {pre_m12.get('gate_status', '')}",
+                "- Captured kernels: "
+                f"{entry.get('captured_kernel_count', 0)} total / "
+                f"{entry.get('translated_kernel_count', 0)} translated / "
+                f"{entry.get('captured_fallback_count', 0)} fallback",
+                "- Strict full TVM runnable models: "
+                f"{entry.get('full_tvm_runnable_models', 0)}",
+                "- Triton-kernel runnable models: "
+                f"{entry.get('triton_kernel_runnable_models', 0)}",
+                "- Residual concat/split Grid2D blockers: "
+                f"{residual_counts.get('captured_grid_concat_split', 0)}",
+                "- Wrapper GEMM artifact-only calls: "
+                f"{residual_counts.get('wrapper_extern_gemm_artifact_only', 0)}",
+                "- Wrapper addmm/bias artifact-only calls: "
+                f"{residual_counts.get('wrapper_extern_addmm_bias_artifact_only', 0)}",
+                "- Device-provider conv records not native TVM schedules: "
+                f"{residual_counts.get('device_provider_conv_not_native_schedule', 0)}",
+                "- M11.7 hotpath baseline: "
+                f"conv={hotpath.get('device_provider_runtime_resolved_count', 0)}, "
+                f"conv1x1={hotpath.get('conv1x1_runtime_resolved_count', 0)}, "
+                "grid-conv-adjacent="
+                f"{hotpath.get('grid_conv_adjacent_pointwise_runtime_ready_count', 0)}, "
+                f"vit-smoke={hotpath.get('vit_tiny_random_runtime_resolved_smoke', False)}",
+                "",
+            ]
+        )
+        residual_debt = pre_m12.get("residual_debt") or []
+        if residual_debt:
+            lines.extend(["| Debt | Count | Disposition |", "|---|---:|---|"])
+            for entry_record in residual_debt:
+                lines.append(
+                    "| {name} | {count} | {disposition} |".format(
+                        name=_escape_markdown_cell(str(entry_record.get("debt_kind", ""))),
+                        count=entry_record.get("count", 0),
+                        disposition=_escape_markdown_cell(
+                            str(entry_record.get("m12_disposition", ""))
+                        ),
+                    )
+                )
+            lines.append("")
+        model_entry = pre_m12.get("model_entry") or []
+        if model_entry:
+            lines.extend(
+                [
+                    "| Model | Captured | TVM | Fallback | GEMM artifact | Addmm artifact | Concat/split | Role |",
+                    "|---|---:|---:|---:|---:|---:|---:|---|",
+                ]
+            )
+            for record in model_entry:
+                lines.append(
+                    "| {model} | {captured} | {translated} | {fallback} | {gemm} | {addmm} | {concat} | {role} |".format(
+                        model=_escape_markdown_cell(str(record.get("model_case", ""))),
+                        captured=record.get("captured_kernels", 0),
+                        translated=record.get("translated_kernels", 0),
+                        fallback=record.get("captured_fallbacks", 0),
+                        gemm=record.get("artifact_only_extern_gemm", 0),
+                        addmm=record.get("artifact_only_extern_addmm_bias", 0),
+                        concat=record.get("concat_split_grid2d_blockers", 0),
+                        role=_escape_markdown_cell(str(record.get("m12_entry_role", ""))),
+                    )
+                )
+            lines.append("")
+    if "m12" in report:
+        m12 = report.get("m12") or {}
+        policy = m12.get("policy") or {}
+        execution = m12.get("vit_fixed_shape_execution_plan") or {}
+        closure = m12.get("m12_2_native_matmul_closure") or {}
+        lines.extend(
+            [
+                "## M12 ViT Fixed-Shape E2E",
+                "",
+                f"- Status: {m12.get('status', '')}",
+                "- Policy: performance-ready E2E is distinct from strict full TVM native.",
+                "- Strict full TVM runnable models: "
+                f"{policy.get('full_tvm_runnable_models', 0)}",
+                f"- Performance-ready E2E: {policy.get('performance_ready_e2e', False)}",
+                "- ViT captured kernels: "
+                f"{execution.get('captured_kernel_count', 0)} total / "
+                f"{execution.get('translated_captured_kernel_count', 0)} translated / "
+                f"{execution.get('captured_fallback_count', 0)} fallback",
+                "- ViT wrapper calls: "
+                f"{execution.get('wrapper_call_count', 0)} total / "
+                f"{execution.get('wrapper_matmul_call_count', 0)} matmul",
+                "- ViT native matmul closure: "
+                f"{closure.get('runtime_resolved_total', 0)}/"
+                f"{closure.get('wrapper_matmul_total', 0)} runtime-resolved, "
+                f"provider={closure.get('provider_kind', '')}, "
+                f"host_staging_bytes={closure.get('host_staging_bytes', 0)}",
+                f"- M12.2 performance claim: {closure.get('performance_claim', False)}",
+                "",
+            ]
+        )
+        records = closure.get("records") or []
+        if records:
+            lines.extend(
+                [
+                    "| ViT matmul | Line | Shape | Impl | Provider | Status | Host staged | Perf claim |",
+                    "|---|---:|---|---|---|---|---:|---|",
+                ]
+            )
+            for record in records:
+                shape = "{m}x{n}x{k}".format(
+                    m=record.get("matmul_m", 0),
+                    n=record.get("matmul_n", 0),
+                    k=record.get("matmul_k", 0),
+                )
+                lines.append(
+                    "| {family} | {line} | {shape} | {impl} | {provider} | {status} | {host} | {perf} |".format(
+                        family=_escape_markdown_cell(str(record.get("op_family", ""))),
+                        line=record.get("line_no", 0),
+                        shape=_escape_markdown_cell(shape),
+                        impl=_escape_markdown_cell(str(record.get("implementation_kind", ""))),
+                        provider=_escape_markdown_cell(str(record.get("provider_kind", ""))),
+                        status=_escape_markdown_cell(str(record.get("runtime_status", ""))),
+                        host=int(bool(record.get("uses_host_staging", False))),
+                        perf=record.get("performance_claim", False),
+                    )
+                )
+            lines.append("")
     if "m11" in report:
         m11 = report.get("m11") or {}
         lines.extend(
@@ -649,6 +778,26 @@ def render_capability_markdown(
                     "- Partial vision model smoke count: "
                     f"{model_smoke.get('partial_model_count', 0)}",
                     f"- Full TVM native models: {m11.get('full_tvm_native_model', 0)}",
+                    "",
+                ]
+            )
+        hotpath = m11.get("m11_7_hotpath") or {}
+        if hotpath:
+            lines.extend(
+                [
+                    "### M11.7 Vision Hotpath",
+                    "",
+                    f"- Hotpath status: {hotpath.get('status', '')}",
+                    "- Device-provider conv runtime-resolved: "
+                    f"{hotpath.get('device_provider_runtime_resolved_count', 0)}",
+                    "- 1x1 conv runtime-resolved: "
+                    f"{hotpath.get('conv1x1_runtime_resolved_count', 0)}",
+                    "- Grid conv-adjacent runtime-ready: "
+                    f"{hotpath.get('grid_conv_adjacent_pointwise_runtime_ready_count', 0)}",
+                    "- ViT runtime-resolved smoke: "
+                    f"{hotpath.get('vit_tiny_random_runtime_resolved_smoke', False)}",
+                    "- Host-staged providers excluded from perf claims: "
+                    f"{hotpath.get('host_staged_provider_excluded_from_perf_claims', False)}",
                     "",
                 ]
             )

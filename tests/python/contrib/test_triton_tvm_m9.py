@@ -24,6 +24,7 @@ import pytest
 import tvm
 import tvm.testing
 from tvm.contrib.triton_tvm import (
+    M129OptimizeNativeWrapperMatmul,
     build_triton_tvm,
     register_python_torch_extern_gemm,
     translate_ttir,
@@ -31,8 +32,11 @@ from tvm.contrib.triton_tvm import (
 )
 from tvm.contrib.triton_tvm.matmul import (
     EXTERN_GEMM_PACKED_FUNC,
+    EXTERN_GEMM_PROVIDER_NATIVE_TVM,
     EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+    EXTERN_GEMM_RUNTIME_CLAIM_NATIVE_TVM_FIXED_SHAPE,
     EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED,
+    M129_ROW_THREADED_WRAPPER_MATMUL_SCHEDULE_ID,
     NATIVE_TIR_MATMUL_SCHEDULE_ID,
     SIMT_TIR_MATMUL_SCHEDULE_ID,
     TENSORCORE_TIR_MATMUL_SCHEDULE_ID,
@@ -40,8 +44,10 @@ from tvm.contrib.triton_tvm.matmul import (
     TargetMatmulPolicy,
     build_extern_addmm_bias_tirx_source,
     build_extern_gemm_tirx_source,
+    build_native_wrapper_matmul_tirx_source,
     extract_matmul_semantics_from_wrapper_extern_addmm,
     extract_matmul_semantics_from_wrapper_extern,
+    is_m12_vit_native_wrapper_matmul_scope,
     register_python_torch_extern_addmm_bias,
 )
 from tvm.contrib.triton_tvm.m98_toy_mlp import (
@@ -545,6 +551,215 @@ def test_m9p_extern_addmm_bias_runtime_provider_build_run():
             ]
         )
     tvm.testing.assert_allclose(out_tvm.numpy(), a_np @ b_np + bias_np, rtol=1e-5, atol=1e-5)
+
+
+def test_m12_native_wrapper_matmul_policy_and_contract_validation():
+    gemm_source = (
+        "extern_kernels.mm(reinterpret_tensor(a, (5, 64), (64, 1), 0), "
+        "reinterpret_tensor(b, (64, 64), (1, 64), 0), out=out)"
+    )
+    non_square_gemm_source = (
+        "extern_kernels.mm(reinterpret_tensor(a, (5, 64), (64, 1), 0), "
+        "reinterpret_tensor(b, (64, 128), (1, 64), 0), out=out)"
+    )
+    addmm_source = (
+        "extern_kernels.addmm(bias, reinterpret_tensor(a, (5, 64), (64, 1), 0), "
+        "reinterpret_tensor(b, (64, 64), (1, 64), 0), alpha=1, beta=1, out=out)"
+    )
+    for source, extractor, kernel_name in (
+        (gemm_source, extract_matmul_semantics_from_wrapper_extern, "m12_native_gemm"),
+        (
+            non_square_gemm_source,
+            extract_matmul_semantics_from_wrapper_extern,
+            "m12_native_gemm_non_square",
+        ),
+        (
+            addmm_source,
+            extract_matmul_semantics_from_wrapper_extern_addmm,
+            "m12_native_addmm",
+        ),
+    ):
+        semantics = extractor(source, kernel_name=kernel_name)
+        assert is_m12_vit_native_wrapper_matmul_scope(semantics) is True
+        decision = TargetMatmulPolicy(
+            extern_gemm_runtime_provider=EXTERN_GEMM_PROVIDER_NATIVE_TVM
+        ).decide(semantics, matmul_contract_ok=True)
+
+        assert decision.implementation_kind == "native_tir_schedule"
+        assert decision.schedule_id == NATIVE_TIR_MATMUL_SCHEDULE_ID
+        assert decision.extern_gemm_provider_kind == EXTERN_GEMM_PROVIDER_NATIVE_TVM
+        assert decision.extern_gemm_runtime_claim == (
+            EXTERN_GEMM_RUNTIME_CLAIM_NATIVE_TVM_FIXED_SHAPE
+        )
+        assert decision.extern_gemm_uses_host_staging is False
+        assert decision.extern_gemm_performance_claim is False
+
+        irmod = tvm.script.from_source(
+            build_native_wrapper_matmul_tirx_source(semantics, decision)
+        )
+        validate_matmul_minimal_contract(irmod)
+
+
+def test_m12_native_wrapper_matmul_rejects_stale_host_staging_metadata():
+    source = (
+        "extern_kernels.mm(reinterpret_tensor(a, (5, 64), (64, 1), 0), "
+        "reinterpret_tensor(b, (64, 64), (1, 64), 0), out=out)"
+    )
+    semantics = extract_matmul_semantics_from_wrapper_extern(
+        source,
+        kernel_name="m12_native_bad_host_staging",
+    )
+    decision = TargetMatmulPolicy(
+        extern_gemm_runtime_provider=EXTERN_GEMM_PROVIDER_NATIVE_TVM
+    ).decide(semantics, matmul_contract_ok=True)
+    source_text = build_native_wrapper_matmul_tirx_source(semantics, decision).replace(
+        '"triton_tvm.extern_gemm_uses_host_staging": False',
+        '"triton_tvm.extern_gemm_uses_host_staging": True',
+    )
+    irmod = tvm.script.from_source(source_text)
+
+    with pytest.raises(Exception, match="must not host stage"):
+        validate_matmul_minimal_contract(irmod)
+
+
+def test_m129_backend_pass_rewrites_native_wrapper_matmul_schedule():
+    source_line = (
+        "extern_kernels.mm(reinterpret_tensor(a, (5, 64), (64, 1), 0), "
+        "reinterpret_tensor(b, (64, 64), (1, 64), 0), out=out)"
+    )
+    semantics = extract_matmul_semantics_from_wrapper_extern(
+        source_line,
+        kernel_name="m129_backend_pass_gemm",
+    )
+    decision = TargetMatmulPolicy(
+        extern_gemm_runtime_provider=EXTERN_GEMM_PROVIDER_NATIVE_TVM
+    ).decide(semantics, matmul_contract_ok=True)
+    irmod = tvm.script.from_source(build_native_wrapper_matmul_tirx_source(semantics, decision))
+    optimized = M129OptimizeNativeWrapperMatmul()(irmod)
+    validate_matmul_minimal_contract(optimized)
+
+    func = next(iter(optimized.functions.values()))
+    assert str(func.attrs["triton_tvm.schedule_id"]) == (
+        M129_ROW_THREADED_WRAPPER_MATMUL_SCHEDULE_ID
+    )
+    script = optimized.script()
+    assert 'thread="blockIdx.x"' in script
+    assert 'thread="threadIdx.x"' in script
+    assert "T.thread_binding(5" in script
+    assert "T.thread_binding(64" in script
+
+
+@tvm.testing.requires_cuda
+def test_m12_native_wrapper_gemm_transposed_weight_build_run():
+    source_line = (
+        "extern_kernels.mm(reinterpret_tensor(a, (5, 64), (64, 1), 0), "
+        "reinterpret_tensor(b, (64, 64), (1, 64), 0), out=out)"
+    )
+    semantics = extract_matmul_semantics_from_wrapper_extern(
+        source_line,
+        kernel_name="m12_native_wrapper_gemm",
+    )
+    decision = TargetMatmulPolicy(
+        extern_gemm_runtime_provider=EXTERN_GEMM_PROVIDER_NATIVE_TVM
+    ).decide(semantics, matmul_contract_ok=True)
+    irmod = tvm.script.from_source(build_native_wrapper_matmul_tirx_source(semantics, decision))
+    validate_matmul_minimal_contract(irmod)
+    built = build_triton_tvm(irmod, _extern_gemm_meta("m12_native_wrapper_gemm", 5, 64, 64))
+
+    dev = tvm.cuda(0)
+    a_np = np.arange(5 * 64, dtype="float32").reshape(5, 64) / 13.0
+    b_storage_np = np.arange(64 * 64, dtype="float32").reshape(64, 64) / 17.0
+    out_tvm = tvm.runtime.empty((5, 64), "float32", dev)
+    built.run(
+        [
+            tvm.runtime.tensor(a_np, dev),
+            tvm.runtime.tensor(b_storage_np, dev),
+            out_tvm,
+        ]
+    )
+    tvm.testing.assert_allclose(out_tvm.numpy(), a_np @ b_storage_np.T, rtol=1e-5, atol=1e-5)
+
+
+@tvm.testing.requires_cuda
+def test_m12_native_wrapper_addmm_bias_build_run():
+    source_line = (
+        "extern_kernels.addmm(bias, reinterpret_tensor(a, (5, 64), (64, 1), 0), "
+        "reinterpret_tensor(b, (64, 64), (1, 64), 0), alpha=1, beta=1, out=out)"
+    )
+    semantics = extract_matmul_semantics_from_wrapper_extern_addmm(
+        source_line,
+        kernel_name="m12_native_wrapper_addmm",
+    )
+    decision = TargetMatmulPolicy(
+        extern_gemm_runtime_provider=EXTERN_GEMM_PROVIDER_NATIVE_TVM
+    ).decide(semantics, matmul_contract_ok=True)
+    irmod = tvm.script.from_source(build_native_wrapper_matmul_tirx_source(semantics, decision))
+    validate_matmul_minimal_contract(irmod)
+    built = build_triton_tvm(
+        irmod,
+        _extern_addmm_bias_meta("m12_native_wrapper_addmm", 5, 64, 64),
+    )
+
+    dev = tvm.cuda(0)
+    bias_np = np.arange(64, dtype="float32") / 19.0
+    a_np = np.arange(5 * 64, dtype="float32").reshape(5, 64) / 13.0
+    b_storage_np = np.arange(64 * 64, dtype="float32").reshape(64, 64) / 17.0
+    out_tvm = tvm.runtime.empty((5, 64), "float32", dev)
+    built.run(
+        [
+            tvm.runtime.tensor(bias_np, dev),
+            tvm.runtime.tensor(a_np, dev),
+            tvm.runtime.tensor(b_storage_np, dev),
+            out_tvm,
+        ]
+    )
+    tvm.testing.assert_allclose(
+        out_tvm.numpy(),
+        a_np @ b_storage_np.T + bias_np,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+@tvm.testing.requires_cuda
+def test_m129_backend_pass_native_wrapper_addmm_bias_build_run():
+    source_line = (
+        "extern_kernels.addmm(bias, reinterpret_tensor(a, (5, 64), (64, 1), 0), "
+        "reinterpret_tensor(b, (64, 64), (1, 64), 0), alpha=1, beta=1, out=out)"
+    )
+    semantics = extract_matmul_semantics_from_wrapper_extern_addmm(
+        source_line,
+        kernel_name="m129_native_wrapper_addmm",
+    )
+    decision = TargetMatmulPolicy(
+        extern_gemm_runtime_provider=EXTERN_GEMM_PROVIDER_NATIVE_TVM
+    ).decide(semantics, matmul_contract_ok=True)
+    irmod = tvm.script.from_source(build_native_wrapper_matmul_tirx_source(semantics, decision))
+    built = build_triton_tvm(
+        irmod,
+        _extern_addmm_bias_meta("m129_native_wrapper_addmm", 5, 64, 64),
+        passes=[M129OptimizeNativeWrapperMatmul()],
+    )
+
+    dev = tvm.cuda(0)
+    bias_np = np.arange(64, dtype="float32") / 19.0
+    a_np = np.arange(5 * 64, dtype="float32").reshape(5, 64) / 13.0
+    b_storage_np = np.arange(64 * 64, dtype="float32").reshape(64, 64) / 17.0
+    out_tvm = tvm.runtime.empty((5, 64), "float32", dev)
+    built.run(
+        [
+            tvm.runtime.tensor(bias_np, dev),
+            tvm.runtime.tensor(a_np, dev),
+            tvm.runtime.tensor(b_storage_np, dev),
+            out_tvm,
+        ]
+    )
+    tvm.testing.assert_allclose(
+        out_tvm.numpy(),
+        a_np @ b_storage_np.T + bias_np,
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 @tvm.testing.requires_cuda

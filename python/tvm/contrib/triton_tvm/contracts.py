@@ -74,14 +74,18 @@ from .attention import (
 from .errors import TritonTVMContractError, UnsupportedContractError
 from .matmul import (
     EXTERN_ADDMM_BIAS_PACKED_FUNC,
+    EXTERN_ADDMM_BIAS_NATIVE_TVM_RUNTIME_PROVIDER_REASON,
     EXTERN_ADDMM_BIAS_RUNTIME_PROVIDER_REASON,
     EXTERN_ADDMM_BIAS_RUNTIME_REPLACEMENT_REASON,
     EXTERN_ADDMM_BIAS_SYMBOL,
     EXTERN_GEMM_PACKED_FUNC,
+    EXTERN_GEMM_NATIVE_TVM_RUNTIME_PROVIDER_REASON,
     EXTERN_GEMM_PROVIDER_ABI_VERSION,
+    EXTERN_GEMM_PROVIDER_NATIVE_TVM,
     EXTERN_GEMM_PROVIDER_NONE,
     EXTERN_GEMM_PROVIDER_PYTHON_TORCH_HOST_STAGED,
     EXTERN_GEMM_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+    EXTERN_GEMM_RUNTIME_CLAIM_NATIVE_TVM_FIXED_SHAPE,
     EXTERN_GEMM_RUNTIME_KIND,
     EXTERN_GEMM_RUNTIME_PROVIDER_KIND,
     EXTERN_GEMM_RUNTIME_PROVIDER_REASON,
@@ -91,6 +95,7 @@ from .matmul import (
     EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED,
     EXTERN_GEMM_SYMBOL,
     MATMUL_PERF_ENVELOPE_ID,
+    M129_ROW_THREADED_WRAPPER_MATMUL_SCHEDULE_ID,
     NATIVE_TIR_MATMUL_SCHEDULE_ID,
     SIMT_TIR_MATMUL_SCHEDULE_ID,
     SIMT_TIR_MATMUL_TILE_M,
@@ -99,6 +104,7 @@ from .matmul import (
     TENSORCORE_TIR_MATMUL_TILE_K,
     TENSORCORE_TIR_MATMUL_TILE_M,
     TENSORCORE_TIR_MATMUL_TILE_N,
+    TT_DOT_NATIVE_SOURCE_KINDS,
     TILED_TIR_MATMUL_SCHEDULE_ID,
     TILED_TIR_MATMUL_TILE_M,
     TILED_TIR_MATMUL_TILE_N,
@@ -122,15 +128,19 @@ from .vision import (
     VISION_RUNTIME_KIND_ARTIFACT_ONLY,
     VISION_RUNTIME_KIND_PROVIDER,
     VISION_PROVIDER_ABI_VERSION,
+    VISION_PROVIDER_DEVICE_TORCH_CUDA,
     VISION_PROVIDER_NONE,
     VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
     VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+    VISION_RUNTIME_CLAIM_PERFORMANCE_ELIGIBLE,
+    VISION_RUNTIME_DEVICE_PROVIDER_REASON,
     VISION_RUNTIME_PROVIDER_REASON,
     VISION_RUNTIME_REPLACEMENT,
     VISION_RUNTIME_REPLACEMENT_REASON,
     VISION_RUNTIME_STATUS_ARTIFACT_ONLY,
     VISION_RUNTIME_STATUS_RUNTIME_RESOLVED,
     is_m11_6_static_conv2d_runtime_scope,
+    is_m11_7_device_conv2d_runtime_scope,
 )
 
 
@@ -771,19 +781,26 @@ def _validate_matmul_minimal_body(name: str, func: tvm.tirx.PrimFunc) -> None:
         )
     if block.init is None:
         raise TritonTVMContractError(f"{name} matmul_minimal requires T.init")
-    if len(block.reads) != 2 or len(block.writes) != 1:
-        raise TritonTVMContractError(
-            f"{name} matmul_minimal requires two reads and one write"
-        )
+    if len(block.writes) != 1:
+        raise TritonTVMContractError(f"{name} matmul_minimal requires one write")
 
     attrs = block.annotations
     if attrs is None or attrs.get("triton_tvm.contract", None) != "matmul_minimal":
         raise TritonTVMContractError(
             f"{name} matmul block must preserve triton_tvm.contract=matmul_minimal"
         )
-    if attrs.get("triton_tvm.matmul_source_kind", None) != "tt_dot":
+    source_kind = str(attrs.get("triton_tvm.matmul_source_kind", ""))
+    if source_kind not in (
+        set(TT_DOT_NATIVE_SOURCE_KINDS)
+        | {"wrapper_extern_gemm", "wrapper_extern_addmm_bias"}
+    ):
         raise TritonTVMContractError(
-            f"{name} matmul block must preserve source kind tt_dot"
+            f"{name} matmul block has unsupported source kind {source_kind!r}"
+        )
+    func_source_kind = str(func.attrs.get("triton_tvm.matmul_source_kind", ""))
+    if func_source_kind and func_source_kind != source_kind:
+        raise TritonTVMContractError(
+            f"{name} matmul block source kind must match function attrs"
         )
     block_dims = _required_matmul_dims(name, attrs, "block attrs")
     if block_dims != func_dims:
@@ -799,9 +816,21 @@ def _validate_matmul_minimal_body(name: str, func: tvm.tirx.PrimFunc) -> None:
     )
     _require_attr_value(name, attrs, "triton_tvm.bounds_policy", "exact", "matmul block")
     _require_attr_value(name, attrs, "triton_tvm.mask_kind", "none", "matmul block")
-    _require_attr_value(name, attrs, "triton_tvm.epilogue_kind", "none", "matmul block")
+    expected_epilogue = "bias_add" if source_kind == "wrapper_extern_addmm_bias" else "none"
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.epilogue_kind",
+        expected_epilogue,
+        "matmul block",
+    )
+    expected_reads = 3 if source_kind == "wrapper_extern_addmm_bias" else 2
+    if len(block.reads) != expected_reads:
+        raise TritonTVMContractError(
+            f"{name} matmul_minimal requires {expected_reads} reads for {source_kind}"
+        )
     _validate_matmul_block_axes(name, block, block_dims)
-    _validate_matmul_buffer_regions(name, block, block_dims)
+    _validate_matmul_buffer_regions(name, block, block_dims, attrs)
     _validate_matmul_stores(name, block)
     implementation_kind = str(attrs.get("triton_tvm.implementation_kind", ""))
     if implementation_kind == "unresolved":
@@ -811,6 +840,7 @@ def _validate_matmul_minimal_body(name: str, func: tvm.tirx.PrimFunc) -> None:
         schedule_id = str(attrs.get("triton_tvm.schedule_id", ""))
         if schedule_id not in (
             NATIVE_TIR_MATMUL_SCHEDULE_ID,
+            M129_ROW_THREADED_WRAPPER_MATMUL_SCHEDULE_ID,
             SIMT_TIR_MATMUL_SCHEDULE_ID,
             TILED_TIR_MATMUL_SCHEDULE_ID,
         ):
@@ -839,6 +869,8 @@ def _validate_matmul_minimal_body(name: str, func: tvm.tirx.PrimFunc) -> None:
             implementation_kind,
             schedule_id=schedule_id,
         )
+        if source_kind in {"wrapper_extern_gemm", "wrapper_extern_addmm_bias"}:
+            _validate_native_wrapper_matmul_runtime_metadata(name, func.attrs or {}, source_kind)
         return
     raise TritonTVMContractError(
         f"{name} matmul block has unsupported implementation_kind={implementation_kind!r}"
@@ -1207,7 +1239,7 @@ def _validate_vision_conv2d_artifact_body(name: str, func: tvm.tirx.PrimFunc) ->
     if (
         str(attrs.get("triton_tvm.vision_runtime_status", ""))
         == VISION_RUNTIME_STATUS_RUNTIME_RESOLVED
-        and not _vision_conv2d_runtime_scope_m11_6(
+        and not _vision_conv2d_runtime_scope_m11_6_or_m11_7(
             contract,
             input_shape,
             weight_shape,
@@ -1220,8 +1252,8 @@ def _validate_vision_conv2d_artifact_body(name: str, func: tvm.tirx.PrimFunc) ->
         )
     ):
         raise TritonTVMContractError(
-            f"{name} M11.6 runtime-resolved conv2d is limited to static NCHW/OIHW "
-            "groups=1 stride/padding envelope"
+            f"{name} M11.6/M11.7 runtime-resolved conv2d is limited to static "
+            "NCHW/OIHW groups=1 stride/padding envelope"
         )
 
     script = _prim_func_script(func)
@@ -1464,9 +1496,9 @@ def _validate_matmul_tensorcore_artifact(name: str, func: tvm.tirx.PrimFunc) -> 
         raise TritonTVMContractError(
             f"{name} TensorCore matmul must preserve triton_tvm.contract=matmul_minimal"
         )
-    if attrs.get("triton_tvm.matmul_source_kind", None) != "tt_dot":
+    if str(attrs.get("triton_tvm.matmul_source_kind", "")) not in TT_DOT_NATIVE_SOURCE_KINDS:
         raise TritonTVMContractError(
-            f"{name} TensorCore matmul must preserve source kind tt_dot"
+            f"{name} TensorCore matmul must preserve a tt.dot source kind"
         )
     if str(attrs.get("triton_tvm.implementation_kind", "")) != "native_tir_schedule":
         raise TritonTVMContractError(
@@ -1606,7 +1638,7 @@ def _vision_conv2d_output_shape(
     return (batch, output_channels, output_h, output_w)
 
 
-def _vision_conv2d_runtime_scope_m11_6(
+def _vision_conv2d_runtime_scope_m11_6_or_m11_7(
     contract: str,
     input_shape: tuple[int, ...],
     weight_shape: tuple[int, ...],
@@ -1645,6 +1677,12 @@ def _vision_conv2d_runtime_scope_m11_6(
         weight_dtype=str(attrs.get("triton_tvm.weight_dtype", "")),
         output_dtype=str(attrs.get("triton_tvm.output_dtype", "")),
     )
+    provider_kind = str(
+        attrs.get("triton_tvm.vision_provider_kind", VISION_PROVIDER_NONE)
+        or VISION_PROVIDER_NONE
+    )
+    if provider_kind == VISION_PROVIDER_DEVICE_TORCH_CUDA:
+        return is_m11_7_device_conv2d_runtime_scope(semantics)
     return is_m11_6_static_conv2d_runtime_scope(semantics)
 
 
@@ -1655,14 +1693,12 @@ def _validate_vision_conv2d_accounting_metadata(
     weight_shape: tuple[int, ...],
     output_shape: tuple[int, ...],
 ) -> None:
-    status = str(attrs.get("triton_tvm.vision_runtime_status", ""))
     input_bytes = _shape_numel(input_shape) * 4
     weight_bytes = _shape_numel(weight_shape) * 4
     output_bytes = _shape_numel(output_shape) * 4
     total_io_bytes = input_bytes + weight_bytes + output_bytes
-    host_staging_bytes = (
-        total_io_bytes if status == VISION_RUNTIME_STATUS_RUNTIME_RESOLVED else 0
-    )
+    uses_host_staging = bool(_bool_attr(attrs, "triton_tvm.vision_uses_host_staging"))
+    host_staging_bytes = total_io_bytes if uses_host_staging else 0
     expected = {
         "triton_tvm.vision_input_bytes": input_bytes,
         "triton_tvm.vision_weight_bytes": weight_bytes,
@@ -1694,10 +1730,7 @@ def _validate_vision_conv2d_runtime_metadata(name: str, attrs) -> None:
     )
     provider_abi_version = _int_attr(attrs, "triton_tvm.vision_provider_abi_version") or 0
     uses_host_staging = _bool_attr(attrs, "triton_tvm.vision_uses_host_staging")
-    if _bool_attr(attrs, "triton_tvm.vision_performance_claim") is not False:
-        raise TritonTVMContractError(
-            f"{name} vision conv2d artifact must not claim performance"
-        )
+    performance_claim = _bool_attr(attrs, "triton_tvm.vision_performance_claim")
     launch_count = _int_attr(attrs, "triton_tvm.vision_runtime_launch_count")
     artifact_calls = _int_attr(attrs, "triton_tvm.vision_artifact_call_count")
     if artifact_calls != 1:
@@ -1738,6 +1771,10 @@ def _validate_vision_conv2d_runtime_metadata(name: str, attrs) -> None:
             raise TritonTVMContractError(
                 f"{name} artifact-only vision conv2d must not use host staging"
             )
+        if performance_claim is not False:
+            raise TritonTVMContractError(
+                f"{name} artifact-only vision conv2d must not claim performance"
+            )
         if launch_count != 0:
             raise TritonTVMContractError(
                 f"{name} vision conv2d artifact must record zero runtime launches"
@@ -1750,25 +1787,14 @@ def _validate_vision_conv2d_runtime_metadata(name: str, attrs) -> None:
             VISION_RUNTIME_KIND_PROVIDER,
             "vision conv2d runtime provider",
         )
-        _require_attr_value(
-            name,
-            attrs,
-            "triton_tvm.extern_runtime_replacement",
-            VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
-            "vision conv2d runtime provider",
-        )
-        _require_attr_value(
-            name,
-            attrs,
-            "triton_tvm.extern_runtime_replacement_reason",
-            VISION_RUNTIME_PROVIDER_REASON,
-            "vision conv2d runtime provider",
-        )
         if _bool_attr(attrs, "triton_tvm.extern_runtime_replacement_available") is not True:
             raise TritonTVMContractError(
                 f"{name} vision conv2d runtime provider must be replacement-available"
             )
-        if provider_kind != VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED:
+        if provider_kind not in {
+            VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+            VISION_PROVIDER_DEVICE_TORCH_CUDA,
+        }:
             raise TritonTVMContractError(
                 f"{name} vision conv2d runtime provider kind mismatch"
             )
@@ -1776,17 +1802,66 @@ def _validate_vision_conv2d_runtime_metadata(name: str, attrs) -> None:
             raise TritonTVMContractError(
                 f"{name} vision conv2d runtime provider ABI mismatch"
             )
-        _require_attr_value(
-            name,
-            attrs,
-            "triton_tvm.vision_runtime_claim",
-            VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY,
-            "vision conv2d runtime provider",
-        )
-        if uses_host_staging is not True:
-            raise TritonTVMContractError(
-                f"{name} vision conv2d runtime provider must record host staging"
+        if provider_kind == VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED:
+            _require_attr_value(
+                name,
+                attrs,
+                "triton_tvm.extern_runtime_replacement",
+                VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
+                "vision conv2d runtime provider",
             )
+            _require_attr_value(
+                name,
+                attrs,
+                "triton_tvm.extern_runtime_replacement_reason",
+                VISION_RUNTIME_PROVIDER_REASON,
+                "vision conv2d runtime provider",
+            )
+            _require_attr_value(
+                name,
+                attrs,
+                "triton_tvm.vision_runtime_claim",
+                VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+                "vision conv2d runtime provider",
+            )
+            if performance_claim is not False:
+                raise TritonTVMContractError(
+                    f"{name} host-staged vision conv2d provider must not claim performance"
+                )
+            if uses_host_staging is not True:
+                raise TritonTVMContractError(
+                    f"{name} host-staged vision conv2d provider must record host staging"
+                )
+        else:
+            _require_attr_value(
+                name,
+                attrs,
+                "triton_tvm.extern_runtime_replacement",
+                VISION_PROVIDER_DEVICE_TORCH_CUDA,
+                "vision conv2d runtime provider",
+            )
+            _require_attr_value(
+                name,
+                attrs,
+                "triton_tvm.extern_runtime_replacement_reason",
+                VISION_RUNTIME_DEVICE_PROVIDER_REASON,
+                "vision conv2d runtime provider",
+            )
+            _require_attr_value(
+                name,
+                attrs,
+                "triton_tvm.vision_runtime_claim",
+                VISION_RUNTIME_CLAIM_PERFORMANCE_ELIGIBLE,
+                "vision conv2d runtime provider",
+            )
+            if performance_claim is not True:
+                raise TritonTVMContractError(
+                    f"{name} device vision conv2d provider must claim performance"
+                )
+            if uses_host_staging is not False:
+                raise TritonTVMContractError(
+                    f"{name} device vision conv2d provider must not record host staging"
+                )
         if launch_count != 1:
             raise TritonTVMContractError(
                 f"{name} vision conv2d runtime provider must record one runtime launch"
@@ -2116,6 +2191,13 @@ def _validate_matmul_loop_extents(
             tirx.ForKind.THREAD_BINDING,
             tirx.ForKind.SERIAL,
         )
+    elif schedule_id == M129_ROW_THREADED_WRAPPER_MATMUL_SCHEDULE_ID:
+        expected_extents = (m, n, k)
+        expected_kinds = (
+            tirx.ForKind.THREAD_BINDING,
+            tirx.ForKind.THREAD_BINDING,
+            tirx.ForKind.SERIAL,
+        )
     elif schedule_id == SIMT_TIR_MATMUL_SCHEDULE_ID:
         expected_extents = (
             (m // SIMT_TIR_MATMUL_TILE_M) * (n // SIMT_TIR_MATMUL_TILE_N),
@@ -2147,15 +2229,25 @@ def _validate_matmul_loop_extents(
             )
 
 
-def _validate_matmul_buffer_regions(name: str, block, dims: tuple[int, int, int]) -> None:
+def _validate_matmul_buffer_regions(name: str, block, dims: tuple[int, int, int], attrs) -> None:
     m, n, k = dims
+    source_kind = str(attrs.get("triton_tvm.matmul_source_kind", ""))
+    b_layout = str(attrs.get("triton_tvm.b_layout", ""))
+    b_shape = (n, k) if b_layout == "transposed_weight_view" else (k, n)
     expected = (
         (block.reads[0], (m, k), "A read"),
-        (block.reads[1], (k, n), "B read"),
+        (block.reads[1], b_shape, "B read"),
         (block.writes[0], (m, n), "C write"),
     )
     for region, shape, label in expected:
         _validate_buffer_region(name, region, shape, label)
+    if source_kind == "wrapper_extern_addmm_bias":
+        bias_shape = _int_tuple_attr(attrs, "triton_tvm.bias_shape")
+        if bias_shape not in ((n,), (m, n)):
+            raise TritonTVMContractError(
+                f"{name} native wrapper addmm bias shape must be N or MxN"
+            )
+        _validate_buffer_region_any_rank(name, block.reads[2], bias_shape, "bias read")
 
 
 def _validate_buffer_region(
@@ -2173,6 +2265,28 @@ def _validate_buffer_region(
         raise TritonTVMContractError(f"{name} matmul {label} must be rank-2")
     region_extents = tuple(_int_imm_value(rng.extent) for rng in buffer_region.region)
     if region_extents != (1, 1):
+        raise TritonTVMContractError(
+            f"{name} matmul {label} region must access one element per axis"
+        )
+
+
+def _validate_buffer_region_any_rank(
+    name: str,
+    buffer_region,
+    expected_shape: tuple[int, ...],
+    label: str,
+) -> None:
+    buffer_shape = tuple(_int_imm_value(dim) for dim in buffer_region.buffer.shape)
+    if buffer_shape != expected_shape:
+        raise TritonTVMContractError(
+            f"{name} matmul {label} buffer shape must be {expected_shape}"
+        )
+    if len(buffer_region.region) != len(expected_shape):
+        raise TritonTVMContractError(
+            f"{name} matmul {label} rank must be {len(expected_shape)}"
+        )
+    region_extents = tuple(_int_imm_value(rng.extent) for rng in buffer_region.region)
+    if region_extents != tuple(1 for _ in expected_shape):
         raise TritonTVMContractError(
             f"{name} matmul {label} region must access one element per axis"
         )
@@ -2365,7 +2479,7 @@ def _validate_matmul_schedule_attrs(
     schedule_id: str,
 ) -> None:
     m, n, _ = dims
-    if schedule_id == NATIVE_TIR_MATMUL_SCHEDULE_ID:
+    if schedule_id in (NATIVE_TIR_MATMUL_SCHEDULE_ID, M129_ROW_THREADED_WRAPPER_MATMUL_SCHEDULE_ID):
         return
     if schedule_id == SIMT_TIR_MATMUL_SCHEDULE_ID:
         tile_m = _int_attr(attrs, "triton_tvm.tile_m")
@@ -2504,6 +2618,91 @@ def _validate_matmul_extern_runtime_metadata(
         raise TritonTVMContractError(
             f"{name} runtime-resolved extern GEMM must be correctness-only host staged"
         )
+
+
+def _validate_native_wrapper_matmul_runtime_metadata(
+    name: str,
+    attrs,
+    source_kind: str,
+) -> None:
+    provider_reason = (
+        EXTERN_ADDMM_BIAS_NATIVE_TVM_RUNTIME_PROVIDER_REASON
+        if source_kind == "wrapper_extern_addmm_bias"
+        else EXTERN_GEMM_NATIVE_TVM_RUNTIME_PROVIDER_REASON
+    )
+    extern_symbol = (
+        EXTERN_ADDMM_BIAS_SYMBOL if source_kind == "wrapper_extern_addmm_bias" else EXTERN_GEMM_SYMBOL
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_symbol",
+        extern_symbol,
+        "native wrapper matmul",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_packed_func",
+        "",
+        "native wrapper matmul",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_runtime_kind",
+        EXTERN_GEMM_RUNTIME_PROVIDER_KIND,
+        "native wrapper matmul",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_runtime_replacement",
+        EXTERN_GEMM_PROVIDER_NATIVE_TVM,
+        "native wrapper matmul",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_runtime_replacement_reason",
+        provider_reason,
+        "native wrapper matmul",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_gemm_runtime_status",
+        EXTERN_GEMM_RUNTIME_STATUS_RUNTIME_RESOLVED,
+        "native wrapper matmul",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_gemm_provider_kind",
+        EXTERN_GEMM_PROVIDER_NATIVE_TVM,
+        "native wrapper matmul",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_gemm_runtime_claim",
+        EXTERN_GEMM_RUNTIME_CLAIM_NATIVE_TVM_FIXED_SHAPE,
+        "native wrapper matmul",
+    )
+    if _bool_attr(attrs, "triton_tvm.extern_runtime_replacement_available") is not True:
+        raise TritonTVMContractError(
+            f"{name} native wrapper matmul must mark replacement available"
+        )
+    if _int_attr(attrs, "triton_tvm.extern_gemm_provider_abi_version") != (
+        EXTERN_GEMM_PROVIDER_ABI_VERSION
+    ):
+        raise TritonTVMContractError(f"{name} native wrapper matmul provider ABI mismatch")
+    if _bool_attr(attrs, "triton_tvm.extern_gemm_performance_claim") is not False:
+        raise TritonTVMContractError(
+            f"{name} native wrapper matmul must not claim performance in M12.2"
+        )
+    if _bool_attr(attrs, "triton_tvm.extern_gemm_uses_host_staging") is not False:
+        raise TritonTVMContractError(f"{name} native wrapper matmul must not host stage")
 
 
 def _int_imm_value(value) -> int | None:
