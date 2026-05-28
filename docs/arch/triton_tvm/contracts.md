@@ -357,6 +357,18 @@ classification, sets `vit_tiny_random_runtime_resolved_smoke=true`, and keeps
 measurements are opt-in and host-staged providers remain excluded from
 performance claims.
 
+M13.5 admits a separate exact-shape native TVM artifact for the fixed-shape ViT
+patch embedding conv while keeping the generic contract id
+`conv2d_nchw_static_v1`. This path is limited by
+`shape_scope=exact_vit_patch_embedding_m13` to input `(1,3,32,32)`, weight
+`(64,3,16,16)`, output `(1,64,2,2)`, stride `(16,16)`, padding `(0,0)`,
+dilation `(1,1)`, and groups `1`. It records
+`vision_provider_kind="native_tvm_conv2d"`, zero host staging, zero
+`device_torch_cuda` conv runtime count, and
+`m13_performance_claim="diagnostic_only"`. This is native conv correctness
+evidence only; P2 and any native conv performance claim remain deferred to
+M13.8/M13.P.
+
 ## Pre-M12 E2E Entry Policy
 
 Pre-M12 separates frozen historical entry debt from current residual M12 debt.
@@ -544,6 +556,10 @@ Source boundaries:
 - `real_jit_tt_dot`: real Triton JIT `tl.dot` artifact lowered by
   `lower_to_ttir` to textual `tt.dot`, parsed by `TTIRReader`, and admitted
   only for the supported exact unmasked row-major rank-2 case.
+- `generated_real_tl_dot_bridge`: M13 generated `@triton.jit` bridge artifact
+  for wrapper matmul/addmm semantics. It converges on the same parsed
+  `tt.dot`/`MatmulSemantics` path but is report-distinct from captured real
+  JIT `tl.dot` evidence.
 - `wrapper_extern_gemm`: Inductor wrapper extern source collected outside the
   `AsyncCompile.triton` TTIR path.
 - `future_graph_matmul`: reserved for later ATen/Relax/graph matmul sources.
@@ -683,3 +699,16 @@ schedules, including TensorCore for 16x16x16 fp16 and tiled schedule for
 8x8x16 fp16. The M12.9 wrapper-specific schedule is explicitly excluded from
 handoff readiness; P2, performance readiness, backend-complete, strict-native,
 and full-runnable claims remain false.
+
+M13.0-M13.4 start the fixed-shape `vit_tiny_random` strict TVM-owned operator
+path. M13.2 runs the 7 captured kernels as TVM artifacts with zero harness
+fallback, zero native Triton launch, and zero silent fallback. M13.3 adds
+`source_kind="generated_real_tl_dot_bridge"` for the 7 wrapper matmul/addmm
+records. This source kind may validate fp32 wrapper shapes through generated
+`@triton.jit tl.dot` bridge semantics, including explicit zero-padding of
+non-power-of-two logical M tiles for Triton `tl.arange`, but it does not count
+as captured `real_jit_tt_dot` evidence. M13.4 connects those 7 wrapper
+matmul/addmm runtime nodes to generated-bridge TVM artifacts, uses native TVM
+pointwise artifacts for exact-shape/layout adapters, reports the 3 addmm bias
+epilogues separately as `epilogue_implementation="native_tvm_pointwise"`, and
+keeps wrapper/native legacy matmul provider counts at zero.

@@ -51,7 +51,14 @@ TORCH_CUDA_CUBLAS_BASELINE_ID = "torch_cuda_cublas_baseline_v1"
 TRITON_NATIVE_MATMUL_BASELINE_ID = "native_triton_matmul_baseline_v1"
 TT_DOT_SOURCE_KIND = "tt_dot"
 REAL_JIT_TT_DOT_SOURCE_KIND = "real_jit_tt_dot"
-TT_DOT_NATIVE_SOURCE_KINDS = frozenset({TT_DOT_SOURCE_KIND, REAL_JIT_TT_DOT_SOURCE_KIND})
+GENERATED_REAL_TL_DOT_BRIDGE_SOURCE_KIND = "generated_real_tl_dot_bridge"
+TT_DOT_NATIVE_SOURCE_KINDS = frozenset(
+    {
+        TT_DOT_SOURCE_KIND,
+        REAL_JIT_TT_DOT_SOURCE_KIND,
+        GENERATED_REAL_TL_DOT_BRIDGE_SOURCE_KIND,
+    }
+)
 EXTERN_GEMM_SYMBOL = "extern_kernels.mm"
 EXTERN_GEMM_PACKED_FUNC = "tvm.contrib.triton_tvm.extern_gemm"
 EXTERN_ADDMM_BIAS_SYMBOL = "extern_kernels.addmm"
@@ -608,7 +615,10 @@ class TargetMatmulPolicy:
             or semantics.c_layout != "row_major"
         ):
             return "non_row_major_matmul_not_supported"
-        if (
+        if semantics.source_kind == GENERATED_REAL_TL_DOT_BRIDGE_SOURCE_KIND:
+            if semantics.a_dtype != "float32" or semantics.b_dtype != "float32":
+                return "generated_tl_dot_bridge_requires_fp32_wrapper_inputs"
+        elif (
             semantics.a_dtype not in ("float16", "bfloat16")
             or semantics.b_dtype not in ("float16", "bfloat16")
         ):
@@ -735,7 +745,10 @@ def extract_matmul_semantics_from_ttir(
     a_stride = (k, 1)
     b_stride = (n, 1)
     c_stride = (n, 1)
-    if source_kind == REAL_JIT_TT_DOT_SOURCE_KIND:
+    if source_kind in {
+        REAL_JIT_TT_DOT_SOURCE_KIND,
+        GENERATED_REAL_TL_DOT_BRIDGE_SOURCE_KIND,
+    }:
         a_layout, a_stride = _infer_real_jit_matmul_layout(
             graph, a_load.operands[0], a_param, (m, k), role="A"
         )

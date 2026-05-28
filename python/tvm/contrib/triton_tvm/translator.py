@@ -309,6 +309,7 @@ def translate_ttir(
     target: str = "cuda",
     emit: str = "tirx",
     contract: str = "pointwise_minimal",
+    matmul_source_kind: str | None = None,
 ) -> tuple[tvm.IRModule, TritonTVMMeta]:
     """Translate normalized TTIR into a contract-driven TIRX IRModule.
 
@@ -328,7 +329,8 @@ def translate_ttir(
     _validate_supported_subset(graph, canonical_contract)
 
     if canonical_contract in _M9_MATMUL_CONTRACTS:
-        matmul_source_kind = REAL_JIT_TT_DOT_SOURCE_KIND if artifact is not None else "tt_dot"
+        if matmul_source_kind is None:
+            matmul_source_kind = REAL_JIT_TT_DOT_SOURCE_KIND if artifact is not None else "tt_dot"
         builder = _TIRXMatmulSemanticBuilder(
             graph, target_policy, matmul_source_kind=matmul_source_kind
         )

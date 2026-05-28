@@ -125,10 +125,15 @@ from .vision import (
     M11_GRID2D_RUNTIME_CLAIM,
     M11_GRID2D_RUNTIME_READY,
     VISION_IMPLEMENTATION_KIND_EXTERN_CONV2D,
+    VISION_IMPLEMENTATION_KIND_NATIVE_TVM_CONV2D,
     VISION_RUNTIME_KIND_ARTIFACT_ONLY,
     VISION_RUNTIME_KIND_PROVIDER,
+    VISION_M11_4_VIT_PATCH_INPUT_SHAPE,
+    VISION_M11_4_VIT_PATCH_WEIGHT_SHAPE,
+    VISION_M11_4_VIT_PATCH_OUTPUT_SHAPE,
     VISION_PROVIDER_ABI_VERSION,
     VISION_PROVIDER_DEVICE_TORCH_CUDA,
+    VISION_PROVIDER_NATIVE_TVM_CONV2D,
     VISION_PROVIDER_NONE,
     VISION_PROVIDER_PYTHON_TORCH_HOST_STAGED,
     VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY,
@@ -171,6 +176,8 @@ _LEGACY_CONTRACT_ALIASES = {
     "cuda_minimal": "pointwise_minimal",
     "cuda_pointwise_flat": "pointwise_flat",
 }
+
+M13_P2_DIRECT_IO_WRAPPER_MATMUL_SCHEDULE_ID = "m13_p2_direct_io_wrapper_matmul_serial_k"
 
 
 @dataclass(frozen=True)
@@ -841,6 +848,7 @@ def _validate_matmul_minimal_body(name: str, func: tvm.tirx.PrimFunc) -> None:
         if schedule_id not in (
             NATIVE_TIR_MATMUL_SCHEDULE_ID,
             M129_ROW_THREADED_WRAPPER_MATMUL_SCHEDULE_ID,
+            M13_P2_DIRECT_IO_WRAPPER_MATMUL_SCHEDULE_ID,
             SIMT_TIR_MATMUL_SCHEDULE_ID,
             TILED_TIR_MATMUL_SCHEDULE_ID,
         ):
@@ -869,7 +877,13 @@ def _validate_matmul_minimal_body(name: str, func: tvm.tirx.PrimFunc) -> None:
             implementation_kind,
             schedule_id=schedule_id,
         )
-        if source_kind in {"wrapper_extern_gemm", "wrapper_extern_addmm_bias"}:
+        if (
+            source_kind in {"wrapper_extern_gemm", "wrapper_extern_addmm_bias"}
+            and schedule_id
+            not in (
+                M13_P2_DIRECT_IO_WRAPPER_MATMUL_SCHEDULE_ID,
+            )
+        ):
             _validate_native_wrapper_matmul_runtime_metadata(name, func.attrs or {}, source_kind)
         return
     raise TritonTVMContractError(
@@ -1138,28 +1152,30 @@ def _validate_vision_conv2d_artifact_body(name: str, func: tvm.tirx.PrimFunc) ->
         "wrapper_extern_convolution",
         "vision conv2d artifact",
     )
-    _require_attr_value(
-        name,
-        attrs,
-        "triton_tvm.implementation_kind",
-        VISION_IMPLEMENTATION_KIND_EXTERN_CONV2D,
-        "vision conv2d artifact",
-    )
-    _require_attr_value(
-        name,
-        attrs,
-        "triton_tvm.extern_symbol",
-        VISION_EXTERN_SYMBOL,
-        "vision conv2d artifact",
-    )
-    _require_attr_value(
-        name,
-        attrs,
-        "triton_tvm.extern_packed_func",
-        VISION_EXTERN_PACKED_FUNC,
-        "vision conv2d artifact",
-    )
-    _validate_vision_conv2d_runtime_metadata(name, attrs)
+    implementation_kind = str(attrs.get("triton_tvm.implementation_kind", ""))
+    if implementation_kind == VISION_IMPLEMENTATION_KIND_EXTERN_CONV2D:
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_symbol",
+            VISION_EXTERN_SYMBOL,
+            "vision conv2d artifact",
+        )
+        _require_attr_value(
+            name,
+            attrs,
+            "triton_tvm.extern_packed_func",
+            VISION_EXTERN_PACKED_FUNC,
+            "vision conv2d artifact",
+        )
+        _validate_vision_conv2d_runtime_metadata(name, attrs)
+    elif implementation_kind == VISION_IMPLEMENTATION_KIND_NATIVE_TVM_CONV2D:
+        _validate_vision_native_conv2d_runtime_metadata(name, attrs)
+    else:
+        raise TritonTVMContractError(
+            f"{name} vision conv2d artifact has unsupported implementation_kind="
+            f"{implementation_kind!r}"
+        )
 
     input_shape = _required_vision_shape(name, attrs, "triton_tvm.input_shape")
     weight_shape = _required_vision_shape(name, attrs, "triton_tvm.weight_shape")
@@ -1239,6 +1255,7 @@ def _validate_vision_conv2d_artifact_body(name: str, func: tvm.tirx.PrimFunc) ->
     if (
         str(attrs.get("triton_tvm.vision_runtime_status", ""))
         == VISION_RUNTIME_STATUS_RUNTIME_RESOLVED
+        and implementation_kind == VISION_IMPLEMENTATION_KIND_EXTERN_CONV2D
         and not _vision_conv2d_runtime_scope_m11_6_or_m11_7(
             contract,
             input_shape,
@@ -1257,19 +1274,33 @@ def _validate_vision_conv2d_artifact_body(name: str, func: tvm.tirx.PrimFunc) ->
         )
 
     script = _prim_func_script(func)
-    packed_call = f'T.call_packed("{VISION_EXTERN_PACKED_FUNC}"'
-    if script.count(packed_call) != 1:
-        raise TritonTVMContractError(
-            f"{name} vision conv2d artifact must contain exactly one "
-            f"{VISION_EXTERN_PACKED_FUNC} packed call"
-        )
-    if "call_extern" in script:
-        raise TritonTVMContractError(
-            f"{name} vision conv2d artifact must not use T.call_extern"
-        )
-    if 'thread="blockIdx.x"' in script or 'thread="threadIdx.x"' in script:
-        raise TritonTVMContractError(
-            f"{name} vision conv2d artifact must not contain a native CUDA schedule"
+    if implementation_kind == VISION_IMPLEMENTATION_KIND_EXTERN_CONV2D:
+        packed_call = f'T.call_packed("{VISION_EXTERN_PACKED_FUNC}"'
+        if script.count(packed_call) != 1:
+            raise TritonTVMContractError(
+                f"{name} vision conv2d artifact must contain exactly one "
+                f"{VISION_EXTERN_PACKED_FUNC} packed call"
+            )
+        if "call_extern" in script:
+            raise TritonTVMContractError(
+                f"{name} vision conv2d artifact must not use T.call_extern"
+            )
+        if 'thread="blockIdx.x"' in script or 'thread="threadIdx.x"' in script:
+            raise TritonTVMContractError(
+                f"{name} vision conv2d artifact must not contain a native CUDA schedule"
+            )
+    else:
+        _validate_vision_native_conv2d_body(
+            name,
+            attrs,
+            script,
+            input_shape,
+            weight_shape,
+            output_shape,
+            stride,
+            padding,
+            dilation,
+            groups,
         )
 
 
@@ -1713,6 +1744,130 @@ def _validate_vision_conv2d_accounting_metadata(
             raise TritonTVMContractError(
                 f"{name} vision conv2d artifact {attr_name} must be {expected_value}"
             )
+
+
+def _validate_vision_native_conv2d_runtime_metadata(name: str, attrs) -> None:
+    """Validate the M13.5 exact-shape native conv runtime metadata."""
+
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.vision_runtime_status",
+        VISION_RUNTIME_STATUS_RUNTIME_RESOLVED,
+        "native vision conv2d artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_runtime_kind",
+        "native_tvm_artifact",
+        "native vision conv2d artifact",
+    )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.extern_runtime_replacement",
+        VISION_PROVIDER_NATIVE_TVM_CONV2D,
+        "native vision conv2d artifact",
+    )
+    if _bool_attr(attrs, "triton_tvm.extern_runtime_replacement_available") is not True:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d artifact must be replacement-available"
+        )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.vision_provider_kind",
+        VISION_PROVIDER_NATIVE_TVM_CONV2D,
+        "native vision conv2d artifact",
+    )
+    if _int_attr(attrs, "triton_tvm.vision_provider_abi_version") != VISION_PROVIDER_ABI_VERSION:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d artifact provider ABI mismatch"
+        )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.vision_runtime_claim",
+        VISION_RUNTIME_CLAIM_CORRECTNESS_ONLY,
+        "native vision conv2d artifact",
+    )
+    if _bool_attr(attrs, "triton_tvm.vision_performance_claim") is not False:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d artifact must not claim performance"
+        )
+    if _bool_attr(attrs, "triton_tvm.vision_uses_host_staging") is not False:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d artifact must not use host staging"
+        )
+    if _int_attr(attrs, "triton_tvm.vision_runtime_launch_count") != 1:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d artifact must record one runtime launch"
+        )
+    if _int_attr(attrs, "triton_tvm.vision_artifact_call_count") != 1:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d artifact must record one artifact call"
+        )
+    if _int_attr(attrs, "triton_tvm.vision_host_staging_bytes") != 0:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d artifact host staging must be zero"
+        )
+    _require_attr_value(
+        name,
+        attrs,
+        "triton_tvm.shape_scope",
+        "exact_vit_patch_embedding_m13",
+        "native vision conv2d artifact",
+    )
+
+
+def _validate_vision_native_conv2d_body(
+    name: str,
+    attrs,
+    script: str,
+    input_shape: tuple[int, ...],
+    weight_shape: tuple[int, ...],
+    output_shape: tuple[int, ...],
+    stride: tuple[int, int],
+    padding: tuple[int, int],
+    dilation: tuple[int, int],
+    groups: int,
+) -> None:
+    """Validate the M13.5 native exact ViT patch conv body."""
+
+    if input_shape != VISION_M11_4_VIT_PATCH_INPUT_SHAPE:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d input shape must be exact ViT patch scope"
+        )
+    if weight_shape != VISION_M11_4_VIT_PATCH_WEIGHT_SHAPE:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d weight shape must be exact ViT patch scope"
+        )
+    if output_shape != VISION_M11_4_VIT_PATCH_OUTPUT_SHAPE:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d output shape must be exact ViT patch scope"
+        )
+    if stride != (16, 16) or padding != (0, 0) or dilation != (1, 1) or groups != 1:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d schedule is limited to exact ViT patch params"
+        )
+    if str(attrs.get("triton_tvm.m13_performance_claim", "")) != "diagnostic_only":
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d artifact performance claim must be diagnostic_only"
+        )
+    if "call_packed" in script or "call_extern" in script:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d artifact must not use extern calls"
+        )
+    for token in ('thread="blockIdx.x"', 'thread="threadIdx.x"', "with T.init()"):
+        if token not in script:
+            raise TritonTVMContractError(
+                f"{name} native vision conv2d artifact missing {token}"
+            )
+    if "T.axis.reduce" not in script and 'T.axis.remap("RRR"' not in script:
+        raise TritonTVMContractError(
+            f"{name} native vision conv2d artifact must use reduction axes"
+        )
 
 
 def _shape_numel(shape: tuple[int, ...]) -> int:
@@ -2479,7 +2634,11 @@ def _validate_matmul_schedule_attrs(
     schedule_id: str,
 ) -> None:
     m, n, _ = dims
-    if schedule_id in (NATIVE_TIR_MATMUL_SCHEDULE_ID, M129_ROW_THREADED_WRAPPER_MATMUL_SCHEDULE_ID):
+    if schedule_id in (
+        NATIVE_TIR_MATMUL_SCHEDULE_ID,
+        M129_ROW_THREADED_WRAPPER_MATMUL_SCHEDULE_ID,
+        M13_P2_DIRECT_IO_WRAPPER_MATMUL_SCHEDULE_ID,
+    ):
         return
     if schedule_id == SIMT_TIR_MATMUL_SCHEDULE_ID:
         tile_m = _int_attr(attrs, "triton_tvm.tile_m")

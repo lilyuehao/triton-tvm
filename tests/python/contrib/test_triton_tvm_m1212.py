@@ -22,7 +22,9 @@ import tvm.testing
 from tvm.contrib.triton_tvm import lower_to_ttir, translate_ttir, validate_matmul_minimal_contract
 from tvm.contrib.triton_tvm.m1212_real_tl_dot_bridge import NEGATIVE_CASES
 from tvm.contrib.triton_tvm.matmul import (
+    GENERATED_REAL_TL_DOT_BRIDGE_SOURCE_KIND,
     REAL_JIT_TT_DOT_SOURCE_KIND,
+    TargetMatmulPolicy,
     extract_matmul_semantics_from_ttir,
 )
 from tvm.contrib.triton_tvm.ttir import TTIRReader
@@ -117,6 +119,19 @@ def _m1212_real_dot_epilogue(
     tl.store(out + m[:, None] * BLOCK_N + n[None, :], acc)
 
 
+@triton.jit
+def _m13_generated_dot_bridge_f32(
+    a, b, out, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+):
+    m = tl.arange(0, BLOCK_M)
+    n = tl.arange(0, BLOCK_N)
+    k = tl.arange(0, BLOCK_K)
+    av = tl.load(a + m[:, None] * BLOCK_K + k[None, :])
+    bv = tl.load(b + k[:, None] * BLOCK_N + n[None, :])
+    acc = tl.dot(av, bv, input_precision="tf32")
+    tl.store(out + m[:, None] * BLOCK_N + n[None, :], acc)
+
+
 def _signature(dtype="*fp16"):
     return {
         "a": dtype,
@@ -163,6 +178,37 @@ def test_m1212_real_tl_dot_bridge_lower_reader_semantics_and_contract():
     assert meta.matmul_contract_ok is True
     assert meta.implementation_kind == "native_tir_schedule"
     assert meta.unsupported_matmul_reason == ""
+
+
+@tvm.testing.requires_cuda
+def test_m13_generated_tl_dot_bridge_admits_fp32_without_real_jit_credit():
+    artifact = lower_to_ttir(
+        _m13_generated_dot_bridge_f32,
+        _signature("*fp32"),
+        {"BLOCK_M": 8, "BLOCK_N": 64, "BLOCK_K": 64},
+    )
+    graph = TTIRReader().read(artifact.ttir)
+    semantics = extract_matmul_semantics_from_ttir(
+        graph, source_kind=GENERATED_REAL_TL_DOT_BRIDGE_SOURCE_KIND
+    )
+    assert semantics.source_kind == GENERATED_REAL_TL_DOT_BRIDGE_SOURCE_KIND
+    assert (semantics.m, semantics.n, semantics.k) == (8, 64, 64)
+    assert semantics.a_dtype == "float32"
+    assert semantics.b_dtype == "float32"
+
+    irmod, meta = translate_ttir(
+        artifact,
+        grid=(1,),
+        contract="matmul_minimal",
+        matmul_source_kind=GENERATED_REAL_TL_DOT_BRIDGE_SOURCE_KIND,
+    )
+    validate_matmul_minimal_contract(irmod)
+    decision = TargetMatmulPolicy().decide(semantics, matmul_contract_ok=True)
+    assert meta.matmul_source_kind == GENERATED_REAL_TL_DOT_BRIDGE_SOURCE_KIND
+    assert meta.matmul_source_kind != REAL_JIT_TT_DOT_SOURCE_KIND
+    assert meta.matmul_contract_ok is True
+    assert decision.implementation_kind == "native_tir_schedule"
+    assert decision.unsupported_matmul_reason == ""
 
 
 @tvm.testing.requires_cuda

@@ -16,10 +16,10 @@ matrix and historical reports live in
 | `norm_row` | supported in M8 | rank-2 LayerNorm/RMSNorm-family row reductions |
 | `softmax_row` | supported in M8 | rank-2 row max/exp/sum softmax |
 | `masked_softmax_row` | supported in M8 | rank-2 masked and causal-style row softmax policy |
-| `matmul_minimal` | supported in M9.1-M9.8 semantic/static/native/extern-proof/toy-graph scope; M9.P Phase 0-3 hardening complete; M12.2 ViT native wrapper closure complete; M12.6 provider-id hardening complete; M12.12 real JIT `tl.dot` bridge complete; M12.14 real `tt.dot` schedule handoff complete; M12.P fixed-shape ViT P2 provider path complete | exact unmasked rank-2 `tt.dot` -> unresolved semantic validation block -> native schedule policy with TensorCore, SIMT16, and serial-K fallback candidates; wrapper `extern_kernels.mm` -> explicit packed-call artifact with artifact-only default and opt-in correctness-only `python_torch_host_staged` runtime proof; wrapper `extern_kernels.addmm` -> minimal `bias_add` packed-call artifact; M12.2 admits only observed `vit_tiny_random` fp32 wrapper GEMM/addmm shapes through correctness-first `native_tvm_matmul` serial-K TIR with zero host staging; M12.6 rejects unknown/stale wrapper GEMM provider ids explicitly; M12.12 admits real Triton JIT three-operand `tt.dot` as `source_kind=real_jit_tt_dot` for the supported row-major fp16/bf16 input and fp32 accumulator/output case; M12.14 proves real JIT `tt.dot` semantics can select reusable TensorCore/tiled schedules without wrapper-specific readiness; M12.P adds backend-general prebound packed-call dispatch for the fixed-shape ViT native matmul provider and passes the unchanged P2 gate without strict full-native TVM or full-runnable model claims |
+| `matmul_minimal` | supported in M9.1-M9.8 semantic/static/native/extern-proof/toy-graph scope; M9.P Phase 0-3 hardening complete; M12.2 ViT native wrapper closure complete; M12.6 provider-id hardening complete; M12.12 real JIT `tl.dot` bridge complete; M12.14 real `tt.dot` schedule handoff complete; M12.P fixed-shape ViT P2 provider path complete; M13.4 generated `tl.dot` bridge runtime replacement complete | exact unmasked rank-2 `tt.dot` -> unresolved semantic validation block -> native schedule policy with TensorCore, SIMT16, and serial-K fallback candidates; wrapper `extern_kernels.mm` -> explicit packed-call artifact with artifact-only default and opt-in correctness-only `python_torch_host_staged` runtime proof; wrapper `extern_kernels.addmm` -> minimal `bias_add` packed-call artifact; M12.2 admits only observed `vit_tiny_random` fp32 wrapper GEMM/addmm shapes through correctness-first `native_tvm_matmul` serial-K TIR with zero host staging; M12.6 rejects unknown/stale wrapper GEMM provider ids explicitly; M12.12 admits real Triton JIT three-operand `tt.dot` as `source_kind=real_jit_tt_dot` for the supported row-major fp16/bf16 input and fp32 accumulator/output case; M12.14 proves real JIT `tt.dot` semantics can select reusable TensorCore/tiled schedules without wrapper-specific readiness; M12.P adds backend-general prebound packed-call dispatch for the fixed-shape ViT native matmul provider and passes the unchanged P2 gate without strict full-native TVM or full-runnable model claims; M13.4 replaces 7 fixed-shape ViT wrapper matmul/addmm runtime nodes with report-distinct `source_kind=generated_real_tl_dot_bridge` TVM artifact execution, explicit native TVM pointwise adapters, and 3 separately reported native TVM bias epilogues |
 | `attention_vit_full_v1` | supported in M10.1-M10.4 artifact/provider/native-decomposed scope | observed wrapper SDPA ViT full-attention call -> semantic extraction -> explicit packed-call artifact `tvm.contrib.triton_tvm.extern_attention_sdpa`; opt-in correctness-only `python_torch_host_staged` provider; opt-in correctness-only native decomposed QK^T, row softmax, and AV path via `native_decomposed`; no performance or full-model runnable claim |
 | `attention_llama_causal_prefill_v1` | supported in M10.5 native-decomposed correctness scope | observed wrapper SDPA Llama causal prefill call -> semantic extraction for already-RoPE'd Q/K tensors, rank-4 V, additive causal mask metadata, `is_causal=False`, and numeric scale; opt-in correctness-only native decomposed QK^T, masked row softmax, and AV path via `native_decomposed`; no RoPE, KV-cache, decode, performance, or full-model runnable claim |
-| `conv2d_nchw_static_v1` | supported in M11.7 device-provider hotpath scope | static fp32 rank-4 NCHW/OIHW wrapper `extern_kernels.convolution` metadata -> explicit packed-call artifact `tvm.contrib.triton_tvm.extern_conv2d`; no bias/transposed/output-padding and output shape formula validation; opt-in `python_torch_host_staged` remains correctness-only; opt-in `device_torch_cuda` marks the observed N=1 groups=1 dilation=1 stride 1/2/16 padding 0/1 regular conv scope runtime-resolved with zero host staging and `performance_eligible`; full TVM runnable closure remains false |
+| `conv2d_nchw_static_v1` | supported in M11.7 device-provider hotpath scope; M13.5 exact ViT native artifact complete | static fp32 rank-4 NCHW/OIHW wrapper `extern_kernels.convolution` metadata -> explicit packed-call artifact `tvm.contrib.triton_tvm.extern_conv2d`; no bias/transposed/output-padding and output shape formula validation; opt-in `python_torch_host_staged` remains correctness-only; opt-in `device_torch_cuda` marks the observed N=1 groups=1 dilation=1 stride 1/2/16 padding 0/1 regular conv scope runtime-resolved with zero host staging and `performance_eligible`; M13.5 adds exact fixed-shape ViT patch embedding `native_tvm_conv2d` artifact evidence with `shape_scope=exact_vit_patch_embedding_m13`, zero host staging, zero `device_torch_cuda` conv runtime count, and `performance_claim=diagnostic_only`; full TVM runnable closure remains false |
 | `conv2d_1x1_nchw_static_v1` | supported in M11.7 device-provider hotpath scope | 1x1 static fp32 rank-4 NCHW/OIHW wrapper conv artifact metadata; `device_torch_cuda` admits N=1 groups=1 stride=1 padding=0 as the M11.7 1x1 hotpath/conv-as-matmul classification surface, resolving 25/25 observed 1x1 records with zero host staging while keeping full-model runnable closure false |
 | `depthwise_conv2d_nchw_static_v1` | supported in M11.2 artifact-only scope | depthwise static fp32 rank-4 NCHW/OIHW wrapper conv artifact metadata; no runtime or performance claim |
 | `grouped_conv2d_nchw_static_v1` | supported in M11.2 artifact-only scope | grouped static fp32 rank-4 NCHW/OIHW wrapper conv artifact metadata; no runtime or performance claim |
@@ -148,6 +148,38 @@ matrix and historical reports live in
   `0.333008 / 0.355069 ms`, or `1.5043x / 1.4946x`.
 - `performance_ready_e2e=true` for the M12 fixed-shape provider mix.
   `strict_full_tvm_native=false` and `full_tvm_runnable_models=0` remain.
+
+## M13.0-M13.5 Strict TVM-Owned Entry Surface
+
+- Generated workbench reports:
+  `reports/m13/m13_0_policy_taxonomy_freeze/report.json`,
+  `reports/m13/m13_1_operator_inventory_baseline/report.json`,
+  `reports/m13/m13_2_captured_kernel_tvm_execution/report.json`,
+  `reports/m13/m13_3_generated_tl_dot_bridge_semantics/report.json`,
+  `reports/m13/m13_4_matmul_addmm_runtime_replacement/report.json`, and
+  `reports/m13/m13_5_native_conv_slice/report.json`.
+- M13.1 inventories 16 fixed-shape `vit_tiny_random` operators: 7 captured
+  kernels, 7 wrapper matmul/addmm calls, 1 patch-embedding conv, and 1 SDPA
+  attention call.
+- M13.2 runs 7/7 captured kernels as TVM artifacts with
+  `harness_fallback_count=0`, `native_triton_launch_count=0`, and
+  `silent_fallback_count=0`.
+- M13.3 validates 7/7 wrapper matmul/addmm generated `tl.dot` bridge semantics
+  under `source_kind=generated_real_tl_dot_bridge`. Generated bridge evidence
+  is report-distinct from captured `real_jit_tt_dot`, keeps
+  `real_jit_tt_dot_captured_count=0`, and feeds the M13.4 runtime replacement
+  without reclassifying generated bridge evidence as captured real `tl.dot`.
+- M13.4 runs 7/7 wrapper matmul/addmm nodes through generated-bridge TVM
+  artifacts, keeps `wrapper_extern_gemm`, `wrapper_extern_addmm_bias`, and
+  legacy `native_tvm_matmul` runtime/provider counts at zero, reports 3
+  native TVM pointwise bias epilogues, and keeps `host_staging_bytes=0`.
+- M13.5 runs the exact fixed-shape ViT patch embedding conv through a native
+  TVM artifact with generic `conv2d_nchw_static_v1` contract naming,
+  `shape_scope=exact_vit_patch_embedding_m13`, native conv artifact
+  correctness, `device_torch_cuda` conv count 0, `host_staging_bytes=0`, and
+  `performance_claim=diagnostic_only`.
+- M13 completion still requires M13-C strict correctness and M13-P2
+  performance. M13.0-M13.5 do not claim strict full-native completion.
 
 ## M7.5 Guard State
 
