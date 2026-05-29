@@ -23,6 +23,7 @@ class CapabilityRecord:
     layout_constraints: Mapping[str, Any]
     allowed_source_origins: tuple[SourceOrigin, ...]
     runtime_available: bool
+    lowering_contract_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -33,4 +34,3 @@ class RegistryResolution:
     capability_id: str | None
     failure_reason: str | None
     query_trace: tuple[str, ...]
-

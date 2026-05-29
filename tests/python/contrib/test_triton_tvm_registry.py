@@ -62,6 +62,5 @@ def test_source_origin_policy_is_checked_after_semantic_and_atomic_requirements(
     )
     result = registry.resolve(source=source, atomic=atomic, semantic_region=semantic)
     assert not result.supported
-    assert result.query_trace == LOOKUP_ORDER[:4]
+    assert result.query_trace == LOOKUP_ORDER[:5]
     assert result.failure_reason == "source origin policy rejected input"
-

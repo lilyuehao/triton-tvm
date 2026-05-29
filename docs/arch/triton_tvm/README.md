@@ -141,6 +141,17 @@ validates contracts, creates Semantic Region records, resolves capabilities,
 and runs runtime admission. It is an alpha route runner and makes no performance
 claim.
 
+Add `--e2e-scaffold` to record the diagnostic post-admission E2E scaffold. The
+scaffold records placeholders only; it does not execute model operators or
+report latency.
+
+Add `--target llvm --atomic-dag-tir` to build
+`artifact_source=atomic_dag_generated_tir` artifacts from the validated Atomic
+DAG route records, run 14/14 top-level operators through TVM packed functions,
+and compare `last_hidden_state` plus `pooler_output` against the reference
+tensor model. This remains a correctness gate only and makes no performance
+claim.
+
 ## Legacy Boundary
 
 Historical milestone modules, report scripts, provider experiments, wrapper
@@ -167,6 +178,8 @@ PYTHONPATH=/home/liyh/xdb/tvm/python /home/liyh/miniconda3/envs/tvm-0.24.0/bin/p
   /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_registry.py \
   /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_model_adapter.py \
   /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_runtime_admission.py \
+  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_runtime_e2e.py \
+  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_executor.py \
   /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_reports.py \
   /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_alpha_path.py \
   /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_vit_runner.py \

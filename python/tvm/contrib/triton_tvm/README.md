@@ -107,6 +107,26 @@ TorchInductor `SourceRecord`s, builds Atomic DAGs, validates contracts, creates
 Semantic Region records, resolves capability records, and runs runtime
 admission. It writes `report.json` and makes no performance claim.
 
+To include the diagnostic E2E scaffold after admission, add:
+
+```bash
+--e2e-scaffold
+```
+
+The scaffold records post-admission placeholders in `diagnostic_e2e`; it does
+not execute model operators and does not report latency.
+
+To execute the 14 top-level ViT operators through Atomic-DAG-generated TIR
+artifacts and compare both model outputs, use:
+
+```bash
+--target llvm --atomic-dag-tir
+```
+
+This mode reports `artifact_source=atomic_dag_generated_tir`, compares
+`last_hidden_state` and `pooler_output` against the reference tensor executor,
+and still keeps `performance_claim=false`.
+
 ## Development Checks
 
 Run the active package tests with:
@@ -120,6 +140,8 @@ PYTHONPATH=/home/liyh/xdb/tvm/python /home/liyh/miniconda3/envs/tvm-0.24.0/bin/p
   /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_registry.py \
   /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_model_adapter.py \
   /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_runtime_admission.py \
+  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_runtime_e2e.py \
+  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_executor.py \
   /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_reports.py \
   /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_alpha_path.py \
   /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_vit_runner.py \

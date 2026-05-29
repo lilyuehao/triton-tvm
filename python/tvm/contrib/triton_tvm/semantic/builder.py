@@ -9,13 +9,34 @@ from ..atomic import AtomicDAGRecord
 from ..contracts import ContractValidationResult
 from ..source import SourceRecord
 from ..source.identity import stable_hash
-from .schema import GraphOptimizationInput, SemanticRegionRecord
+from .schema import (
+    SEMANTIC_PROOF_STATUS_SURROGATE_VALIDATED,
+    SEMANTIC_PROOF_STATUS_VALIDATED,
+    GraphOptimizationInput,
+    SemanticRegionRecord,
+)
+
+
+LOWERING_CONTRACT_STATUS_DIRECT = "direct_lowering"
+LOWERING_CONTRACT_STATUS_SPECIALIZED = "specialized_lowering"
+LOWERING_CONTRACT_STATUS_TEMPORARY_SURROGATE = "temporary_surrogate"
+LOWERING_CONTRACT_STATUS_FLATTENED_SURROGATE = "flattened_surrogate"
+LOWERING_CONTRACT_STATUS_COMPOSITE = "composite"
+_SURROGATE_LOWERING_STATUSES = {
+    LOWERING_CONTRACT_STATUS_TEMPORARY_SURROGATE,
+    LOWERING_CONTRACT_STATUS_FLATTENED_SURROGATE,
+}
 
 
 def build_semantic_region(
     source: SourceRecord,
     atomic: AtomicDAGRecord,
     validation: ContractValidationResult,
+    *,
+    semantic_region_key: str | None = None,
+    declared_semantic_region_key: str | None = None,
+    lowering_contract_ids: tuple[str, ...] | None = None,
+    lowering_contract_status: str = LOWERING_CONTRACT_STATUS_DIRECT,
 ) -> SemanticRegionRecord:
     """Create a Semantic Region only from a passing contract validation result."""
 
@@ -27,9 +48,21 @@ def build_semantic_region(
         raise ValueError("validation Atomic DAG does not match AtomicDAGRecord")
     if validation.matched_contract_id is None:
         raise ValueError("passing validation requires a matched contract")
-    key = validation.matched_contract_id
+    key = semantic_region_key or validation.matched_contract_id
+    declared_key = declared_semantic_region_key or key
+    contract_ids = tuple(lowering_contract_ids or (validation.matched_contract_id,))
+    semantic_proof_status = (
+        SEMANTIC_PROOF_STATUS_SURROGATE_VALIDATED
+        if lowering_contract_status in _SURROGATE_LOWERING_STATUSES
+        else SEMANTIC_PROOF_STATUS_VALIDATED
+    )
     payload = {
         "semantic_region_key": key,
+        "declared_semantic_region_key": declared_key,
+        "matched_contract_id": validation.matched_contract_id,
+        "lowering_contract_ids": contract_ids,
+        "lowering_contract_status": lowering_contract_status,
+        "semantic_proof_status": semantic_proof_status,
         "input_atomic_dag_hash": atomic.atomic_dag_hash,
         "input_source_id": source.source_id,
         "validator_id": validation.validator_id,
@@ -52,6 +85,10 @@ def build_semantic_region(
         dtype_constraints=dict(validation.dtype_constraints),
         layout_constraints=dict(validation.layout_constraints),
         optimization_eligibility={"graph_optimization_input": True},
+        declared_semantic_region_key=declared_key,
+        lowering_contract_ids=contract_ids,
+        lowering_contract_status=lowering_contract_status,
+        semantic_proof_status=semantic_proof_status,
     )
 
 
@@ -67,4 +104,3 @@ def build_graph_optimization_input(
         atomic_dag_hash=atomic.atomic_dag_hash,
         source_id=atomic.source_id,
     )
-

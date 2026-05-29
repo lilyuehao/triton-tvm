@@ -26,6 +26,19 @@ class OperatorManifestRecord:
     runtime_admission_status: str
     gap_reason: str | None
     optional_model_anchor: str | None = None
+    declared_semantic_region_key: str | None = None
+    source_route_record_ids: tuple[str, ...] = ()
+    source_ids: tuple[str, ...] = ()
+    atomic_dag_hashes: tuple[str, ...] = ()
+    atomic_dag_bundle_hash: str | None = None
+    lowering_contract_ids: tuple[str, ...] = ()
+    lowering_contract_status: str | None = None
+    matched_contract_id: str | None = None
+    contract_validation_status: str | None = None
+    semantic_proof_status: str | None = None
+    proof_source: str | None = None
+    support_claim_source: str | None = None
+    wrapper_provider_claim: bool = False
 
     @property
     def identity(self) -> tuple[str, str]:
@@ -40,4 +53,3 @@ class ManifestGapRecord:
     operator_id: str
     source_id: str | None
     reason: str
-

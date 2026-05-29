@@ -13,6 +13,7 @@ from .schema import CapabilityRecord, RegistryResolution
 
 LOOKUP_ORDER = (
     "semantic_region",
+    "lowering_contract",
     "atomic_requirements",
     "shape_dtype_layout_constraints",
     "source_origin_policy",
@@ -44,6 +45,25 @@ class CapabilityRegistry:
             return _failure(trace, "no capability for Semantic Region")
 
         trace.append(LOOKUP_ORDER[1])
+        candidates = [
+            capability
+            for capability in candidates
+            if not capability.lowering_contract_ids
+            or set(capability.lowering_contract_ids).issubset(
+                set(
+                    semantic_region.lowering_contract_ids
+                    or (
+                        (semantic_region.matched_contract_id,)
+                        if semantic_region.matched_contract_id is not None
+                        else ()
+                    )
+                )
+            )
+        ]
+        if not candidates:
+            return _failure(trace, "lowering contract not available for Semantic Region")
+
+        trace.append(LOOKUP_ORDER[2])
         atomic_families = set(atomic.atomic_family_histogram)
         candidates = [
             capability
@@ -53,7 +73,7 @@ class CapabilityRegistry:
         if not candidates:
             return _failure(trace, "atomic requirements not satisfied")
 
-        trace.append(LOOKUP_ORDER[2])
+        trace.append(LOOKUP_ORDER[3])
         candidates = [
             capability
             for capability in candidates
@@ -64,14 +84,14 @@ class CapabilityRegistry:
         if not candidates:
             return _failure(trace, "shape/dtype/layout constraints not satisfied")
 
-        trace.append(LOOKUP_ORDER[3])
+        trace.append(LOOKUP_ORDER[4])
         candidates = [
             capability for capability in candidates if source.source_origin in capability.allowed_source_origins
         ]
         if not candidates:
             return _failure(trace, "source origin policy rejected input")
 
-        trace.append(LOOKUP_ORDER[4])
+        trace.append(LOOKUP_ORDER[5])
         for capability in candidates:
             if capability.runtime_available:
                 return RegistryResolution(
@@ -96,4 +116,3 @@ def _failure(trace: list[str], reason: str) -> RegistryResolution:
         failure_reason=reason,
         query_trace=tuple(trace),
     )
-

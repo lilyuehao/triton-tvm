@@ -8,8 +8,10 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from ..atomic import AtomicDAGRecord
+from ..contracts import ContractValidationResult
 from ..semantic import SemanticRegionRecord
 from ..source import SourceRecord
+from ..source.identity import stable_hash
 from .schema import ManifestGapRecord, OperatorManifestRecord
 
 
@@ -27,6 +29,14 @@ def build_operator_manifest_record(
     runtime_admission_status: str = "not_checked",
     gap_reason: str | None = None,
     optional_model_anchor: str | None = None,
+    validation: ContractValidationResult | None = None,
+    declared_semantic_region_key: str | None = None,
+    source_route_record_ids: tuple[str, ...] | None = None,
+    source_ids: tuple[str, ...] | None = None,
+    atomic_dag_hashes: tuple[str, ...] | None = None,
+    atomic_dag_bundle_hash: str | None = None,
+    lowering_contract_ids: tuple[str, ...] | None = None,
+    lowering_contract_status: str | None = None,
 ) -> OperatorManifestRecord:
     """Build an operator manifest entry without duplicating proof facts."""
 
@@ -36,6 +46,32 @@ def build_operator_manifest_record(
         raise ValueError("Semantic Region source does not match manifest source")
     if semantic_region is not None and semantic_region.input_atomic_dag_hash != atomic.atomic_dag_hash:
         raise ValueError("Semantic Region Atomic DAG does not match manifest Atomic DAG")
+    route_record_ids = tuple(source_route_record_ids or (operator_id,))
+    manifest_source_ids = tuple(source_ids or (source.source_id,))
+    manifest_atomic_hashes = tuple(
+        atomic_dag_hashes
+        or ((atomic.atomic_dag_hash,) if atomic is not None else ())
+    )
+    bundle_hash = atomic_dag_bundle_hash
+    if bundle_hash is None and manifest_atomic_hashes:
+        bundle_hash = stable_hash({"atomic_dag_hashes": manifest_atomic_hashes})
+    contract_ids = tuple(
+        lowering_contract_ids
+        or (
+            semantic_region.lowering_contract_ids
+            if semantic_region is not None and semantic_region.lowering_contract_ids
+            else (
+                (semantic_region.matched_contract_id,)
+                if semantic_region is not None
+                else (
+                    (validation.matched_contract_id,)
+                    if validation is not None and validation.matched_contract_id is not None
+                    else ()
+                )
+            )
+        )
+    )
+    validation_status = validation.validation_status if validation is not None else None
     return OperatorManifestRecord(
         model_id=model_id,
         operator_id=operator_id,
@@ -54,6 +90,39 @@ def build_operator_manifest_record(
         runtime_admission_status=runtime_admission_status,
         gap_reason=gap_reason,
         optional_model_anchor=optional_model_anchor,
+        declared_semantic_region_key=(
+            declared_semantic_region_key
+            or (
+                semantic_region.declared_semantic_region_key
+                if semantic_region is not None
+                else None
+            )
+        ),
+        source_route_record_ids=route_record_ids,
+        source_ids=manifest_source_ids,
+        atomic_dag_hashes=manifest_atomic_hashes,
+        atomic_dag_bundle_hash=bundle_hash,
+        lowering_contract_ids=contract_ids,
+        lowering_contract_status=(
+            lowering_contract_status
+            or (semantic_region.lowering_contract_status if semantic_region is not None else None)
+        ),
+        matched_contract_id=(
+            semantic_region.matched_contract_id
+            if semantic_region is not None
+            else (validation.matched_contract_id if validation is not None else None)
+        ),
+        contract_validation_status=validation_status,
+        semantic_proof_status=(
+            semantic_region.semantic_proof_status if semantic_region is not None else None
+        ),
+        proof_source=semantic_region.proof_source if semantic_region is not None else None,
+        support_claim_source=(
+            semantic_region.support_claim_source if semantic_region is not None else None
+        ),
+        wrapper_provider_claim=(
+            semantic_region.wrapper_provider_claim if semantic_region is not None else False
+        ),
     )
 
 
@@ -88,5 +157,16 @@ def recover_manifest_proof_facts(
         "ttir_hash": atomic.ttir_hash if atomic is not None else source.ttir_hash,
         "validator_id": semantic.validator_id if semantic is not None else None,
         "matched_contract_id": semantic.matched_contract_id if semantic is not None else None,
+        "semantic_region_key": semantic.semantic_region_key if semantic is not None else None,
+        "declared_semantic_region_key": (
+            semantic.declared_semantic_region_key if semantic is not None else None
+        ),
+        "lowering_contract_ids": (
+            semantic.lowering_contract_ids if semantic is not None else record.lowering_contract_ids
+        ),
+        "lowering_contract_status": (
+            semantic.lowering_contract_status
+            if semantic is not None
+            else record.lowering_contract_status
+        ),
     }
-

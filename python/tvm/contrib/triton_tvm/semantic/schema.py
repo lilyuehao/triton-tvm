@@ -10,6 +10,11 @@ from typing import Any, Mapping
 
 
 SEMANTIC_REGION_SCHEMA_VERSION = "semantic_region_v1"
+SEMANTIC_PROOF_STATUS_VALIDATED = "validated"
+SEMANTIC_PROOF_STATUS_SURROGATE_VALIDATED = "surrogate_validated"
+SEMANTIC_PROOF_STATUS_VALIDATION_FAILED = "validation_failed"
+PROOF_SOURCE_ATOMIC_DAG_CONTRACT_VALIDATION = "atomic_dag_contract_validation"
+SUPPORT_CLAIM_SOURCE_VALIDATED_CONTRACT = "validated_contract"
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,13 @@ class SemanticRegionRecord:
     dtype_constraints: Mapping[str, Any]
     layout_constraints: Mapping[str, Any]
     optimization_eligibility: Mapping[str, Any]
+    declared_semantic_region_key: str | None = None
+    lowering_contract_ids: tuple[str, ...] = ()
+    lowering_contract_status: str | None = None
+    semantic_proof_status: str = SEMANTIC_PROOF_STATUS_VALIDATED
+    proof_source: str = PROOF_SOURCE_ATOMIC_DAG_CONTRACT_VALIDATION
+    support_claim_source: str = SUPPORT_CLAIM_SOURCE_VALIDATED_CONTRACT
+    wrapper_provider_claim: bool = False
     schema_version: str = SEMANTIC_REGION_SCHEMA_VERSION
 
 
@@ -38,4 +50,3 @@ class GraphOptimizationInput:
     semantic_region: SemanticRegionRecord
     atomic_dag_hash: str
     source_id: str
-
