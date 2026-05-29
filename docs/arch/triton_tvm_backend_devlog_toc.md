@@ -1,10 +1,9 @@
-# Triton TVM Backend Devlog TOC
+# Triton-TVM Devlog Table of Contents
 
-The historical devlog TOC is no longer maintained in the TVM tree.
+The public alpha does not expose an internal devlog table of contents. Use the
+active documentation instead:
 
-Use the companion workbench instead:
-
-- `/home/liyh/xdb/triton-tvm-workbench/devlog/README.md`
-- `/home/liyh/xdb/triton-tvm-workbench/devlog/milestones/`
-- `/home/liyh/xdb/triton-tvm-workbench/devlog/archive/m00_to_m75_full.md`
-
+- `ALPHA_SCOPE.md`
+- `ALPHA_RELEASE.md`
+- `docs/arch/triton_tvm/README.md`
+- `docs/arch/triton_tvm/design.md`

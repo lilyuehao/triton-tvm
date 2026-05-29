@@ -10,6 +10,10 @@ The current implementation focuses on correctness closure for fixed-shape
 operator routes. It does not perform graph optimization, operator fusion, or
 automatic backend selection.
 
+For the public alpha boundary, see the repository-level
+[`ALPHA_SCOPE.md`](../../../../ALPHA_SCOPE.md) and
+[`ALPHA_RELEASE.md`](../../../../ALPHA_RELEASE.md).
+
 ## What It Does
 
 The integration provides a structured path from Triton-like source material to

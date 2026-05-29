@@ -5,7 +5,7 @@ import re
 ROOT = Path(__file__).resolve().parents[3]
 PACKAGE = ROOT / "python/tvm/contrib/triton_tvm"
 TESTS = ROOT / "tests/python/contrib"
-ARCHIVE = Path("/home/liyh/xdb/triton-tvm-workbench/legacy_reference/m15_active_relocation")
+DOCS = ROOT / "docs/arch"
 
 MILESTONE_MODULE = re.compile(r"^m(?:9|10|11|12|13|14)(?:[0-9a-z_].*)?\.py$")
 MILESTONE_TEST = re.compile(r"^test_triton_tvm_m(?:9|10|11|12|13|14)(?:[0-9a-z_].*)?\.py$")
@@ -60,11 +60,32 @@ def test_active_tests_have_no_legacy_imports_or_fixture_credit_literals():
     assert offenders == []
 
 
-def test_legacy_material_is_outside_python_import_path():
-    assert ARCHIVE.exists()
-    archived_python = sorted(ARCHIVE.rglob("*.py.txt"))
-    assert archived_python
-    assert not any(PACKAGE in path.parents for path in archived_python)
+def test_no_legacy_reference_archive_in_active_package():
+    assert not (PACKAGE / "legacy_reference").exists()
+
+
+def test_public_triton_tvm_docs_do_not_contain_local_workstation_paths():
+    patterns = (re.compile(r"/home/"), re.compile(r"triton-tvm-workbench"))
+    doc_roots = (
+        ROOT / "README.md",
+        ROOT / "ALPHA_SCOPE.md",
+        ROOT / "ALPHA_RELEASE.md",
+        DOCS / "triton_tvm",
+        DOCS / "triton_tvm_backend_plan.md",
+        DOCS / "triton_tvm_backend_devlog.md",
+        DOCS / "triton_tvm_backend_devlog_toc.md",
+        DOCS / "triton_tvm_contracts.md",
+        DOCS / "triton_tvm_capability_matrix.md",
+        PACKAGE / "README.md",
+    )
+    files = []
+    for root in doc_roots:
+        if root.is_dir():
+            files.extend(root.rglob("*.md"))
+        else:
+            files.append(root)
+    offenders = _scan_files(files, patterns)
+    assert offenders == []
 
 
 def _scan_files(paths, patterns):

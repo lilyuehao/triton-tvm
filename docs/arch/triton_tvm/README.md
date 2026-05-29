@@ -1,189 +1,121 @@
-# Triton-TVM Alpha Pipeline
+# Triton-TVM Architecture
 
-This is the active engineering entry for `tvm.contrib.triton_tvm`.
+This directory documents the active alpha architecture for
+`tvm.contrib.triton_tvm`. Historical planning notes are intentionally not part
+of the active path; the canonical implementation entry is the package README:
 
-The current package is an alpha semantic-boundary refactor. It keeps the
-completed atomic route as correctness evidence, but active code no longer uses
-development milestone module names, historical provider paths, or legacy source
-labels as support signals.
+- `python/tvm/contrib/triton_tvm/README.md`
 
-## Canonical Pipeline
-
-```text
-SourceRecord(source_origin + artifact_kind + identity)
-  -> Atomic DAG
-  -> contract validator
-  -> Semantic Region
-  -> model manifest / capability registry
-  -> runtime admission and reports
-```
-
-`source/` is only an input normalization and identity layer. It records where
-input material came from and how it can be hashed or audited. It does not encode
-schedules, runtime providers, model families, semantic support, or capability
-credit.
-
-## Package Map
-
-- `source/`: `SourceRecord`, `SourceOrigin`, `SourceArtifactKind`, stable source
-  and TTIR hashing, TorchInductor adapters, and native Triton language adapters.
-- `atomic/`: Atomic DAG schema, textual TTIR extraction, atomic family
-  classification, stable DAG hashing, unsupported atomic records, and
-  SourceRecord/AtomicDAGRecord join consistency validation.
-- `contracts/`: contract validators and validation-result records. This is the
-  only active boundary that may promote an Atomic DAG into a Semantic Region.
-- `semantic/`: Semantic Region records and graph-optimization input sidecars.
-  It consumes Atomic DAG records and passing validator results; it does not
-  parse TTIR directly.
-- `manifest/`: model/operator manifest records. Identity is `model_id +
-  operator_id`; capability matching uses `semantic_region_key`.
-- `registry/`: capability lookup by Semantic Region, atomic requirements,
-  shape/dtype/layout constraints, source-origin policy, then runtime admission.
-- `models/`: minimal adapters that materialize SourceRecords and TTIR inputs
-  without declaring backend support.
-- `runtime/`: admission helpers for the final validated route only.
-- `reports/`: structured evidence report helpers. Reports read facts; they do
-  not decide support.
-
-## Source Policy
-
-Production source origins are:
-
-- `torch_inductor`
-- `native_triton_language`
-
-`test_fixture` exists only for tests and is rejected by alpha capability
-reports as production support.
-
-Artifact kinds are:
-
-- `triton_python_source`
-- `ttir_module`
-- `captured_jit_kernel`
-- `exported_inductor_kernel`
-- `normalized_ttir_graph`
-
-`normalized_ttir_graph` records must include producer metadata, a stable content
-hash, and parent source or TTIR provenance. Native Triton language production
-records require auditable Triton source provenance or a provenance chain back to
-such material.
-
-## Atomic And Semantic Boundaries
-
-Atomic DAG records are low-level TTIR-derived proof structures. They contain
-atomic operation records, unsupported-operation records, source identity
-snapshots, hashes, and producer/consumer consistency state. They do not own
-semantic-region identity.
-
-Semantic Region records are sidecars created only after a contract validator
-passes. Failed validation produces a `ContractValidationResult` or a manifest
-gap; it must not create a Semantic Region or registry-matchable identity.
-
-## Manifest And Registry
-
-Manifest identity is:
+## Active Pipeline
 
 ```text
-model_id + operator_id
+SourceRecord
+  -> AtomicDAGRecord
+  -> ContractValidationResult
+  -> SemanticRegionRecord
+  -> OperatorManifestRecord
+  -> CapabilityRegistry
+  -> OperatorExecutionRequest
+  -> TIRRegionArtifact
+  -> TVM packed-function execution
 ```
 
-Capability matching key is:
+Each boundary has a narrow responsibility:
+
+- `source/` records origin, artifact kind, stable identity, and provenance.
+- `atomic/` extracts low-level TTIR-derived operation evidence.
+- `contracts/` validates whether an Atomic DAG satisfies a supported lowering
+  contract.
+- `semantic/` creates model-level semantic regions only after validation.
+- `manifest/` connects model/operator identity with proof records.
+- `registry/` decides whether a semantic region is admitted for runtime.
+- `runtime/` builds execution requests, buffer plans, and TVM artifacts.
+- `reports/` records evidence and claims without deciding support.
+
+## Support Rule
+
+Support is never inferred from wrapper names, provider labels, function names,
+or model labels. A route is supported only when the source identity, Atomic DAG,
+contract validation result, semantic region, manifest entry, capability record,
+and runtime artifact are all present and consistent.
+
+The design also keeps these identities separate:
 
 ```text
-semantic_region_key
+semantic_region_key != lowering_contract_id
 ```
 
-Proof facts such as source hashes, TTIR hashes, source origin, artifact kind,
-validator id, and matched contract id are recovered by joining manifest records
-to SourceRecord, AtomicDAGRecord, ContractValidationResult, and SemanticRegion
-records. They are not independent manifest identities.
+For example, a ViT patch-embedding region can have semantic key
+`conv_patchify` while lowering through the `conv2d_nchw_static` contract.
 
-Registry lookup order is fixed:
+## Fixed-Shape ViT Alpha Route
+
+The alpha route covers a fixed-shape ViT correctness path. It reports 14
+top-level semantic operators while preserving 16 source/lowering route records.
+The difference is intentional: the decomposed attention region is one
+top-level semantic operator with three internal source routes.
+
+Top-level inventory:
 
 ```text
-Semantic Region
-  -> required atomic families / op attrs
-  -> shape / dtype / layout constraints
-  -> source-origin policy
-  -> runtime / admission availability
+1 x conv_patchify
+2 x pointwise_grid2d
+2 x norm_row
+5 x matmul
+1 x attention_decomposed
+3 x pointwise_flat
 ```
 
-## Adding A Model
+The route validates source and Atomic DAG evidence, constructs semantic regions
+and manifests, resolves capabilities, builds TVM artifacts, executes through
+TVM packed functions, and compares `last_hidden_state` plus `pooler_output`
+against the reference tensor model.
 
-1. Add a model adapter under `models/`.
-2. The adapter emits SourceRecords and TTIR, or already-normalized TTIR graph
-   inputs with producer/version/hash/provenance metadata.
-3. Build Atomic DAG records from those inputs.
-4. Validate SourceRecord/AtomicDAGRecord source snapshots.
-5. Run contract validators.
-6. Build Semantic Region sidecars only for passing validation results.
-7. Build manifest records keyed by `model_id + operator_id`.
-8. Resolve support through the capability registry.
-9. Emit explicit manifest gaps for unsupported cases.
+## Usage
 
-Model adapters must not add model-specific atomic families, source origins,
-artifact kinds, Semantic Region keys, or registry keys. If the active vocabulary
-is insufficient, emit a gap.
-
-## Fixed-Shape ViT Runner
-
-The active package includes a fixed-shape ViT runner for the current
-compile/admission route:
+Run from the repository root:
 
 ```bash
-PYTHONPATH=/home/liyh/xdb/tvm/python /home/liyh/miniconda3/envs/tvm-0.24.0/bin/python -m \
-  tvm.contrib.triton_tvm.models.vit \
-  --out-dir /home/liyh/xdb/triton-tvm-workbench/reports/m15/vit_fixed_shape_active_route
+export PYTHONPATH="$PWD/python"
+
+python -m tvm.contrib.triton_tvm.models.vit \
+  --target llvm \
+  --atomic-dag-tir \
+  --out-dir /tmp/triton_tvm_vit_atomic_dag_tir
 ```
 
-It materializes 16 fixed-shape ViT operator inputs, builds Atomic DAG records,
-validates contracts, creates Semantic Region records, resolves capabilities,
-and runs runtime admission. It is an alpha route runner and makes no performance
-claim.
+For a scaffold-only post-admission report:
 
-Add `--e2e-scaffold` to record the diagnostic post-admission E2E scaffold. The
-scaffold records placeholders only; it does not execute model operators or
-report latency.
-
-Add `--target llvm --atomic-dag-tir` to build
-`artifact_source=atomic_dag_generated_tir` artifacts from the validated Atomic
-DAG route records, run 14/14 top-level operators through TVM packed functions,
-and compare `last_hidden_state` plus `pooler_output` against the reference
-tensor model. This remains a correctness gate only and makes no performance
-claim.
-
-## Legacy Boundary
-
-Historical milestone modules, report scripts, provider experiments, wrapper
-paths, fixed-shape dashboards, and performance loops are archived outside the
-Python import path under:
-
-```text
-/home/liyh/xdb/triton-tvm-workbench/legacy_reference/m15_active_relocation
+```bash
+python -m tvm.contrib.triton_tvm.models.vit \
+  --target llvm \
+  --e2e-scaffold \
+  --out-dir /tmp/triton_tvm_vit_scaffold
 ```
-
-The archive is reference material only. Active package code and active tests do
-not import it.
 
 ## Validation
 
-Run the M15 active test gate:
+Run the focused Triton-TVM tests:
 
 ```bash
-PYTHONPATH=/home/liyh/xdb/tvm/python /home/liyh/miniconda3/envs/tvm-0.24.0/bin/python -m pytest \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_source.py \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_atomic.py \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_semantic.py \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_manifest.py \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_registry.py \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_model_adapter.py \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_runtime_admission.py \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_runtime_e2e.py \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_executor.py \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_reports.py \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_alpha_path.py \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_vit_runner.py \
-  /home/liyh/xdb/tvm/tests/python/contrib/test_triton_tvm_static_hygiene.py
+python -m pytest \
+  tests/python/contrib/test_triton_tvm_source.py \
+  tests/python/contrib/test_triton_tvm_atomic.py \
+  tests/python/contrib/test_triton_tvm_semantic.py \
+  tests/python/contrib/test_triton_tvm_manifest.py \
+  tests/python/contrib/test_triton_tvm_registry.py \
+  tests/python/contrib/test_triton_tvm_model_adapter.py \
+  tests/python/contrib/test_triton_tvm_runtime_admission.py \
+  tests/python/contrib/test_triton_tvm_runtime_e2e.py \
+  tests/python/contrib/test_triton_tvm_executor.py \
+  tests/python/contrib/test_triton_tvm_reports.py \
+  tests/python/contrib/test_triton_tvm_alpha_path.py \
+  tests/python/contrib/test_triton_tvm_vit_runner.py \
+  tests/python/contrib/test_triton_tvm_static_hygiene.py
 ```
 
-This alpha scope makes no performance claim.
+## Boundaries
+
+The alpha route is correctness-oriented. It does not claim arbitrary Triton
+kernel import, dynamic shapes, graph optimization, fusion, automatic backend
+selection, general model import, or production performance.

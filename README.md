@@ -15,8 +15,45 @@
 <!--- specific language governing permissions and limitations -->
 <!--- under the License. -->
 
-<img src=https://raw.githubusercontent.com/apache/tvm-site/main/images/logo/tvm-logo-small.png width=128/> Open Machine Learning Compiler Framework
-==============================================
+Triton-TVM Alpha
+================
+
+This repository is a public alpha snapshot of an experimental Triton-to-TVM
+integration built as a fork of Apache TVM. The active package lives in
+[`tvm.contrib.triton_tvm`](python/tvm/contrib/triton_tvm/README.md).
+
+Alpha entry points:
+
+- [Alpha scope](ALPHA_SCOPE.md)
+- [Alpha release notes](ALPHA_RELEASE.md)
+- [Architecture overview](docs/arch/triton_tvm/README.md)
+- [Package README](python/tvm/contrib/triton_tvm/README.md)
+
+The current route carries Triton/TorchInductor operator evidence through:
+
+```text
+SourceRecord
+  -> AtomicDAGRecord
+  -> ContractValidationResult
+  -> SemanticRegionRecord
+  -> OperatorManifestRecord
+  -> CapabilityRegistry
+  -> OperatorExecutionRequest
+  -> TIRRegionArtifact
+  -> TVM packed-function execution
+```
+
+The alpha supports a fixed-shape ViT correctness route with 14 top-level
+semantic operators over 16 source/lowering route records. The difference is
+intentional: the decomposed attention region is one top-level semantic operator
+with three internal source routes. This release makes no production performance
+claim and does not claim general Triton kernel import.
+
+Apache TVM Upstream
+-------------------
+
+<img src=https://raw.githubusercontent.com/apache/tvm-site/main/images/logo/tvm-logo-small.png width=128/> Apache TVM: Open Machine Learning Compiler Framework
+
 [Documentation](https://tvm.apache.org/docs) |
 [Contributors](CONTRIBUTORS.md) |
 [Community](https://tvm.apache.org/community) |
@@ -27,14 +64,6 @@ following the following principles:
 
 - Python-first development that enables quick customization of machine learning compiler pipelines.
 - Universal deployment to bring models into minimum deployable modules.
-
-Triton-TVM Integration
-----------------------
-This tree includes an experimental Triton-to-TVM integration under
-[`tvm.contrib.triton_tvm`](python/tvm/contrib/triton_tvm/README.md). It
-captures Triton/TorchInductor source identity, validates low-level Atomic DAG
-evidence, lowers fixed-shape operator regions to TVM TIR artifacts, and runs
-op-by-op correctness checks through TVM packed functions.
 
 License
 -------

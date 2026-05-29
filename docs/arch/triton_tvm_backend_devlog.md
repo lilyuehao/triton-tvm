@@ -1,12 +1,11 @@
-# Triton TVM Backend Devlog
+# Triton-TVM Backend Devlog
 
-This long devlog was frozen after M7.5 and moved to the companion workbench.
+This public alpha keeps active architecture, scope, and validation docs in the
+repository. Long-form development logs are not part of the support claim.
 
-Current development should use:
+Current reader entry points:
 
-- `/home/liyh/xdb/triton-tvm-workbench/CURRENT.md`
-- `/home/liyh/xdb/triton-tvm-workbench/devlog/milestones/`
-- `/home/liyh/xdb/triton-tvm-workbench/devlog/archive/m00_to_m75_full.md`
-
-Do not append new milestone entries to this TVM-side compatibility stub.
-
+- `ALPHA_SCOPE.md`
+- `ALPHA_RELEASE.md`
+- `docs/arch/triton_tvm/README.md`
+- `python/tvm/contrib/triton_tvm/README.md`

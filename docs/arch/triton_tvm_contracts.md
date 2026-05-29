@@ -1,12 +1,10 @@
-# Triton TVM Contracts
+# Triton-TVM Contracts
 
-Contract and report policy is summarized in:
+The active contract policy is documented in:
 
+- `docs/arch/triton_tvm/contracts.md`
 - `docs/arch/triton_tvm/design.md`
 - `docs/arch/triton_tvm/capability_matrix.md`
 
-Long-form contract history and ADR decisions live in:
-
-- `/home/liyh/xdb/triton-tvm-workbench/adr/`
-- `/home/liyh/xdb/triton-tvm-workbench/devlog/archive/tvm_arch_docs/`
-
+Contract support in the alpha is limited to the fixed-shape ViT correctness
+route and must pass through explicit Atomic DAG and contract validation.
