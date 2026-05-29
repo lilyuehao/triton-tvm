@@ -28,6 +28,14 @@ following the following principles:
 - Python-first development that enables quick customization of machine learning compiler pipelines.
 - Universal deployment to bring models into minimum deployable modules.
 
+Triton-TVM Integration
+----------------------
+This tree includes an experimental Triton-to-TVM integration under
+[`tvm.contrib.triton_tvm`](python/tvm/contrib/triton_tvm/README.md). It
+captures Triton/TorchInductor source identity, validates low-level Atomic DAG
+evidence, lowers fixed-shape operator regions to TVM TIR artifacts, and runs
+op-by-op correctness checks through TVM packed functions.
+
 License
 -------
 TVM is licensed under the [Apache-2.0](LICENSE) license.
