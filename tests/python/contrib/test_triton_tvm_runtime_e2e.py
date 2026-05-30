@@ -143,5 +143,10 @@ def test_reference_tvm_report_distinguishes_imported_tirx_artifact_source():
     )
 
     assert result.artifact_source_breakdown == {"imported_tirx": 1}
+    assert result.tir_artifact_source_breakdown == {"imported_tirx": 1}
+    assert result.tir_generation_mode == "imported_ir_module"
+    assert result.atomic_dag_role == "none"
+    assert result.e2e_correctness_pass is False
     assert result.allclose_count == 1
     assert result.e2e_pass is False
+    assert result.e2e_pass_alias_for == "e2e_correctness_pass"

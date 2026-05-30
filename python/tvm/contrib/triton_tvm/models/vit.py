@@ -62,12 +62,12 @@ VIT_SOURCE_ROUTE_RECORD_COUNT = 16
 VIT_TOP_LEVEL_OPERATOR_COUNT = 14
 VIT_OPERATOR_COUNT = VIT_TOP_LEVEL_OPERATOR_COUNT
 RUNTIME_CLAIM_SYNTHETIC_ONLY = "synthetic_runtime_channel_only"
-RUNTIME_CLAIM_ATOMIC_DAG_GENERATED = "atomic_dag_generated_correctness_only"
+RUNTIME_CLAIM_ATOMIC_DAG_GATED_TE = "atomic_dag_gated_te_correctness_only"
 TIR_ARTIFACT_SOURCE_SYNTHETIC = "synthetic_tir"
-TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GENERATED = "atomic_dag_generated_tir"
+TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GATED_TE = "atomic_dag_gated_te_tir"
 TIR_ARTIFACT_SOURCE_IMPORTED_TIRX = "imported_tirx"
 E2E_GATE_ARTIFACT_SOURCES = (
-    TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GENERATED,
+    TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GATED_TE,
     TIR_ARTIFACT_SOURCE_IMPORTED_TIRX,
 )
 
@@ -215,8 +215,8 @@ def run_vit_tiny_fixed_shape_route(
     executor_registry: ExecutorRegistry | None = None,
     enable_synthetic_tir: bool = False,
     synthetic_tir_operator_ids: Iterable[str] | None = None,
-    enable_atomic_dag_tir: bool = False,
-    atomic_dag_tir_operator_ids: Iterable[str] | None = None,
+    enable_atomic_dag_gated_te_tir: bool = False,
+    atomic_dag_gated_te_operator_ids: Iterable[str] | None = None,
     tir_artifact_sources: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Compile and run the fixed-shape ViT inventory through the active route."""
@@ -368,8 +368,8 @@ def run_vit_tiny_fixed_shape_route(
         top_records,
         enable_synthetic_tir=enable_synthetic_tir,
         synthetic_tir_operator_ids=synthetic_tir_operator_ids,
-        enable_atomic_dag_tir=enable_atomic_dag_tir,
-        atomic_dag_tir_operator_ids=atomic_dag_tir_operator_ids,
+        enable_atomic_dag_gated_te_tir=enable_atomic_dag_gated_te_tir,
+        atomic_dag_gated_te_operator_ids=atomic_dag_gated_te_operator_ids,
         tir_artifact_sources=tir_artifact_sources,
     )
 
@@ -409,6 +409,14 @@ def run_vit_tiny_fixed_shape_route(
         report["diagnostic_e2e"] = reference_tvm_e2e_result_to_dict(diagnostic)
         report["runtime_claim"] = runtime_claim
         report["e2e_pass"] = diagnostic.e2e_pass
+        report["e2e_pass_alias_for"] = diagnostic.e2e_pass_alias_for
+        report["e2e_correctness_pass"] = diagnostic.e2e_correctness_pass
+        report["e2e_gate_kind"] = diagnostic.e2e_gate_kind
+        report["atomic_dag_role"] = diagnostic.atomic_dag_role
+        report["tir_generation_mode"] = diagnostic.tir_generation_mode
+        report["dag_node_lowering_coverage_claim"] = (
+            diagnostic.dag_node_lowering_coverage_claim
+        )
     elif enable_e2e_scaffold or executor_registry is not None:
         report["diagnostic_e2e"] = e2e_result_to_dict(
             run_e2e_scaffold(
@@ -719,14 +727,14 @@ def build_vit_synthetic_tir_artifacts(
     )
 
 
-def build_vit_atomic_dag_generated_tir_artifacts(
+def build_vit_atomic_dag_gated_te_tir_artifacts(
     requests: Iterable[OperatorExecutionRequest],
     *,
     atomics_by_route: Mapping[str, Any],
     target: str = "llvm",
     operator_ids: Iterable[str] | None = None,
 ) -> tuple[TIRRegionArtifact, ...]:
-    """Generate TIR artifacts from validated Atomic DAG route evidence."""
+    """Generate TE/TIR artifacts admitted by validated Atomic DAG route evidence."""
 
     request_list = tuple(requests)
     selected = set(operator_ids) if operator_ids is not None else None
@@ -734,7 +742,7 @@ def build_vit_atomic_dag_generated_tir_artifacts(
         request_list,
         target=target,
         artifact_sources_by_operator={
-            request.operator_id: TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GENERATED
+            request.operator_id: TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GATED_TE
             for request in request_list
             if selected is None or request.operator_id in selected
         },
@@ -837,8 +845,8 @@ def _resolve_vit_tir_artifact_sources(
     *,
     enable_synthetic_tir: bool,
     synthetic_tir_operator_ids: Iterable[str] | None,
-    enable_atomic_dag_tir: bool,
-    atomic_dag_tir_operator_ids: Iterable[str] | None,
+    enable_atomic_dag_gated_te_tir: bool,
+    atomic_dag_gated_te_operator_ids: Iterable[str] | None,
     tir_artifact_sources: Mapping[str, str] | None,
 ) -> dict[str, str]:
     top_operator_ids = tuple(record.operator_id for record in top_records)
@@ -859,23 +867,23 @@ def _resolve_vit_tir_artifact_sources(
             if operator_id not in top_operator_ids:
                 raise ValueError(f"unknown synthetic TIR operator: {operator_id}")
             sources.setdefault(operator_id, TIR_ARTIFACT_SOURCE_SYNTHETIC)
-    if enable_atomic_dag_tir:
+    if enable_atomic_dag_gated_te_tir:
         selected = (
-            tuple(atomic_dag_tir_operator_ids)
-            if atomic_dag_tir_operator_ids is not None
+            tuple(atomic_dag_gated_te_operator_ids)
+            if atomic_dag_gated_te_operator_ids is not None
             else top_operator_ids
         )
         for operator_id in selected:
             if operator_id not in top_operator_ids:
-                raise ValueError(f"unknown Atomic DAG TIR operator: {operator_id}")
-            sources[operator_id] = TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GENERATED
+                raise ValueError(f"unknown Atomic-DAG-gated TE/TIR operator: {operator_id}")
+            sources[operator_id] = TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GATED_TE
     return dict(sorted(sources.items(), key=lambda item: top_operator_ids.index(item[0])))
 
 
 def _runtime_claim_for_artifact_sources(artifact_sources: Iterable[str]) -> str:
     source_set = set(artifact_sources)
     if source_set and source_set.issubset(E2E_GATE_ARTIFACT_SOURCES):
-        return RUNTIME_CLAIM_ATOMIC_DAG_GENERATED
+        return RUNTIME_CLAIM_ATOMIC_DAG_GATED_TE
     if source_set == {TIR_ARTIFACT_SOURCE_SYNTHETIC}:
         return RUNTIME_CLAIM_SYNTHETIC_ONLY
     return "mixed_tir_artifact_correctness_only"
@@ -884,7 +892,7 @@ def _runtime_claim_for_artifact_sources(artifact_sources: Iterable[str]) -> str:
 def _validate_tir_artifact_source(artifact_source: str) -> None:
     if artifact_source not in {
         TIR_ARTIFACT_SOURCE_SYNTHETIC,
-        TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GENERATED,
+        TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GATED_TE,
         TIR_ARTIFACT_SOURCE_IMPORTED_TIRX,
     }:
         raise ValueError(f"unsupported TIR artifact source: {artifact_source}")
@@ -901,18 +909,24 @@ def _tir_generation_meta(
         return {
             "generator_id": "vit_synthetic_te_codegen_v1",
             "proof_source": "synthetic_runtime_channel_debug",
-            "atomic_dag_generated": False,
+            "tir_generation_mode": "synthetic_operator_template_te",
+            "atomic_dag_role": "none",
+            "atomic_dag_gated": False,
+            "atomic_dag_lowered": False,
+            "dag_node_lowering_coverage_claim": False,
         }
-    if artifact_source == TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GENERATED:
+    if artifact_source == TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GATED_TE:
         if atomics_by_route is None:
-            raise ValueError("Atomic DAG generated TIR requires route Atomic DAG records")
-        return _atomic_dag_tir_generation_meta(request, atomics_by_route, target=target)
+            raise ValueError("Atomic-DAG-gated TE/TIR requires route Atomic DAG records")
+        return _atomic_dag_gated_te_tir_generation_meta(
+            request, atomics_by_route, target=target
+        )
     if artifact_source == TIR_ARTIFACT_SOURCE_IMPORTED_TIRX:
         raise ValueError("imported_tirx artifacts require imported IRModule inputs")
     raise ValueError(f"unsupported TIR artifact source: {artifact_source}")
 
 
-def _atomic_dag_tir_generation_meta(
+def _atomic_dag_gated_te_tir_generation_meta(
     request: OperatorExecutionRequest,
     atomics_by_route: Mapping[str, Any],
     *,
@@ -927,14 +941,14 @@ def _atomic_dag_tir_generation_meta(
 
     atomic_hashes = tuple(atomic.atomic_dag_hash for atomic in route_atomics)
     if atomic_hashes != request.atomic_dag_hashes:
-        raise ValueError("Atomic DAG generated TIR hash bundle does not match request")
+        raise ValueError("Atomic-DAG-gated TE/TIR hash bundle does not match request")
     if any(atomic.target != target for atomic in route_atomics):
-        raise ValueError("Atomic DAG generated TIR target does not match request target")
+        raise ValueError("Atomic-DAG-gated TE/TIR target does not match request target")
     unsupported = sum(len(atomic.unsupported_atomic_ops) for atomic in route_atomics)
     if unsupported:
-        raise ValueError("Atomic DAG generated TIR refuses unsupported atomic ops")
+        raise ValueError("Atomic-DAG-gated TE/TIR refuses unsupported atomic ops")
     if not all(atomic.producer_consumer_consistent for atomic in route_atomics):
-        raise ValueError("Atomic DAG generated TIR requires producer/consumer consistency")
+        raise ValueError("Atomic-DAG-gated TE/TIR requires producer/consumer consistency")
 
     family_histogram: dict[str, int] = {}
     for atomic in route_atomics:
@@ -944,13 +958,21 @@ def _atomic_dag_tir_generation_meta(
     missing = tuple(family for family in required if family not in family_histogram)
     if missing:
         raise ValueError(
-            "Atomic DAG generated TIR missing required atomic families: " + ", ".join(missing)
+            "Atomic-DAG-gated TE/TIR missing required atomic families: "
+            + ", ".join(missing)
         )
 
     return {
-        "generator_id": "vit_atomic_dag_te_codegen_v1",
+        "generator_id": "vit_atomic_dag_gated_te_codegen_v1",
         "proof_source": "atomic_dag_contract_validation",
-        "atomic_dag_generated": True,
+        "tir_generation_mode": "operator_template_te",
+        "atomic_dag_role": "admission_gate",
+        "atomic_dag_gated": True,
+        "atomic_dag_lowered": False,
+        "atomic_dag_hash_checked": True,
+        "atomic_family_requirements_checked": True,
+        "producer_consumer_consistency_checked": True,
+        "dag_node_lowering_coverage_claim": False,
         "input_atomic_dag_hashes": atomic_hashes,
         "input_atomic_dag_bundle_hash": request.atomic_dag_bundle_hash,
         "input_atomic_family_histogram": dict(sorted(family_histogram.items())),
@@ -973,8 +995,8 @@ def _required_atomic_families_for_tir_generation(
 def _primfunc_prefix_for_artifact_source(artifact_source: str) -> str:
     if artifact_source == TIR_ARTIFACT_SOURCE_SYNTHETIC:
         return "synthetic"
-    if artifact_source == TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GENERATED:
-        return "atomic_dag_generated"
+    if artifact_source == TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GATED_TE:
+        return "atomic_dag_gated_te"
     if artifact_source == TIR_ARTIFACT_SOURCE_IMPORTED_TIRX:
         return "imported_tirx"
     raise ValueError(f"unsupported TIR artifact source: {artifact_source}")
@@ -983,8 +1005,8 @@ def _primfunc_prefix_for_artifact_source(artifact_source: str) -> str:
 def _schedule_id_for_artifact_source(artifact_source: str) -> str:
     if artifact_source == TIR_ARTIFACT_SOURCE_SYNTHETIC:
         return "synthetic_te_default"
-    if artifact_source == TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GENERATED:
-        return "atomic_dag_te_default"
+    if artifact_source == TIR_ARTIFACT_SOURCE_ATOMIC_DAG_GATED_TE:
+        return "atomic_dag_gated_te_default"
     if artifact_source == TIR_ARTIFACT_SOURCE_IMPORTED_TIRX:
         return "imported_tirx"
     raise ValueError(f"unsupported TIR artifact source: {artifact_source}")
@@ -1480,7 +1502,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--e2e-scaffold", action="store_true")
     parser.add_argument("--synthetic-tir", action="store_true")
-    parser.add_argument("--atomic-dag-tir", action="store_true")
+    parser.add_argument("--atomic-dag-gated-te-tir", action="store_true")
     args = parser.parse_args(argv)
     report = run_vit_tiny_fixed_shape_route(
         target=args.target,
@@ -1488,7 +1510,7 @@ def main(argv: list[str] | None = None) -> int:
         out_dir=args.out_dir,
         enable_e2e_scaffold=args.e2e_scaffold,
         enable_synthetic_tir=args.synthetic_tir,
-        enable_atomic_dag_tir=args.atomic_dag_tir,
+        enable_atomic_dag_gated_te_tir=args.atomic_dag_gated_te_tir,
     )
     diagnostic = report.get("diagnostic_e2e")
     diagnostic_suffix = (

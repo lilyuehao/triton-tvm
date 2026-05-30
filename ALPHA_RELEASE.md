@@ -1,6 +1,6 @@
-# v0.1.0-alpha Release Notes
+# v0.1.1-alpha Release Notes
 
-`v0.1.0-alpha` is a public alpha snapshot of the Triton-TVM integration in this
+`v0.1.1-alpha` is a public alpha snapshot of the Triton-TVM integration in this
 fork. It is suitable for compiler-infrastructure review and fixed-shape
 correctness reproduction, not for production inference deployment.
 
@@ -23,8 +23,8 @@ export PYTHONPATH="$PWD/python"
 
 python -m tvm.contrib.triton_tvm.models.vit \
   --target llvm \
-  --atomic-dag-tir \
-  --out-dir /tmp/triton_tvm_vit_atomic_dag_tir
+  --atomic-dag-gated-te-tir \
+  --out-dir /tmp/triton_tvm_vit_atomic_dag_gated_te_tir
 ```
 
 Run the focused test set:
@@ -60,3 +60,8 @@ python -m pytest \
 The ViT report should expose source route count, top-level operator count,
 artifact-source breakdown, allclose status, model-output comparison status, and
 explicit runtime-claim fields.
+
+The alpha correctness route uses `atomic_dag_gated_te_tir`: Atomic DAG records
+act as the admission and evidence gate, while the executable TVM IR is produced
+from fixed-shape TE/TIR templates. This is a correctness claim, not a generic
+Atomic-DAG-node-to-TIR lowering claim.

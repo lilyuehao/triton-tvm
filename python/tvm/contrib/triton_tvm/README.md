@@ -115,7 +115,7 @@ The runnable ViT path supports:
 - connected buffer planning for `last_hidden_state` and `pooler_output`
 - reference tensor execution for all 14 operators
 - TVM packed-function execution through `TIRRegionArtifact`
-- artifact-source reporting for `synthetic_tir`, `atomic_dag_generated_tir`,
+- artifact-source reporting for `synthetic_tir`, `atomic_dag_gated_te_tir`,
   and `imported_tirx`
 - model-output comparison for `last_hidden_state` and `pooler_output`
 
@@ -138,13 +138,13 @@ python -m tvm.contrib.triton_tvm.models.vit \
   --out-dir /tmp/triton_tvm_vit_route
 ```
 
-Run the full TVM correctness path using Atomic-DAG-generated TIR artifacts:
+Run the full TVM correctness path using Atomic-DAG-gated TE/TIR artifacts:
 
 ```bash
 python -m tvm.contrib.triton_tvm.models.vit \
   --target llvm \
-  --atomic-dag-tir \
-  --out-dir /tmp/triton_tvm_vit_atomic_dag_tir
+  --atomic-dag-gated-te-tir \
+  --out-dir /tmp/triton_tvm_vit_atomic_dag_gated_te_tir
 ```
 
 The report written to `report.json` includes the operator inventory, source
@@ -187,8 +187,10 @@ This package is a correctness-oriented integration layer. In particular:
 
 - `synthetic_tir` is a runtime-channel debug artifact source and is not an
   end-to-end support proof.
-- `atomic_dag_generated_tir` artifacts are generated from validated route
-  evidence and can be used for the fixed-shape correctness gate.
+- `atomic_dag_gated_te_tir` artifacts use validated Atomic DAG route evidence
+  as an admission gate before selecting a fixed-shape TE/TIR template. They can
+  be used for the fixed-shape correctness gate, but they do not claim generic
+  Atomic-DAG-node-to-TIR lowering coverage.
 - `imported_tirx` is represented in the reporting ABI; importing external TIRX
   modules is a separate integration point.
 - Graph optimization and fusion are intentionally outside the current path.

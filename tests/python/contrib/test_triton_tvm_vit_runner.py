@@ -2,7 +2,7 @@ import pytest
 
 from tvm.contrib.triton_tvm.atomic import build_atomic_dag
 from tvm.contrib.triton_tvm.models.vit import (
-    build_vit_atomic_dag_generated_tir_artifacts,
+    build_vit_atomic_dag_gated_te_tir_artifacts,
     build_vit_tiny_fixed_shape_adapter,
     run_vit_tiny_fixed_shape_route,
     vit_execution_requests_from_report,
@@ -71,8 +71,12 @@ def test_vit_runner_synthetic_tir_reference_and_tvm_allclose_14_of_14():
     assert diagnostic["not_run_count"] == 0
     assert diagnostic["performance_claim"] is False
     assert diagnostic["runtime_claim"] == "synthetic_runtime_channel_only"
+    assert diagnostic["e2e_correctness_pass"] is False
     assert diagnostic["e2e_pass"] is False
     assert diagnostic["atomic_dag_lowering_coverage_claim"] is False
+    assert diagnostic["dag_node_lowering_coverage_claim"] is False
+    assert diagnostic["atomic_dag_role"] == "none"
+    assert diagnostic["tir_generation_mode"] == "synthetic_operator_template_te"
     assert diagnostic["artifact_source_breakdown"] == {"synthetic_tir": 14}
     assert diagnostic["model_comparison_status"] == "allclose"
     assert diagnostic["model_output_count"] == 2
@@ -127,22 +131,33 @@ def test_vit_synthetic_tir_single_entry_reports_not_run_without_gap():
     assert diagnostic["failed_count"] == 0
 
 
-def test_vit_runner_atomic_dag_generated_tir_replaces_synthetic_and_model_outputs_allclose():
-    report = run_vit_tiny_fixed_shape_route(target="llvm", enable_atomic_dag_tir=True)
+def test_vit_runner_atomic_dag_gated_te_tir_replaces_synthetic_and_model_outputs_allclose():
+    report = run_vit_tiny_fixed_shape_route(
+        target="llvm", enable_atomic_dag_gated_te_tir=True
+    )
     diagnostic = report["diagnostic_e2e"]
 
-    assert report["runtime_claim"] == "atomic_dag_generated_correctness_only"
+    assert report["runtime_claim"] == "atomic_dag_gated_te_correctness_only"
+    assert report["e2e_correctness_pass"] is True
     assert report["e2e_pass"] is True
+    assert report["e2e_pass_alias_for"] == "e2e_correctness_pass"
     assert report["performance_claim"] is False
     assert diagnostic["status"] == "allclose"
     assert diagnostic["planned_operator_count"] == 14
     assert diagnostic["reference_executed_count"] == 14
     assert diagnostic["tvm_executed_count"] == 14
     assert diagnostic["allclose_count"] == 14
-    assert diagnostic["artifact_source_breakdown"] == {"atomic_dag_generated_tir": 14}
-    assert diagnostic["runtime_claim"] == "atomic_dag_generated_correctness_only"
+    assert diagnostic["artifact_source_breakdown"] == {"atomic_dag_gated_te_tir": 14}
+    assert diagnostic["tir_artifact_source_breakdown"] == {"atomic_dag_gated_te_tir": 14}
+    assert diagnostic["runtime_claim"] == "atomic_dag_gated_te_correctness_only"
+    assert diagnostic["e2e_correctness_pass"] is True
     assert diagnostic["e2e_pass"] is True
+    assert diagnostic["e2e_pass_alias_for"] == "e2e_correctness_pass"
+    assert diagnostic["e2e_gate_kind"] == "fixed_shape_vit_correctness"
+    assert diagnostic["atomic_dag_role"] == "admission_gate"
+    assert diagnostic["tir_generation_mode"] == "operator_template_te"
     assert diagnostic["atomic_dag_lowering_coverage_claim"] is False
+    assert diagnostic["dag_node_lowering_coverage_claim"] is False
     assert diagnostic["model_comparison_status"] == "allclose"
     assert diagnostic["model_output_count"] == 2
     assert diagnostic["model_allclose_count"] == 2
@@ -156,15 +171,15 @@ def test_vit_runner_mixed_tir_artifact_sources_allclose_but_do_not_pass_e2e_gate
     report = run_vit_tiny_fixed_shape_route(
         target="llvm",
         enable_synthetic_tir=True,
-        enable_atomic_dag_tir=True,
-        atomic_dag_tir_operator_ids=("patch_embed",),
+        enable_atomic_dag_gated_te_tir=True,
+        atomic_dag_gated_te_operator_ids=("patch_embed",),
     )
     diagnostic = report["diagnostic_e2e"]
 
     assert diagnostic["status"] == "allclose"
     assert diagnostic["allclose_count"] == 14
     assert diagnostic["artifact_source_breakdown"] == {
-        "atomic_dag_generated_tir": 1,
+        "atomic_dag_gated_te_tir": 1,
         "synthetic_tir": 13,
     }
     assert diagnostic["model_comparison_status"] == "allclose"
@@ -174,7 +189,7 @@ def test_vit_runner_mixed_tir_artifact_sources_allclose_but_do_not_pass_e2e_gate
     assert diagnostic["e2e_pass"] is False
 
 
-def test_atomic_dag_generated_tir_requires_matching_atomic_hash_bundle():
+def test_atomic_dag_gated_te_tir_requires_matching_atomic_hash_bundle():
     report = run_vit_tiny_fixed_shape_route(target="llvm")
     requests = vit_execution_requests_from_report(report)
     adapter = build_vit_tiny_fixed_shape_adapter(target="llvm")
@@ -191,7 +206,7 @@ def test_atomic_dag_generated_tir_requires_matching_atomic_hash_bundle():
     )
 
     with pytest.raises(ValueError, match="hash bundle"):
-        build_vit_atomic_dag_generated_tir_artifacts(
+        build_vit_atomic_dag_gated_te_tir_artifacts(
             (bad_request,),
             atomics_by_route=atomics_by_route,
             target="llvm",

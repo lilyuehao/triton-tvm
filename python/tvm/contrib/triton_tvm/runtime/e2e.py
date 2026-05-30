@@ -86,9 +86,16 @@ class ReferenceTvmE2EResult:
     proof_source_breakdown: Mapping[str, int]
     runtime_claim: str
     e2e_pass: bool
+    e2e_pass_alias_for: str
+    e2e_correctness_pass: bool
+    e2e_gate_kind: str
     performance_claim: bool
     graph_optimization_used: bool
     atomic_dag_lowering_coverage_claim: bool
+    dag_node_lowering_coverage_claim: bool
+    tir_artifact_source_breakdown: Mapping[str, int]
+    tir_generation_mode: str
+    atomic_dag_role: str
     model_comparison_status: str
     model_output_count: int
     model_allclose_count: int
@@ -182,9 +189,10 @@ def run_reference_tvm_e2e(
     final_output_buffer_ids: tuple[str, ...] = (),
     runtime_claim: str = "synthetic_runtime_channel_only",
     e2e_gate_artifact_sources: tuple[str, ...] = (
-        "atomic_dag_generated_tir",
+        "atomic_dag_gated_te_tir",
         "imported_tirx",
     ),
+    e2e_gate_kind: str = "fixed_shape_vit_correctness",
     rtol: float = 1.0e-4,
     atol: float = 1.0e-4,
 ) -> ReferenceTvmE2EResult:
@@ -258,6 +266,12 @@ def run_reference_tvm_e2e(
                 "failure_reason": reference_result.reason or tvm_result.reason,
                 "runtime_claim": runtime_claim,
                 "e2e_pass": False,
+                "e2e_correctness_pass": False,
+                "atomic_dag_role": _atomic_dag_role_for_source(tvm_result.artifact_source),
+                "tir_generation_mode": _tir_generation_mode_for_source(
+                    tvm_result.artifact_source
+                ),
+                "dag_node_lowering_coverage_claim": False,
             }
         )
 
@@ -311,13 +325,17 @@ def run_reference_tvm_e2e(
     )
     allowed_artifact_sources = set(e2e_gate_artifact_sources)
     operator_sources = tuple(record["tir_artifact_source"] for record in operator_records)
-    e2e_pass = (
+    e2e_correctness_pass = (
         bool(operator_records)
         and allclose_count == len(operator_records)
         and bool(model_outputs)
         and model_allclose_count == len(model_outputs)
         and all(source in allowed_artifact_sources for source in operator_sources)
     )
+    tir_generation_mode = _combined_mode(
+        record["tir_generation_mode"] for record in operator_records
+    )
+    atomic_dag_role = _combined_mode(record["atomic_dag_role"] for record in operator_records)
     status = (
         "allclose"
         if allclose_count == len(operator_records) and operator_records
@@ -349,10 +367,17 @@ def run_reference_tvm_e2e(
         semantic_proof_status_breakdown=semantic_status_breakdown,
         proof_source_breakdown=proof_source_breakdown,
         runtime_claim=runtime_claim,
-        e2e_pass=e2e_pass,
+        e2e_pass=e2e_correctness_pass,
+        e2e_pass_alias_for="e2e_correctness_pass",
+        e2e_correctness_pass=e2e_correctness_pass,
+        e2e_gate_kind=e2e_gate_kind,
         performance_claim=False,
         graph_optimization_used=False,
         atomic_dag_lowering_coverage_claim=False,
+        dag_node_lowering_coverage_claim=False,
+        tir_artifact_source_breakdown=artifact_source_breakdown,
+        tir_generation_mode=tir_generation_mode,
+        atomic_dag_role=atomic_dag_role,
         model_comparison_status=model_comparison_status,
         model_output_count=len(model_outputs),
         model_allclose_count=model_allclose_count,
@@ -531,6 +556,37 @@ def _count_nonempty(values: Iterable[Any]) -> dict[str, int]:
         key = str(value)
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def _tir_generation_mode_for_source(artifact_source: str | None) -> str:
+    if artifact_source == "synthetic_tir":
+        return "synthetic_operator_template_te"
+    if artifact_source == "atomic_dag_gated_te_tir":
+        return "operator_template_te"
+    if artifact_source == "imported_tirx":
+        return "imported_ir_module"
+    if artifact_source is None:
+        return "not_run"
+    return "unknown"
+
+
+def _atomic_dag_role_for_source(artifact_source: str | None) -> str:
+    if artifact_source == "atomic_dag_gated_te_tir":
+        return "admission_gate"
+    if artifact_source in {"synthetic_tir", "imported_tirx"}:
+        return "none"
+    if artifact_source is None:
+        return "not_run"
+    return "unknown"
+
+
+def _combined_mode(values: Iterable[str]) -> str:
+    unique = {value for value in values if value}
+    if not unique:
+        return "not_run"
+    if len(unique) == 1:
+        return next(iter(unique))
+    return "mixed"
 
 
 def _lowering_contract_warning(status: str | None) -> str | None:
