@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import ctypes
+import ctypes.util
 import math
 import time
 from typing import Any, Iterable, Mapping, MutableMapping, Protocol
@@ -357,15 +359,28 @@ class ReferenceTensorExecutor:
             cls = _as_numpy(_read(context, spec.input_buffer_ids[1]))
             result = x.copy()
             result[0:1, :] = result[0:1, :] + cls
+        elif impl_id == "class_token_concat":
+            x = _as_numpy(_read(context, spec.input_buffer_ids[0]))
+            cls = _as_numpy(_read(context, spec.input_buffer_ids[1]))
+            result = _np().concatenate((cls, x), axis=1)
         elif impl_id == "position_add":
             result = _as_numpy(_read(context, spec.input_buffer_ids[0])) + _as_numpy(
                 _read(context, spec.input_buffer_ids[1])
             )
-        elif impl_id == "gelu":
+        elif impl_id in {"gelu", "gelu_tanh"}:
             x = _as_numpy(_read(context, spec.input_buffer_ids[0]))
             result = 0.5 * x * (
                 1.0 + _np().tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x**3))
             )
+        elif impl_id == "gelu_exact":
+            x = _as_numpy(_read(context, spec.input_buffer_ids[0]))
+            try:
+                from scipy import special  # pylint: disable=import-outside-toplevel
+
+                erf = special.erf
+            except Exception:  # pragma: no cover - optional scipy fallback
+                erf = _np().vectorize(math.erf)
+            result = 0.5 * x * (1.0 + erf(x / math.sqrt(2.0)))
         elif impl_id == "norm_row":
             x = _as_numpy(_read(context, spec.input_buffer_ids[0]))
             scale = _as_numpy(_read(context, spec.input_buffer_ids[1]))
@@ -382,6 +397,10 @@ class ReferenceTensorExecutor:
                 result = result + _as_numpy(_read(context, spec.input_buffer_ids[2]))
         elif impl_id == "pooler":
             lhs = _as_numpy(_read(context, spec.input_buffer_ids[0]))[0:1, :]
+            rhs = _as_numpy(_read(context, spec.input_buffer_ids[1]))
+            result = lhs @ rhs + _as_numpy(_read(context, spec.input_buffer_ids[2]))
+        elif impl_id == "classifier_head":
+            lhs = _as_numpy(_read(context, spec.input_buffer_ids[0]))[:, 0, :]
             rhs = _as_numpy(_read(context, spec.input_buffer_ids[1]))
             result = lhs @ rhs + _as_numpy(_read(context, spec.input_buffer_ids[2]))
         elif impl_id == "conv_patchify":
@@ -441,6 +460,399 @@ class BuiltTIRRegionArtifact:
     runtime_module: Any
     packed_funcs: Mapping[str, Any]
     device: Any
+
+
+@dataclass(frozen=True)
+class BoundTvmPackedStep:
+    """One pre-bound TVM packed call in an execution session."""
+
+    operator_id: str
+    primfunc_name: str
+    packed_func: Any
+    args: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class BoundTvmPackedOperator:
+    """One validated top-level operator with all lowering steps pre-bound."""
+
+    operator_id: str
+    execution_order: int
+    output_buffer_ids: tuple[str, ...]
+    artifact_source: str | None
+    steps: tuple[BoundTvmPackedStep, ...]
+
+
+class CudaGraphReplayError(RuntimeError):
+    """Raised when CUDA graph capture or replay is not available."""
+
+
+class _CudaRuntimeGraphApi:
+    """Small ctypes wrapper for the CUDA runtime graph APIs."""
+
+    _CUDA_SUCCESS = 0
+
+    def __init__(self):
+        library_name = ctypes.util.find_library("cudart") or "libcudart.so"
+        try:
+            self._lib = ctypes.CDLL(library_name)
+        except OSError as err:  # pragma: no cover - depends on local CUDA install
+            raise CudaGraphReplayError(f"failed to load CUDA runtime: {err}") from err
+        self._bind()
+
+    def _bind(self) -> None:
+        self._lib.cudaGetErrorString.argtypes = [ctypes.c_int]
+        self._lib.cudaGetErrorString.restype = ctypes.c_char_p
+        self._lib.cudaRuntimeGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        self._lib.cudaRuntimeGetVersion.restype = ctypes.c_int
+        self._lib.cudaStreamBeginCapture.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.cudaStreamBeginCapture.restype = ctypes.c_int
+        self._lib.cudaStreamEndCapture.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._lib.cudaStreamEndCapture.restype = ctypes.c_int
+        runtime_version = ctypes.c_int()
+        self.check(
+            self._lib.cudaRuntimeGetVersion(ctypes.byref(runtime_version)),
+            "cudaRuntimeGetVersion",
+        )
+        self._instantiate_uses_flags = int(runtime_version.value) >= 12000
+        if self._instantiate_uses_flags:
+            self._lib.cudaGraphInstantiate.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.c_ulonglong,
+            ]
+        else:
+            self._lib.cudaGraphInstantiate.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_char_p,
+                ctypes.c_size_t,
+            ]
+        self._lib.cudaGraphInstantiate.restype = ctypes.c_int
+        self._lib.cudaGraphLaunch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self._lib.cudaGraphLaunch.restype = ctypes.c_int
+        self._lib.cudaGraphDestroy.argtypes = [ctypes.c_void_p]
+        self._lib.cudaGraphDestroy.restype = ctypes.c_int
+        self._lib.cudaGraphExecDestroy.argtypes = [ctypes.c_void_p]
+        self._lib.cudaGraphExecDestroy.restype = ctypes.c_int
+        self._lib.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+        self._lib.cudaStreamSynchronize.restype = ctypes.c_int
+
+    def check(self, err_code: int, op_name: str) -> None:
+        if int(err_code) == self._CUDA_SUCCESS:
+            return
+        message = self._lib.cudaGetErrorString(int(err_code))
+        decoded = message.decode("utf-8", errors="replace") if message else "unknown CUDA error"
+        raise CudaGraphReplayError(f"{op_name} failed: {decoded} ({int(err_code)})")
+
+    def begin_capture(self, stream: int, capture_mode: int) -> None:
+        self.check(
+            self._lib.cudaStreamBeginCapture(ctypes.c_void_p(stream), int(capture_mode)),
+            "cudaStreamBeginCapture",
+        )
+
+    def end_capture(self, stream: int) -> int:
+        graph = ctypes.c_void_p()
+        self.check(
+            self._lib.cudaStreamEndCapture(ctypes.c_void_p(stream), ctypes.byref(graph)),
+            "cudaStreamEndCapture",
+        )
+        return int(graph.value or 0)
+
+    def instantiate(self, graph: int) -> int:
+        graph_exec = ctypes.c_void_p()
+        if self._instantiate_uses_flags:
+            err_code = self._lib.cudaGraphInstantiate(
+                ctypes.byref(graph_exec),
+                ctypes.c_void_p(graph),
+                ctypes.c_ulonglong(0),
+            )
+        else:
+            error_node = ctypes.c_void_p()
+            log_buffer = ctypes.create_string_buffer(1024)
+            err_code = self._lib.cudaGraphInstantiate(
+                ctypes.byref(graph_exec),
+                ctypes.c_void_p(graph),
+                ctypes.byref(error_node),
+                log_buffer,
+                ctypes.c_size_t(len(log_buffer)),
+            )
+        self.check(err_code, "cudaGraphInstantiate")
+        return int(graph_exec.value or 0)
+
+    def launch(self, graph_exec: int, stream: int) -> None:
+        self.check(
+            self._lib.cudaGraphLaunch(ctypes.c_void_p(graph_exec), ctypes.c_void_p(stream)),
+            "cudaGraphLaunch",
+        )
+
+    def destroy_graph(self, graph: int) -> None:
+        if graph:
+            self.check(self._lib.cudaGraphDestroy(ctypes.c_void_p(graph)), "cudaGraphDestroy")
+
+    def destroy_graph_exec(self, graph_exec: int) -> None:
+        if graph_exec:
+            self.check(
+                self._lib.cudaGraphExecDestroy(ctypes.c_void_p(graph_exec)),
+                "cudaGraphExecDestroy",
+            )
+
+    def synchronize_stream(self, stream: int) -> None:
+        self.check(
+            self._lib.cudaStreamSynchronize(ctypes.c_void_p(stream)),
+            "cudaStreamSynchronize",
+        )
+
+
+class CudaGraphReplay:
+    """Captured CUDA graph replay state for one bound TVM packed session."""
+
+    # Matches cudaStreamCaptureModeGlobal. Keep aligned with TVM Relax VM's CUDA graph path.
+    _CAPTURE_MODE_GLOBAL = 0
+
+    def __init__(self, target: str):
+        if not target.startswith("cuda"):
+            raise CudaGraphReplayError(f"CUDA graph replay requires a CUDA target, got {target}")
+        tvm = _import_tvm()
+        self.target = target
+        self.device = _device_for_target(tvm, target)
+        self.stream = int(self.device.create_raw_stream())
+        self._api = _CudaRuntimeGraphApi()
+        self._graph_exec = 0
+        self.capture_error: str | None = None
+        self.capture_count = 0
+        self.replay_count = 0
+        self._closed = False
+
+    @property
+    def captured(self) -> bool:
+        return bool(self._graph_exec)
+
+    def capture(self, run_callable: Any) -> None:
+        """Capture one execution of ``run_callable`` into an executable CUDA graph."""
+
+        if self._closed:
+            raise CudaGraphReplayError("CUDA graph replay object is closed")
+        if self.captured:
+            return
+        graph = 0
+        capture_started = False
+        self.capture_error = None
+        self.device.set_raw_stream(self.stream)
+        try:
+            self._api.begin_capture(self.stream, self._CAPTURE_MODE_GLOBAL)
+            capture_started = True
+            run_callable()
+            graph = self._api.end_capture(self.stream)
+            capture_started = False
+            graph_exec = self._api.instantiate(graph)
+            self._graph_exec = graph_exec
+            self.capture_count += 1
+        except Exception as err:
+            self.capture_error = str(err)
+            if capture_started:
+                try:
+                    graph = self._api.end_capture(self.stream)
+                except Exception:
+                    graph = 0
+            raise
+        finally:
+            self.device.set_raw_stream(0)
+            if graph:
+                try:
+                    self._api.destroy_graph(graph)
+                except CudaGraphReplayError:
+                    pass
+
+    def replay(self) -> None:
+        if self._closed:
+            raise CudaGraphReplayError("CUDA graph replay object is closed")
+        if not self.captured:
+            raise CudaGraphReplayError("CUDA graph has not been captured")
+        self._api.launch(self._graph_exec, self.stream)
+        self.replay_count += 1
+
+    def synchronize(self) -> None:
+        if not self._closed:
+            self._api.synchronize_stream(self.stream)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            self.device.set_raw_stream(0)
+        except Exception:
+            pass
+        try:
+            self._api.destroy_graph_exec(self._graph_exec)
+        except CudaGraphReplayError:
+            pass
+        self._graph_exec = 0
+        try:
+            self.device.free_raw_stream(self.stream)
+        except Exception:
+            pass
+        self._closed = True
+
+    def __del__(self):  # pragma: no cover - best effort cleanup at interpreter shutdown
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def state(self) -> dict[str, Any]:
+        return {
+            "requested": True,
+            "enabled": self.captured,
+            "target": self.target,
+            "capture_mode": "cudaStreamCaptureModeGlobal",
+            "stream": self.stream,
+            "capture_count": self.capture_count,
+            "replay_count": self.replay_count,
+            "capture_error": self.capture_error,
+        }
+
+
+class TvmPackedExecutionSession:
+    """Pre-validated and pre-bound TVM packed forward session."""
+
+    backend_id = "tvm_packed"
+
+    def __init__(
+        self,
+        *,
+        target: str,
+        context: ExecutionContext,
+        operators: Iterable[BoundTvmPackedOperator],
+        build_cache: TIRArtifactBuildCache,
+    ):
+        self.target = target
+        self.context = context
+        self.operators = tuple(sorted(operators, key=lambda item: item.execution_order))
+        self.build_cache = build_cache
+        artifact_breakdown: dict[str, int] = {}
+        for operator in self.operators:
+            if operator.artifact_source:
+                artifact_breakdown[operator.artifact_source] = (
+                    artifact_breakdown.get(operator.artifact_source, 0) + 1
+                )
+        self.artifact_source_breakdown = dict(sorted(artifact_breakdown.items()))
+        self._cuda_graph: CudaGraphReplay | None = None
+        self._cuda_graph_requested = False
+        self._cuda_graph_capture_error: str | None = None
+
+    def run(
+        self,
+        *,
+        collect_operator_records: bool = True,
+        use_cuda_graph: bool = False,
+    ) -> tuple[OperatorExecutionResult, ...]:
+        """Execute the bound forward. Fast path may skip per-op records."""
+
+        if use_cuda_graph:
+            if collect_operator_records:
+                raise ValueError("CUDA graph replay does not support per-operator records")
+            if self._cuda_graph is None or not self._cuda_graph.captured:
+                raise CudaGraphReplayError("CUDA graph replay was requested before capture")
+            self._cuda_graph.replay()
+            return ()
+
+        records: list[OperatorExecutionResult] = []
+        for operator in self.operators:
+            if collect_operator_records:
+                start = time.perf_counter()
+                try:
+                    for step in operator.steps:
+                        step.packed_func(*step.args)
+                    elapsed_ms = (time.perf_counter() - start) * 1000.0
+                except Exception as err:  # pragma: no cover - defensive ABI boundary
+                    records.append(
+                        OperatorExecutionResult(
+                            status=EXECUTION_STATUS_FAILED,
+                            operator_id=operator.operator_id,
+                            backend_id=self.backend_id,
+                            reason=str(err),
+                            artifact_source=operator.artifact_source,
+                        )
+                    )
+                    continue
+                records.append(
+                    OperatorExecutionResult(
+                        status=EXECUTION_STATUS_EXECUTED,
+                        operator_id=operator.operator_id,
+                        backend_id=self.backend_id,
+                        reason=None,
+                        elapsed_ms=elapsed_ms,
+                        output_buffer_ids=operator.output_buffer_ids,
+                        artifact_source=operator.artifact_source,
+                        correctness_readback=True,
+                    )
+                )
+            else:
+                for step in operator.steps:
+                    step.packed_func(*step.args)
+        return tuple(records)
+
+    def capture_cuda_graph(self) -> bool:
+        """Capture this session's fast path for CUDA graph replay."""
+
+        self._cuda_graph_requested = True
+        if not self.target.startswith("cuda"):
+            self._cuda_graph_capture_error = (
+                f"CUDA graph replay requires a CUDA target, got {self.target}"
+            )
+            return False
+        try:
+            if self._cuda_graph is None:
+                self._cuda_graph = CudaGraphReplay(self.target)
+            self._cuda_graph.capture(
+                lambda: self.run(collect_operator_records=False, use_cuda_graph=False)
+            )
+            self._cuda_graph_capture_error = None
+            return True
+        except Exception as err:  # pragma: no cover - depends on CUDA runtime and kernels
+            self._cuda_graph_capture_error = str(err)
+            return False
+
+    def cuda_graph_state(self) -> dict[str, Any]:
+        """Return report-friendly CUDA graph replay state."""
+
+        if self._cuda_graph is not None:
+            state = self._cuda_graph.state()
+            state["requested"] = self._cuda_graph_requested
+            state["capture_error"] = self._cuda_graph_capture_error
+            return state
+        return {
+            "requested": self._cuda_graph_requested,
+            "enabled": False,
+            "target": self.target,
+            "capture_mode": (
+                "cudaStreamCaptureModeGlobal" if self.target.startswith("cuda") else None
+            ),
+            "stream": None,
+            "capture_count": 0,
+            "replay_count": 0,
+            "capture_error": self._cuda_graph_capture_error,
+        }
+
+    def synchronize(self) -> None:
+        """Synchronize work submitted by this session."""
+
+        if self.target.startswith("cuda"):
+            tvm = _import_tvm()
+            _device_for_target(tvm, self.target).sync()
+            if self._cuda_graph is not None:
+                self._cuda_graph.synchronize()
+
+    def close(self) -> None:
+        """Release optional runtime resources owned by the session."""
+
+        if self._cuda_graph is not None:
+            self._cuda_graph.close()
 
 
 class TIRArtifactValidationError(ValueError):
@@ -522,6 +934,69 @@ class TvmPackedExecutor:
             operator_id=request.operator_id,
             backend_id=self.backend_id,
             reason="no TIR artifact registered",
+        )
+
+    def create_session(
+        self,
+        requests: Iterable[OperatorExecutionRequest],
+        context: ExecutionContext,
+    ) -> TvmPackedExecutionSession:
+        """Pre-compile, validate, allocate, and bind a request sequence."""
+
+        operators = []
+        for request in sorted(requests, key=lambda item: item.execution_order):
+            artifact = self._artifact_registry.get(request.model_id, request.operator_id)
+            if artifact is None:
+                raise TIRArtifactValidationError(
+                    f"no TIR artifact registered for {request.operator_id}"
+                )
+            validate_tir_region_artifact(artifact, request, context)
+            built = self.build_cache.compile_or_get(artifact)
+            produced: set[str] = set()
+            bound_steps = []
+            for step in artifact.lowering_plan:
+                args = tuple(
+                    _get_or_create_tvm_buffer(
+                        context,
+                        artifact,
+                        buffer_id,
+                        built.device,
+                        is_input=(
+                            buffer_id in step.input_buffer_ids
+                            and buffer_id not in produced
+                        ),
+                    )
+                    for buffer_id in step.arg_buffer_order
+                )
+                bound_steps.append(
+                    BoundTvmPackedStep(
+                        operator_id=request.operator_id,
+                        primfunc_name=step.primfunc_name,
+                        packed_func=built.packed_funcs[step.primfunc_name],
+                        args=args,
+                    )
+                )
+                produced.update(step.output_buffer_ids)
+                produced.update(step.intermediate_buffer_ids)
+            for output_buffer_id in artifact.output_buffer_ids:
+                if not _has(context, output_buffer_id):
+                    raise TIRArtifactValidationError(
+                        f"output buffer missing after session binding: {output_buffer_id}"
+                    )
+            operators.append(
+                BoundTvmPackedOperator(
+                    operator_id=request.operator_id,
+                    execution_order=request.execution_order,
+                    output_buffer_ids=artifact.output_buffer_ids,
+                    artifact_source=artifact.artifact_source,
+                    steps=tuple(bound_steps),
+                )
+            )
+        return TvmPackedExecutionSession(
+            target=context.target,
+            context=context,
+            operators=tuple(operators),
+            build_cache=self.build_cache,
         )
 
     def _execute_artifact(
@@ -738,22 +1213,44 @@ def _reference_conv_patchify(spec: ReferenceOperatorSpec, context: ExecutionCont
     weight = _as_numpy(_read(context, spec.input_buffer_ids[1]))
     bias = _as_numpy(_read(context, spec.input_buffer_ids[2]))
     patch = int(spec.attrs.get("patch", 2))
-    grid_h = image.shape[1] // patch
-    grid_w = image.shape[2] // patch
+    if image.ndim == 4:
+        batch, _, image_h, image_w = image.shape
+    else:
+        batch, image_h, image_w = 1, image.shape[1], image.shape[2]
+    grid_h = image_h // patch
+    grid_w = image_w // patch
     hidden = weight.shape[0]
-    result = _np().zeros((grid_h * grid_w, hidden), dtype=_np().float32)
-    for token in range(grid_h * grid_w):
-        py = token // grid_w
-        px = token % grid_w
-        window = image[:, py * patch : (py + 1) * patch, px * patch : (px + 1) * patch]
-        for h in range(hidden):
-            result[token, h] = _np().sum(window * weight[h]) + bias[h]
+    result_shape = (batch, grid_h * grid_w, hidden) if image.ndim == 4 else (grid_h * grid_w, hidden)
+    result = _np().zeros(result_shape, dtype=_np().float32)
+    for batch_index in range(batch):
+        sample = image[batch_index] if image.ndim == 4 else image
+        for token in range(grid_h * grid_w):
+            py = token // grid_w
+            px = token % grid_w
+            window = sample[:, py * patch : (py + 1) * patch, px * patch : (px + 1) * patch]
+            for h in range(hidden):
+                if image.ndim == 4:
+                    result[batch_index, token, h] = _np().sum(window * weight[h]) + bias[h]
+                else:
+                    result[token, h] = _np().sum(window * weight[h]) + bias[h]
     return result
 
 
 def _reference_attention(spec: ReferenceOperatorSpec, context: ExecutionContext) -> Any:
     qkv = _as_numpy(_read(context, spec.input_buffer_ids[0]))
     hidden = int(spec.attrs.get("hidden", qkv.shape[1] // 3))
+    heads = int(spec.attrs.get("heads", 1))
+    if qkv.ndim == 3 and heads > 1:
+        batch, tokens, _ = qkv.shape
+        head_dim = hidden // heads
+        packed = qkv.reshape(batch, tokens, 3, heads, head_dim).transpose(2, 0, 3, 1, 4)
+        q, k, v = packed[0], packed[1], packed[2]
+        scores = (q @ _np().swapaxes(k, -1, -2)) / math.sqrt(float(head_dim))
+        scores = scores - scores.max(axis=-1, keepdims=True)
+        weights = _np().exp(scores)
+        weights = weights / weights.sum(axis=-1, keepdims=True)
+        out = weights @ v
+        return out.transpose(0, 2, 1, 3).reshape(batch, tokens, hidden)
     q = qkv[:, :hidden]
     k = qkv[:, hidden : 2 * hidden]
     v = qkv[:, 2 * hidden :]

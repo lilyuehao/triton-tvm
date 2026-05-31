@@ -179,6 +179,8 @@ cscope*
 perf
 .bash_history
 *.json
+!python/tvm/contrib/triton_tvm/configs/
+!python/tvm/contrib/triton_tvm/configs/*.json
 *.params
 *.ro
 *.onnx

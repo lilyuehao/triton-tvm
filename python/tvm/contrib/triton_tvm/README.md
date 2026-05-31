@@ -129,36 +129,110 @@ Set `PYTHONPATH`:
 export PYTHONPATH="$PWD/python"
 ```
 
-Run the fixed-shape ViT route through source capture, Atomic DAG validation,
-manifest construction, capability lookup, and runtime admission:
+The CLI entry point is config-driven:
 
 ```bash
 python -m tvm.contrib.triton_tvm.models.vit \
-  --target llvm \
-  --out-dir /tmp/triton_tvm_vit_route
+  --config python/tvm/contrib/triton_tvm/configs/vit_s_16_224_autotune_template.json
 ```
 
-Run the full TVM correctness path using Atomic-DAG-gated TE/TIR artifacts:
+The config covers target, route, weight source, correctness checks,
+classification, benchmark settings, and autoscheduler selection. Programmatic
+helpers for the tiny fixed-shape scaffold remain available from
+`tvm.contrib.triton_tvm.models.vit`, but the CLI is reserved for model-specific
+JSON configs.
+
+## Fixed-Shape ViT-S/16 Example
+
+The default template targets the standard ViT-S/16 inventory at 224x224:
+
+```text
+batch=1, image=224, patch=16, tokens=197, hidden=384,
+heads=6, layers=12, mlp=1536, classes=1000
+```
+
+The ViT-S report includes 125 top-level operators, 149 source/lowering route
+records, runtime admission status, `tvm_backend_execution` records for the
+`tvm_packed` backend, optional `diagnostic_e2e` reference-vs-TVM correctness,
+and `torch_compile_comparison` records for `last_hidden_state` and `logits`.
+
+ViT-S autotuning is configured through a model-specific JSON file instead of
+per-demo CLI flags. The CLI entry point accepts only `--config`:
 
 ```bash
 python -m tvm.contrib.triton_tvm.models.vit \
-  --target llvm \
-  --atomic-dag-gated-te-tir \
-  --out-dir /tmp/triton_tvm_vit_atomic_dag_gated_te_tir
+  --config python/tvm/contrib/triton_tvm/configs/vit_s_16_224_autotune_template.json
 ```
 
-The report written to `report.json` includes the operator inventory, source
-route count, artifact source, per-operator allclose status, model-output
-allclose status, and runtime claim fields.
+The template is runnable and contains target, weight source, checks,
+benchmarking, and MetaSchedule settings. Edit `autotune.operator_ids` to choose
+which top-level ViT-S operators are tuned. The runner deduplicates selected
+operators by workload shape and attributes, so multiple layers can reuse one
+MetaSchedule database record set. For example, all QKV projections share
+`tokens197_k384_n1152`, residual adds share `add_b1_tokens197_hidden384`, and
+each selected attention operator expands to `attention_score`,
+`attention_softmax`, and `attention_apply` workloads.
 
-For a scaffold-only post-admission report, use:
+The report includes `autotune_config_path`, `autotune_config_hash`,
+`selected_operator_count`, `selected_workload_count`, and
+`workload_reuse_map`. Operators selected for tuning report
+`codegen_source=te_workload_meta_schedule`; unselected operators keep the
+baseline TE/TIR path. Atomic operator boundaries remain intact and
+`performance_claim` stays `false`.
+
+ViT-S input weights are loaded through a small registry. The built-in sources
+are:
+
+- `deterministic_random`: local deterministic synthetic weights and input.
+- `timm`: a `timm` VisionTransformer state dict, with optional pretrained or
+  checkpoint-backed loading.
+
+The template uses `timm` weights and a synthetic-image classification task.
+Pretrained timm weights can be requested by setting
+`weight_source.pretrained=true`, or supplied from a local checkpoint with
+`weight_source.checkpoint_path`. The default Hugging Face endpoint is
+`https://hf-mirror.com`.
+
+To download the timm checkpoint explicitly through the Hugging Face CLI mirror,
+unset proxy variables if the Hub metadata HEAD request is intercepted:
 
 ```bash
-python -m tvm.contrib.triton_tvm.models.vit \
-  --target llvm \
-  --e2e-scaffold \
-  --out-dir /tmp/triton_tvm_vit_scaffold
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 \
+  conda run -n tvm-0.24.0 hf download \
+    timm/vit_small_patch16_224.augreg_in1k \
+    model.safetensors config.json \
+    --local-dir /tmp/triton_tvm_hf_weights/vit_small_patch16_224_augreg_in1k \
+    --max-workers 1
 ```
+
+Then run the local checkpoint-backed classification path by pointing
+`weight_source.checkpoint_path` in the JSON config at the downloaded
+`model.safetensors` file:
+
+```bash
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  HF_ENDPOINT=https://hf-mirror.com \
+  conda run -n tvm-0.24.0 python -m tvm.contrib.triton_tvm.models.vit \
+    --config python/tvm/contrib/triton_tvm/configs/vit_s_16_224_autotune_template.json
+```
+
+For a local E2E latency comparison of the Triton-TVM backend against
+`torch.compile`, set `benchmark.enabled=true` in the JSON config. The benchmark
+excludes weight loading, excludes backend first-call/compile and the first
+`torch.compile` call from timed latency samples, runs warmup iterations,
+synchronizes GPU timing, and reports all timed samples plus
+min/mean/median/p90/p95/p99/max/sample-stddev in `report.json`.
+
+Set `benchmark.cuda_graph_replay=true` to capture the pre-bound Triton-TVM
+ViT-S session once and replay it during the backend timed loop. The capture
+uses a dedicated CUDA stream, keeps the 125 Atomic top-level operator sequence
+unchanged, and excludes session init, first call, graph capture, and warmup
+from timed latency. The report records `backend_cuda_graph_replay_requested`,
+`backend_cuda_graph_replay_enabled`, capture time, capture error if any, and
+the replay count under `e2e_latency_benchmark.statistical_method`.
 
 ## Testing
 
